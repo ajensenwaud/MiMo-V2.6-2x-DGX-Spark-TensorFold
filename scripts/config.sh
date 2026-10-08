@@ -61,7 +61,8 @@ run_args() {   # docker run arguments shared by both ranks
        "-v $MODEL_DIR:/model:ro -v $CACHE_DIR:/root/.cache" \
        "-e NCCL_SOCKET_IFNAME=$NCCL_IFNAME -e NCCL_IB_HCA=$NCCL_HCAS -e NCCL_IB_GID_INDEX=$NCCL_GID" \
        "-e NCCL_MIN_NCHANNELS=4 -e NCCL_MAX_NCHANNELS=4 -e TF_ROCE_MAX_KB=$ROCE_MAX_KB" \
-       "$(env | grep -E '^TF_MIMO_[A-Z_]*=' | sed 's/^/-e /' | tr '\n' ' ')"
+       "$(env | grep -E '^TF_MIMO_[A-Z0-9_]*=' | sed 's/^/-e /' | tr '\n' ' ')" \
+       "${DEV_SRC:+-v $DEV_SRC:/opt/tensorfold-mimo/src:ro}"
 }
 
 serve_args() {  # $1 rank

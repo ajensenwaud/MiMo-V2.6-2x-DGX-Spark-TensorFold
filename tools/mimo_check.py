@@ -2,6 +2,10 @@
 """Score the TensorFold mimo_v2 engine against exllamav3's reference logits (tools/mimo_ref.py), one GPU.
 
   python3 tools/mimo_check.py /model /out/ref-2.27.safetensors [--json out.json]
+  python3 tools/mimo_check.py /model /out/ref.safetensors --tp 2 --rank R --master IP --port P   (one per node)
+
+Under --tp 2 both ranks run the same forwards (each holds its half of the weights) and get bit-equal logits; rank 0
+reports.
 
 Per text: (1) prompt path, every position: KL(ref || engine) and top-1 agreement; (2) decode path: the first half
 as a prompt, the rest fed one row at a time (decode kernels), same metrics on those rows; (3) greedy 32 tokens from
@@ -32,7 +36,12 @@ def main() -> None:
     ap.add_argument("ref")
     ap.add_argument("--json")
     ap.add_argument("--context", type=int, default=4096)
+    ap.add_argument("--tp", type=int, default=1)
+    ap.add_argument("--rank", type=int, default=0)
+    ap.add_argument("--master", default="10.100.128.1")
+    ap.add_argument("--port", type=int, default=29571)
     a = ap.parse_args()
+    import os
 
     from safetensors import safe_open
 
@@ -41,8 +50,21 @@ def main() -> None:
 
     torch.cuda.set_device(0)
     t0 = time.perf_counter()
-    w = load(a.model)
-    model = Model(w, a.context, 1)
+    comm = None
+    if a.tp == 2:
+        from tensorfold.cuda.comm import open_comm
+
+        comm = open_comm(a.rank, 2, a.master, a.port)
+        if os.environ.get("TF_MIMO_COMM", "roce") == "roce":
+            from tensorfold.cuda.roce import RoceComm
+
+            comm = RoceComm(comm, a.rank, 2)
+    w = load(a.model, rank=a.rank, world=a.tp)
+    model = Model(w, a.context, 1, comm=comm)
+    if comm is not None:
+        comm.barrier()
+        if hasattr(comm, "settle"):
+            comm.settle()
     print(f"[check] loaded in {time.perf_counter() - t0:.0f}s; "
           f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB allocated", flush=True)
     ref = safe_open(a.ref, framework="pt")
@@ -60,6 +82,12 @@ def main() -> None:
         p_kl, p_max, p_top = kl_top1(rl, got)
         v = rl.shape[1]
         lp = torch.log_softmax(rl.float(), -1)
+        nxt_ids = torch.tensor(ids[1:], device=rl.device)
+        lq_all = torch.log_softmax(got[:, :v].float(), -1)
+        nll_ref = float(-lp[:-1].gather(1, nxt_ids[:, None]).mean())
+        nll_ours = float(-lq_all[:-1].gather(1, nxt_ids[:, None]).mean())
+        top1_true_ref = float((lp[:-1].argmax(-1) == nxt_ids).float().mean())
+        top1_true_ours = float((lq_all[:-1].argmax(-1) == nxt_ids).float().mean())
         by_pos = (lp.exp() * (lp - torch.log_softmax(got[:, :v].float(), -1))).sum(-1)
         worst = torch.topk(by_pos, min(8, n))
         worst = [(int(i), round(float(k), 3), int(ids[i])) for k, i in zip(worst.values, worst.indices)]
@@ -84,9 +112,11 @@ def main() -> None:
                         "greedy_match": f"{match}/{len(gen)}", "prompt_s": round(tp, 3),
                         "eager_decode_tok_s": round(len(gen) / td, 2),
                         "kl_first_half": float(by_pos[:n // 2].mean()), "kl_second_half": float(by_pos[n // 2:].mean()),
-                        "worst_positions": worst}
-        print(f"[check] {name}: {json.dumps(report[name])}", flush=True)
-    if a.json:
+                        "worst_positions": worst, "nll_ref": nll_ref, "nll_ours": nll_ours,
+                        "true_top1_ref": top1_true_ref, "true_top1_ours": top1_true_ours}
+        if a.rank == 0:
+            print(f"[check] {name}: {json.dumps(report[name])}", flush=True)
+    if a.json and a.rank == 0:
         with open(a.json, "w") as f:
             json.dump(report, f, indent=1)
 
