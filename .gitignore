@@ -1,0 +1,6 @@
+scripts/local.sh
+logs/
+results/**/*.log
+__pycache__/
+*.pyc
+.*.swp
