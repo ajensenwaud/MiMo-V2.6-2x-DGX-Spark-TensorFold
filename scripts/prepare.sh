@@ -39,7 +39,7 @@ else
 fi
 docker tag "$tag" "$IMAGE:latest"
 docker run --rm --entrypoint python3 "$tag" -c \
-  "import exllamav3, exllamav3_ext, tensorfold; from tensorfold.cuda.exl3 import experts, linear; print('import gate ok:', exllamav3.__version__, tensorfold.__file__)"
+  "import exllamav3, exllamav3_ext, tensorfold; from tensorfold.cuda.exl3 import experts, linear; from importlib.metadata import version; print('import gate ok: exllamav3', version('exllamav3'), tensorfold.__file__)"
 id=$(docker image inspect --format '{{.Id}}' "$tag")
 log "head image $tag = $id"
 

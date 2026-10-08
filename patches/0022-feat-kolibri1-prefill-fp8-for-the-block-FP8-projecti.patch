@@ -1,0 +1,25 @@
+From 634cc1771106d78fba7b2ba500365f108dfa309b Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Wed, 7 Oct 2026 01:35:21 +1100
+Subject: [PATCH 22/23] feat(kolibri1): --prefill-fp8 for the block-FP8
+ projections (fast_prefill)
+
+---
+ src/tensorfold/families/kolibri1/cuda/weights.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/tensorfold/families/kolibri1/cuda/weights.py b/src/tensorfold/families/kolibri1/cuda/weights.py
+index bdce6e7..fcf4c9d 100644
+--- a/src/tensorfold/families/kolibri1/cuda/weights.py
++++ b/src/tensorfold/families/kolibri1/cuda/weights.py
+@@ -92,6 +92,7 @@ class Weights:
+     rank: int = 0
+     world: int = 1
+     full: Config | None = None        # the checkpoint's config (``config`` holds a rank's heads under TP)
++    fast_prefill: bool = True         # --prefill-fp8: the block-FP8 projections run prompts on the FP8 GEMM
+ 
+ 
+ def _rows(t: torch.Tensor, lo: int, hi: int, dim: int) -> torch.Tensor:
+-- 
+2.53.0
+

@@ -1,0 +1,596 @@
+From 3c3aa24469b76e9a019296a00ba16faacf5d0043 Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 13:08:29 +1100
+Subject: [PATCH 09/23] feat(kolibri1 cuda): two ranks (--tp 2): heads, expert
+ widths and vocabulary split; rank 1 follows rank 0's forwards
+
+---
+ src/tensorfold/families/kolibri1/__init__.py  |   7 +-
+ .../families/kolibri1/cuda/decoder.py         |   9 +-
+ .../families/kolibri1/cuda/engine.py          |  56 +++++++-
+ .../families/kolibri1/cuda/forward.py         |  33 ++++-
+ src/tensorfold/families/kolibri1/cuda/moe.py  |   9 +-
+ src/tensorfold/families/kolibri1/cuda/tp.py   |  80 +++++++++++
+ .../families/kolibri1/cuda/weights.py         |  61 +++++++--
+ tests/cuda/test_kolibri1_tp.py                | 129 ++++++++++++++++++
+ 8 files changed, 354 insertions(+), 30 deletions(-)
+ create mode 100644 src/tensorfold/families/kolibri1/cuda/tp.py
+ create mode 100644 tests/cuda/test_kolibri1_tp.py
+
+diff --git a/src/tensorfold/families/kolibri1/__init__.py b/src/tensorfold/families/kolibri1/__init__.py
+index d3f1f64..b467254 100644
+--- a/src/tensorfold/families/kolibri1/__init__.py
++++ b/src/tensorfold/families/kolibri1/__init__.py
+@@ -27,10 +27,11 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+ 
+     if drafter:
+         raise ValueError(f"{TITLE} has no draft model on CUDA yet: drop --drafter")
+-    if int(tp) != 1:
+-        raise ValueError(f"{TITLE} runs on one GPU: drop --tp")
++    if int(tp) not in (1, 2):
++        raise ValueError(f"{TITLE} runs on one GPU or two ranks (--tp 2)")
+     from .cuda.engine import Kolibri1Engine
+ 
+     return Kolibri1Engine(Path(model_dir), context=int(context) if context else None,
+                           explicit=bool(options.get("context_explicit")),
+-                          streams=max(1, int(options.get("parallel") or 1)))
++                          streams=max(1, int(options.get("parallel") or 1)),
++                          tp=int(tp), rank=int(rank), master=master, port=int(master_port))
+diff --git a/src/tensorfold/families/kolibri1/cuda/decoder.py b/src/tensorfold/families/kolibri1/cuda/decoder.py
+index eb6515c..23cbdfa 100644
+--- a/src/tensorfold/families/kolibri1/cuda/decoder.py
++++ b/src/tensorfold/families/kolibri1/cuda/decoder.py
+@@ -15,6 +15,7 @@ from tensorfold.cuda.streams import Stream, accept, next_fill
+ from tensorfold.families.qwen3_5.cuda.decode import CopyIndex, next_copy_rows
+ 
+ from .forward import PROMPT_CHUNK, Chain, Model
++from .tp import DECODE, PROMPT
+ 
+ STEP = 1024              # prompt rows a round while other streams decode
+ MAX_ROWS = 32            # a copy window's rows: each wrong one reads its own experts
+@@ -22,8 +23,8 @@ MIN_MATCH = 8            # context tokens a copy must repeat before it is propos
+ 
+ 
+ class Decoder:
+-    def __init__(self, model: Model, eos: tuple[int, ...]) -> None:
+-        self.model, self.eos = model, tuple(eos)
++    def __init__(self, model: Model, eos: tuple[int, ...], mirror=None) -> None:
++        self.model, self.eos, self.mirror = model, tuple(eos), mirror
+         self.free = list(range(model.slots))
+         self.streams: dict[int, Stream] = {}      # decoding
+         self.filling: list[Stream] = []           # admitted, prompts still prefilling (oldest first)
+@@ -92,6 +93,8 @@ class Decoder:
+         b = min(len(s.prompt), a + (STEP if self.streams else PROMPT_CHUNK))
+         t0 = time.perf_counter()
+         try:
++            if self.mirror is not None:
++                self.mirror.send(PROMPT, [Chain(self.slot[s.sid], a, s.prompt[a:b])])
+             logits = self.model.forward([Chain(self.slot[s.sid], a, s.prompt[a:b])], prompt=True)
+             first = sample_rows(logits, [len(s.prompt)], s.sampling)[0] if b == len(s.prompt) else None
+         except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
+@@ -132,6 +135,8 @@ class Decoder:
+             chains.append(Chain(self.slot[s.sid], p, [s.out[-1], *drafts]))
+             self.written[s.sid] = max(self.written[s.sid], p + 1 + len(drafts))
+         total = sum(len(c.tokens) for c in chains)
++        if self.mirror is not None:
++            self.mirror.send(DECODE, chains)
+         if self.graphs is not None:
+             logits = self.graphs.forward(chains)
+         else:
+diff --git a/src/tensorfold/families/kolibri1/cuda/engine.py b/src/tensorfold/families/kolibri1/cuda/engine.py
+index 57e3a52..2de4593 100644
+--- a/src/tensorfold/families/kolibri1/cuda/engine.py
++++ b/src/tensorfold/families/kolibri1/cuda/engine.py
+@@ -14,7 +14,9 @@ class Kolibri1Engine:
+     """``eos``, ``generate``, ``context_window`` and ``concurrent`` for ``tensorfold.cuda.server``."""
+ 
+     def __init__(self, model_dir: Path, *, context: int | None = None, explicit: bool = False,
+-                 streams: int = 1) -> None:
++                 streams: int = 1, tp: int = 1, rank: int = 0, master: str = "", port: int = 29551) -> None:
++        import os
++
+         import torch
+ 
+         from tensorfold.cuda.capacity import available_bytes
+@@ -26,10 +28,27 @@ class Kolibri1Engine:
+ 
+         torch.cuda.set_device(0)
+         started = time.perf_counter()
+-        self.w = load(model_dir)
++        self.rank, self.tp, self.comm, self.mirror = rank, tp, None, None
++        if tp == 2:
++            from tensorfold.cuda.comm import open_comm
++
++            from .tp import Mirror
++
++            self.comm = open_comm(rank, 2, master, port)
++            if os.environ.get("TF_KOLIBRI_COMM", "roce") == "roce":
++                from tensorfold.cuda.roce import RoceComm
++
++                self.comm = RoceComm(self.comm, rank, 2)
++            self.mirror = Mirror(self.comm, rank)
++        self.w = load(model_dir, rank=rank, world=tp)
+         torch.cuda.empty_cache()
+         cfg = self.w.config
+         budget = available_bytes(torch) - WORKSPACE
++        if self.comm is not None:                  # both ranks size their caches alike: the smaller budget
++            mine = torch.tensor([budget], dtype=torch.int64, device="cuda")
++            both = torch.empty(2, dtype=torch.int64, device="cuda")
++            getattr(self.comm, "nccl", self.comm).all_gather(mine, both)
++            budget = int(both.min())
+         fits = max(0, budget // streams)
+         per = Model.slot_bytes(cfg, 1024) - Model.slot_bytes(cfg, 0)
+         most = (fits - Model.slot_bytes(cfg, 0)) // per * 1024 if fits > Model.slot_bytes(cfg, 0) else 0
+@@ -44,20 +63,45 @@ class Kolibri1Engine:
+         if window < 4096:
+             raise ValueError(f"{streams} stream(s) leave room for {most} tokens each; free memory or lower --parallel")
+         self.context_window = window
+-        self.model = Model(self.w, window, streams)
++        self.model = Model(self.w, window, streams, comm=self.comm)
+         self.eos = tuple(cfg.eos)
+-        self.decoder = Decoder(self.model, self.eos)
+-        self.scheduler = Scheduler(self.decoder, max_streams=streams)
+         self.concurrent = streams > 1
+         self.drafts = True                     # copies from the context (Kolibri 1 ships no draft head)
+-        print(f"[tensorfold] kolibri1: {streams} stream(s) of {window} tokens "
++        self.scheduler = None
++        if self.comm is not None:
++            self.comm.barrier()
++            if hasattr(self.comm, "settle"):
++                self.comm.settle()
++        where = f" rank {rank} of {tp}," if tp > 1 else ""
++        print(f"[tensorfold] kolibri1:{where} {streams} stream(s) of {window} tokens "
+               f"({streams * Model.slot_bytes(cfg, window) / 2**30:.1f} GiB of caches; sliding layers keep a "
+               f"{self.model.ring}-key ring), ready in {time.perf_counter() - started:.0f}s", flush=True)
++        if rank == 0:
++            self.decoder = Decoder(self.model, self.eos, mirror=self.mirror)
++            self.scheduler = Scheduler(self.decoder, max_streams=streams)
++
++    def follow(self) -> None:
++        """Rank 1: run the forwards rank 0 describes, until it stops."""
++
++        import os
++
++        from .tp import follow
++
++        graphs = None
++        if os.environ.get("TF_KOLIBRI_GRAPHS", "1") != "0":
++            from .graphs import Graphs
++
++            graphs = Graphs(self.model)
++        follow(self.model, graphs, self.mirror)
+ 
+     def close(self) -> None:
+         if self.scheduler is not None:
+             self.scheduler.close()
+             self.scheduler = None
++            if self.mirror is not None:
++                from .tp import STOP
++
++                self.mirror.send(STOP)
+ 
+     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens: Callable[[list[int]], bool | None],
+                  draft: bool = True, stop_eos: bool = True, constraint=None,
+diff --git a/src/tensorfold/families/kolibri1/cuda/forward.py b/src/tensorfold/families/kolibri1/cuda/forward.py
+index d167314..c413af7 100644
+--- a/src/tensorfold/families/kolibri1/cuda/forward.py
++++ b/src/tensorfold/families/kolibri1/cuda/forward.py
+@@ -54,9 +54,12 @@ class Chain:
+ class Model:
+     """The weights and ``slots`` streams' caches: full layers keep ``context`` positions, sliding ones a ring."""
+ 
+-    def __init__(self, w: Weights, context: int, slots: int = 1, device: str = "cuda") -> None:
++    def __init__(self, w: Weights, context: int, slots: int = 1, device: str = "cuda", comm=None) -> None:
+         cfg = w.config
+         self.w, self.cfg, self.context, self.slots = w, cfg, int(context), int(slots)
++        self.comm = comm if getattr(w, "world", 1) > 1 else None
++        if getattr(w, "world", 1) > 1 and comm is None:
++            raise ValueError("a rank's share of the weights needs its communicator")
+         self.ring = attention.ring_size(PROMPT_CHUNK, cfg.window)
+         kv = (cfg.kv_heads, cfg.head_dim)
+         self.k, self.v = [], []
+@@ -79,6 +82,24 @@ class Model:
+         full = sum(cfg.full)
+         return row * (full * context + (len(cfg.full) - full) * attention.ring_size(PROMPT_CHUNK, cfg.window))
+ 
++    def _sum(self, part: torch.Tensor) -> torch.Tensor:
++        """Under TP the ranks' partial rows summed in rank order (fp32; the same bits on both ranks)."""
++
++        if self.comm is None:
++            return part
++        part = part.contiguous()
++        recv = torch.empty((2, *part.shape), dtype=part.dtype, device=part.device)
++        self.comm.all_gather(part, recv)
++        return recv[0].float() + recv[1].float()
++
++    def _logits(self, x: torch.Tensor) -> torch.Tensor:
++        part = shared.router(x, self.w.head)                  # this rank's vocabulary slice, fp32
++        if self.comm is None:
++            return part
++        recv = torch.empty((2, *part.shape), dtype=part.dtype, device=part.device)
++        self.comm.all_gather(part.contiguous(), recv)
++        return recv.permute(1, 0, 2).reshape(part.shape[0], 2 * part.shape[1])
++
+     def check(self, chains: Sequence[Chain]) -> None:
+         for c in chains:
+             if len(c.tokens) > self.ring - self.cfg.window:        # its first row's window must survive its writes
+@@ -128,12 +149,12 @@ class Model:
+             else:
+                 a = attention.full_planned(q, k, v, offs[j], plan, scale=self.scale)
+             j += cfg.full[i]
+-            x = glue.add_rms(L.o(a.view(n, h * d)), res, L.post_attn_norm, L.pre_moe_norm, eps)
+-            m = moe.run(x, L.router, L.bias, L.experts, cfg.top_k, prefill=prompt)
++            x = glue.add_rms(self._sum(L.o(a.view(n, h * d))), res, L.post_attn_norm, L.pre_moe_norm, eps)
++            m = moe.run(x, L.router, L.bias, L.experts, cfg.top_k, prefill=prompt, partial=self.comm is not None)
+             after = w.layers[i + 1].input_norm if i + 1 < len(w.layers) else w.norm
+-            x = glue.add_rms(m, res, L.post_moe_norm, after, eps)
++            x = glue.add_rms(self._sum(m), res, L.post_moe_norm, after, eps)
+         if staged is not None:
+-            return x if features else shared.router(x, w.head)
++            return x if features else self._logits(x)
+         if rows is None:
+             ends, at = [], 0
+             for c in chains:
+@@ -143,7 +164,7 @@ class Model:
+         if features:                                          # every row's normed state, as the head reads it
+             return x
+         x = x[torch.tensor(list(rows), device=dev)]
+-        return shared.router(x, w.head)
++        return self._logits(x)
+ 
+     def prefill(self, prompt: Sequence[int], start: int = 0, slot: int = 0, chunk: int | None = None) -> torch.Tensor:
+         """The prompt from ``start`` in chunks; the last row's logits [1, V]."""
+diff --git a/src/tensorfold/families/kolibri1/cuda/moe.py b/src/tensorfold/families/kolibri1/cuda/moe.py
+index 3bee323..c7b8361 100644
+--- a/src/tensorfold/families/kolibri1/cuda/moe.py
++++ b/src/tensorfold/families/kolibri1/cuda/moe.py
+@@ -53,8 +53,11 @@ _scratch: dict[tuple, Buffers] = {}
+ 
+ 
+ def run(x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: fp8x.Experts8, top_k: int, *,
+-        prefill: bool = False) -> torch.Tensor:
+-    """x [R, D] bf16 -> [R, D] bf16: its top-k experts by sigmoid weight, plus the ungated shared expert."""
++        prefill: bool = False, partial: bool = False) -> torch.Tensor:
++    """x [R, D] bf16 -> [R, D] bf16: its top-k experts by sigmoid weight, plus the ungated shared expert.
++
++    ``partial`` (a tensor-parallel rank's share of every expert's width): the weighted sum in fp32, unrounded, for
++    the ranks to add."""
+ 
+     rows = x.shape[0]
+     experts = router.shape[0]
+@@ -70,4 +73,6 @@ def run(x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: fp8x.Expe
+     grouped.route(buf.pick[:rows], buf.plan, fp8x.PROMPT_TILE if prefill else 16)
+     fp8x.gate_up(x, ex, buf.plan, buf.act[:rows * buf.slots], rows)
+     fp8x.down(buf.act[:rows * buf.slots], ex, buf.plan, buf.y[:rows].view(-1, ex.dims), rows)
++    if partial:
++        return (buf.y[:rows].float() * buf.wts[:rows, :, None]).sum(1)
+     return shared.combine(buf.y[:rows], buf.wts[:rows])
+diff --git a/src/tensorfold/families/kolibri1/cuda/tp.py b/src/tensorfold/families/kolibri1/cuda/tp.py
+new file mode 100644
+index 0000000..643683f
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/cuda/tp.py
+@@ -0,0 +1,80 @@
++"""Kolibri 1 on two ranks: rank 0 schedules; every forward it runs is described to rank 1, which runs the same one.
++
++The description (kind, chains, tokens) goes through NCCL, which waits without a limit while rank 1 idles; the
++forward's own all-gathers go over RoCE when they fit. Both ranks gather the same partials and sum them in rank
++order, so their logits are bit-equal and only rank 0 samples.
++"""
++
++from __future__ import annotations
++
++import torch
++
++from .forward import Chain
++
++HEADER = 256            # int32 words a description carries in one gather; longer ones send the rest in a second
++STOP, PROMPT, DECODE = 0, 1, 2
++
++
++def _nccl(comm):
++    return getattr(comm, "nccl", comm)                # RoceComm wraps NCCL; descriptions take NCCL's unbounded wait
++
++
++class Mirror:
++    def __init__(self, comm, rank: int) -> None:
++        self.comm, self.rank = _nccl(comm), rank
++
++    def _gather(self, words: list[int], n: int) -> list[int]:
++        mine = torch.zeros(n, dtype=torch.int32)
++        if self.rank == 0:
++            mine[:len(words)] = torch.tensor(words, dtype=torch.int32)
++        got = torch.empty(2 * n, dtype=torch.int32, device="cuda")
++        self.comm.all_gather(mine.pin_memory().cuda(non_blocking=True), got)
++        if self.rank == 0:                               # its own words: no wait on the gather here
++            return (list(words) + [0] * n)[:n]
++        return got[:n].tolist()                          # rank 0's words
++
++    def send(self, kind: int, chains=()) -> None:
++        assert self.rank == 0
++        words = [kind, len(chains), sum(len(c.tokens) for c in chains)]
++        for c in chains:
++            words += [c.slot, c.p0, len(c.tokens)]
++        for c in chains:
++            words += list(c.tokens)
++        self._exchange(words)
++
++    def _exchange(self, words: list[int]) -> list[int]:
++        head = self._gather(words[:HEADER], HEADER)
++        kind, n, total = head[0], head[1], head[2]
++        size = 3 + 3 * n + total
++        if size > HEADER:
++            head = head + self._gather(words[HEADER:size], size - HEADER)
++        return head[:size]
++
++    def receive(self) -> tuple[int, list[Chain]]:
++        assert self.rank == 1
++        w = self._exchange([])
++        kind, n = w[0], w[1]
++        chains, at = [], 3 + 3 * n
++        for i in range(n):
++            slot, p0, length = w[3 + 3 * i:6 + 3 * i]
++            chains.append(Chain(slot, p0, w[at:at + length]))
++            at += length
++        return kind, chains
++
++
++def follow(model, graphs, mirror: Mirror) -> None:
++    """Rank 1: run every forward rank 0 describes until it says stop."""
++
++    while True:
++        kind, chains = mirror.receive()
++        if kind == STOP:
++            return
++        try:
++            if kind == PROMPT:
++                model.forward(chains, prompt=True)
++            elif graphs is not None:
++                graphs.forward(chains)
++            else:
++                model.forward(chains, prompt=False, rows=range(sum(len(c.tokens) for c in chains)))
++        except ValueError as exc:            # refused before any gather, on rank 0 too (the same check)
++            print(f"[tensorfold] kolibri1 rank 1: {exc}", flush=True)
+diff --git a/src/tensorfold/families/kolibri1/cuda/weights.py b/src/tensorfold/families/kolibri1/cuda/weights.py
+index 091683f..38e056f 100644
+--- a/src/tensorfold/families/kolibri1/cuda/weights.py
++++ b/src/tensorfold/families/kolibri1/cuda/weights.py
+@@ -78,14 +78,35 @@ class Weights:
+     embed: torch.Tensor             # [V, D] bf16
+     layers: list[Layer] = field(default_factory=list)
+     norm: torch.Tensor | None = None
+-    head: torch.Tensor | None = None  # [V, D] bf16
++    head: torch.Tensor | None = None  # [V, D] bf16 (a rank's V / world rows under TP)
++    rank: int = 0
++    world: int = 1
++    full: Config | None = None        # the checkpoint's config (``config`` holds a rank's heads under TP)
+ 
+ 
+-def load(model_dir: str | Path, device: str = "cuda") -> Weights:
++def _rows(t: torch.Tensor, lo: int, hi: int, dim: int) -> torch.Tensor:
++    return t.narrow(dim, lo, hi - lo).contiguous()
++
++
++def load(model_dir: str | Path, device: str = "cuda", *, rank: int = 0, world: int = 1) -> Weights:
++    """The checkpoint, or under tensor parallelism (``world`` 2) rank ``rank``'s share: its query and key heads, its
++    o_proj inputs, its half of every expert's width (shared one included) and its half of the vocabulary; the
++    embedding, norms and router whole on every rank."""
++
++    from dataclasses import replace
++
+     from tensorfold.cuda.direct_read import SafeTensors
+ 
+     model_dir = Path(model_dir)
+-    cfg = Config.read(model_dir)
++    full = Config.read(model_dir)
++    if world not in (1, 2) or not 0 <= rank < world:
++        raise ValueError(f"Kolibri 1 runs on 1 or 2 ranks, not rank {rank} of {world}")
++    if full.heads % world or full.kv_heads % world or full.moe_width % (128 * world) \
++            or full.shared_width != full.moe_width or full.vocab % world:
++        raise ValueError(f"Kolibri 1's shapes do not split over {world} ranks")
++    cfg = replace(full, heads=full.heads // world, kv_heads=full.kv_heads // world)
++    hd, B = full.head_dim, 128
++    qh, kh, ni = cfg.heads, cfg.kv_heads, full.moe_width // world
+     index = json.loads((model_dir / "model.safetensors.index.json").read_text())["weight_map"]
+     f = SafeTensors(sorted({model_dir / v for v in index.values()}))
+     t0 = time.perf_counter()
+@@ -96,28 +117,43 @@ def load(model_dir: str | Path, device: str = "cuda") -> Weights:
+     def fp8(name: str) -> tuple[torch.Tensor, torch.Tensor]:
+         return get(name + ".weight").view(torch.float8_e4m3fn), get(name + ".weight_scale_inv").float()
+ 
+-    def linear(*names: str) -> Fp8BlockLinear:
+-        parts = [fp8(n) for n in names]
++    def out_rows(pair, lo: int, hi: int):          # output rows [lo, hi) of a [N, K] weight, 128-row scale blocks
++        w8, s = pair
++        if world == 1:
++            return pair
++        return _rows(w8, lo, hi, w8.dim() - 2), _rows(s, lo // B, hi // B, s.dim() - 2)
++
++    def in_cols(pair, lo: int, hi: int):           # input columns [lo, hi)
++        w8, s = pair
++        if world == 1:
++            return pair
++        return _rows(w8, lo, hi, w8.dim() - 1), _rows(s, lo // B, hi // B, s.dim() - 1)
++
++    def linear(*parts) -> Fp8BlockLinear:
+         return Fp8BlockLinear.from_checkpoint(torch.cat([w for w, _ in parts]), torch.cat([s for _, s in parts]))
+ 
+-    w = Weights(cfg, get("model.embed_tokens.weight").to(torch.bfloat16).contiguous())
++    w = Weights(cfg, get("model.embed_tokens.weight").to(torch.bfloat16).contiguous(), rank=rank, world=world,
++                full=full)
+     for i in range(cfg.layers):
+         p = f"model.layers.{i}."
+         a = p + "self_attn."
+         mats = {}
+         for proj in ("gate_proj", "up_proj", "down_proj"):
+-            parts = [fp8(f"{p}mlp.experts.{e}.{proj}") for e in range(cfg.experts)]
+-            parts.append(fp8(f"{p}mlp.shared_experts.{proj}"))
++            cut = in_cols if proj == "down_proj" else out_rows
++            parts = [cut(fp8(f"{p}mlp.experts.{e}.{proj}"), rank * ni, (rank + 1) * ni) for e in range(cfg.experts)]
++            parts.append(cut(fp8(f"{p}mlp.shared_experts.{proj}"), rank * ni, (rank + 1) * ni))
+             mats[proj] = (torch.stack([x for x, _ in parts]), torch.stack([s for _, s in parts]))
+             del parts
+         ex = fp8x.make(mats["gate_proj"], mats["up_proj"], mats["down_proj"])
+         del mats
+         w.layers.append(Layer(
+             input_norm=get(p + "input_layernorm.weight").float().contiguous(),
+-            qkv=linear(a + "q_proj", a + "k_proj", a + "v_proj"),
++            qkv=linear(out_rows(fp8(a + "q_proj"), rank * qh * hd, (rank + 1) * qh * hd),
++                       out_rows(fp8(a + "k_proj"), rank * kh * hd, (rank + 1) * kh * hd),
++                       out_rows(fp8(a + "v_proj"), rank * kh * hd, (rank + 1) * kh * hd)),
+             q_norm=get(a + "q_norm.weight").float().contiguous(),
+             k_norm=get(a + "k_norm.weight").float().contiguous(),
+-            o=linear(a + "o_proj"),
++            o=linear(in_cols(fp8(a + "o_proj"), rank * qh * hd, (rank + 1) * qh * hd)),
+             post_attn_norm=get(p + "post_attn_norm.weight").float().contiguous(),
+             pre_moe_norm=get(p + "post_attention_layernorm.weight").float().contiguous(),
+             router=get(p + "mlp.gate.weight").to(torch.bfloat16).contiguous(),
+@@ -127,6 +163,9 @@ def load(model_dir: str | Path, device: str = "cuda") -> Weights:
+         if i % 10 == 9 or i == cfg.layers - 1:
+             print(f"[tensorfold] kolibri1: {i + 1}/{cfg.layers} layers in {time.perf_counter() - t0:.0f}s", flush=True)
+     w.norm = get("model.norm.weight").float().contiguous()
+-    w.head = get("lm_head.weight").to(torch.bfloat16).contiguous()
++    head = get("lm_head.weight")
++    v = full.vocab // world
++    w.head = head[rank * v:(rank + 1) * v].to(torch.bfloat16).contiguous()
++    del head
+     f.close()
+     return w
+diff --git a/tests/cuda/test_kolibri1_tp.py b/tests/cuda/test_kolibri1_tp.py
+new file mode 100644
+index 0000000..1cb5ead
+--- /dev/null
++++ b/tests/cuda/test_kolibri1_tp.py
+@@ -0,0 +1,129 @@
++"""Kolibri 1 on two ranks, simulated on one GPU (a thread a rank, an in-process all-gather): rank-equal logits that
++track the one-GPU forward, and the forward descriptions rank 1 follows."""
++
++from __future__ import annotations
++
++import sys
++import threading
++from pathlib import Path
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++sys.path.insert(0, str(Path(__file__).parent))
++
++from kolibri1_tiny import write  # noqa: E402
++
++
++class PairComm:
++    """Two threads' all-gather in rank order: each publishes its send, both copy both."""
++
++    def __init__(self, shared: dict, rank: int) -> None:
++        self.shared, self.rank, self.world = shared, rank, 2
++
++    def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
++        torch.cuda.synchronize()
++        self.shared[self.rank] = send.detach().clone()
++        self.shared["bar"].wait()
++        r = recv.view(2, -1)
++        r[0].copy_(self.shared[0].reshape(-1))
++        r[1].copy_(self.shared[1].reshape(-1))
++        torch.cuda.synchronize()
++        self.shared["bar"].wait()
++
++    def barrier(self) -> None:
++        self.shared["bar"].wait()
++
++
++def pair(fn):
++    shared = {"bar": threading.Barrier(2, timeout=120)}
++    out, errors = [None, None], []
++
++    def run(rank):
++        try:
++            out[rank] = fn(rank, PairComm(shared, rank))
++        except BaseException as e:              # noqa: BLE001
++            errors.append(e)
++            shared["bar"].abort()
++
++    ts = [threading.Thread(target=run, args=(r,)) for r in (0, 1)]
++    for t in ts:
++        t.start()
++    for t in ts:
++        t.join()
++    if errors:
++        raise errors[0]
++    return out
++
++
++@pytest.fixture(scope="module")
++def tiny(tmp_path_factory) -> Path:
++    return write(tmp_path_factory.mktemp("kolibri1-tiny-tp"), width=256)
++
++
++def tokens(n: int, seed: int = 0) -> list[int]:
++    g = torch.Generator().manual_seed(seed)
++    return torch.randint(0, 500, (n,), generator=g).tolist()
++
++
++def decode(model, prompt, steps, slot=0):
++    from tensorfold.families.kolibri1.cuda.forward import Chain
++
++    rows = [model.prefill(prompt, slot=slot)[0]]
++    nxt, pos = int(rows[0].argmax()), len(prompt)
++    for _ in range(steps):
++        r = model.forward([Chain(slot, pos, [nxt])], prompt=False, rows=range(1))[0]
++        rows.append(r)
++        nxt, pos = int(r.argmax()), pos + 1
++    return torch.stack(rows)
++
++
++def test_two_ranks_agree_bit_for_bit_and_track_one_gpu(tiny):
++    from tensorfold.families.kolibri1.cuda.forward import Model
++    from tensorfold.families.kolibri1.cuda.weights import load
++
++    prompt = tokens(60, seed=7)
++    one = decode(Model(load(tiny), 256), prompt, 12)
++
++    def rank_run(rank, comm):
++        return decode(Model(load(tiny, rank=rank, world=2), 256, comm=comm), prompt, 12)
++
++    r0, r1 = pair(rank_run)
++    assert torch.equal(r0, r1)
++    assert r0.shape == one.shape
++    cos = torch.nn.functional.cosine_similarity(r0, one, dim=-1)
++    assert cos.min() > 0.995, cos
++    assert (r0.argmax(-1) == one.argmax(-1)).all()
++
++
++def test_a_ranks_share_halves_heads_experts_and_vocab(tiny):
++    from tensorfold.families.kolibri1.cuda.weights import load
++
++    full, half = load(tiny), load(tiny, rank=1, world=2)
++    assert half.config.heads * 2 == full.config.heads and half.config.kv_heads * 2 == full.config.kv_heads
++    assert half.head.shape[0] * 2 == full.head.shape[0]
++    assert torch.equal(half.head, full.head[full.head.shape[0] // 2:])
++    assert half.layers[0].experts.width * 2 == full.layers[0].experts.width
++
++
++def test_rank_one_receives_the_forwards_rank_zero_describes():
++    from tensorfold.families.kolibri1.cuda.forward import Chain
++    from tensorfold.families.kolibri1.cuda.tp import DECODE, PROMPT, STOP, Mirror
++
++    sent = [(PROMPT, [Chain(1, 0, tokens(700, seed=1))]),             # longer than one header
++            (DECODE, [Chain(0, 33, [5]), Chain(2, 90, [7, 8, 9])]),
++            (STOP, [])]
++
++    def run(rank, comm):
++        m = Mirror(comm, rank)
++        if rank == 0:
++            for kind, chains in sent:
++                m.send(kind, chains)
++            return None
++        return [m.receive() for _ in sent]
++
++    _, got = pair(run)
++    for (kind, chains), (k, c) in zip(sent, got):
++        assert k == kind
++        assert [(x.slot, x.p0, list(x.tokens)) for x in c] == [(x.slot, x.p0, list(x.tokens)) for x in chains]
+-- 
+2.53.0
+

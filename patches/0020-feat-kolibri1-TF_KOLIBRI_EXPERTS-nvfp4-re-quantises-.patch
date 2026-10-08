@@ -1,0 +1,154 @@
+From 3b23b21902b747032c79ad04cedf43f63d335b8a Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 23:25:12 +1100
+Subject: [PATCH 20/23] feat(kolibri1): TF_KOLIBRI_EXPERTS=nvfp4 re-quantises
+ the FP8 experts to NVFP4 at load (MSE-chosen block scales) on the grouped
+ NVFP4 kernel
+
+---
+ src/tensorfold/families/kolibri1/cuda/moe.py  | 10 ++--
+ .../families/kolibri1/cuda/quant.py           | 59 +++++++++++++++++++
+ .../families/kolibri1/cuda/weights.py         | 10 +++-
+ 3 files changed, 73 insertions(+), 6 deletions(-)
+ create mode 100644 src/tensorfold/families/kolibri1/cuda/quant.py
+
+diff --git a/src/tensorfold/families/kolibri1/cuda/moe.py b/src/tensorfold/families/kolibri1/cuda/moe.py
+index 0d244bd..84ba47b 100644
+--- a/src/tensorfold/families/kolibri1/cuda/moe.py
++++ b/src/tensorfold/families/kolibri1/cuda/moe.py
+@@ -10,6 +10,7 @@ import triton.language as tl
+ from tensorfold.cuda import experts as grouped
+ from tensorfold.cuda import moe as shared
+ from tensorfold.cuda.fp8 import experts as fp8x
++from tensorfold.cuda.nvfp4 import experts as nvx
+ 
+ 
+ @triton.jit
+@@ -53,7 +54,7 @@ _scratch: dict[tuple, Buffers] = {}
+ _PROMPT_BF16 = __import__("os").environ.get("TF_KOLIBRI_PROMPT_PARTIAL", "bf16") == "bf16"
+ 
+ 
+-def run(x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: fp8x.Experts8, top_k: int, *,
++def run(x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: fp8x.Experts8 | nvx.Experts4, top_k: int, *,
+         prefill: bool = False, partial: bool = False) -> torch.Tensor:
+     """x [R, D] bf16 -> [R, D] bf16: its top-k experts by sigmoid weight, plus the ungated shared expert.
+ 
+@@ -71,9 +72,10 @@ def run(x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: fp8x.Expe
+     shared.router(x, router, buf.logits[:rows])
+     _topk[(rows,)](buf.logits, bias, buf.pick, buf.wts, NE=experts, TOPK=top_k, SLOTS=top_k + 1,
+                    BLOCK=triton.next_power_of_2(experts), SLOTP=triton.next_power_of_2(top_k + 1), num_warps=4)
+-    grouped.route(buf.pick[:rows], buf.plan, fp8x.PROMPT_TILE if prefill else 16)
+-    fp8x.gate_up(x, ex, buf.plan, buf.act[:rows * buf.slots], rows)
+-    fp8x.down(buf.act[:rows * buf.slots], ex, buf.plan, buf.y[:rows].view(-1, ex.dims), rows)
++    kx = nvx if isinstance(ex, nvx.Experts4) else fp8x
++    grouped.route(buf.pick[:rows], buf.plan, (nvx.PREFILL_TILE if kx is nvx else fp8x.PROMPT_TILE) if prefill else 16)
++    kx.gate_up(x, ex, buf.plan, buf.act[:rows * buf.slots], rows)
++    kx.down(buf.act[:rows * buf.slots], ex, buf.plan, buf.y[:rows].view(-1, ex.dims), rows)
+     if partial:
+         out = (buf.y[:rows].float() * buf.wts[:rows, :, None]).sum(1)
+         # prompt rows cross the link in bf16 (their expert outputs are bf16 already): half the bytes
+diff --git a/src/tensorfold/families/kolibri1/cuda/quant.py b/src/tensorfold/families/kolibri1/cuda/quant.py
+new file mode 100644
+index 0000000..ec1962a
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/cuda/quant.py
+@@ -0,0 +1,59 @@
++"""Kolibri 1's FP8 experts re-quantised to NVFP4 at load (opt-in, quality-gated): half the expert bytes a token.
++
++Each 16-input block takes the e4m3 scale (of four candidates around amax / 6) with the least squared error against
++the checkpoint's own FP8 weights, so the 4-bit copy tracks the shipped numerics, not a bf16 ancestor."""
++
++from __future__ import annotations
++
++import torch
++
++from tensorfold.cuda.fp8 import experts as fp8x
++from tensorfold.cuda.nvfp4 import experts as nvx
++
++MAGS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
++CUTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)          # midpoints between MAGS
++FACTORS = (1.0, 0.95, 0.9, 0.85)                        # candidate scale = factor * amax / 6
++
++
++def _nvfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """fp32 [E, N, K] -> (words [E, N, K/2] uint8 low nibble first, e4m3 scale bytes [E, N, K/16], scales [E])."""
++
++    e, n, k = w.shape
++    blocks = w.view(e, n, k // 16, 16)
++    g = (w.abs().amax(dim=(1, 2)) / (6.0 * 448.0)).clamp_min(1e-30)               # [E]
++    gb = g.view(e, 1, 1, 1)
++    amax = blocks.abs().amax(-1, keepdim=True)
++    mags = torch.tensor(MAGS, device=w.device)
++    cuts = torch.tensor(CUTS, device=w.device)
++    best_err = best_s = best_i = None
++    for f in FACTORS:
++        s = (amax * f / 6.0 / gb).clamp(max=448.0).to(torch.float8_e4m3fn)
++        step = s.float() * gb
++        v = torch.where(step > 0, blocks / step.clamp_min(1e-30), torch.zeros_like(blocks))
++        i = torch.bucketize(v.abs().clamp(max=6.0), cuts)                         # nearest magnitude, 0..7
++        err = ((mags[i] * torch.sign(v) * step - blocks) ** 2).sum(-1, keepdim=True)
++        code = i + 8 * (v < 0).to(i.dtype)
++        if best_err is None:
++            best_err, best_s, best_i = err, s, code
++        else:
++            take = err < best_err
++            best_err = torch.where(take, err, best_err)
++            best_s = torch.where(take, s.view(torch.uint8), best_s.view(torch.uint8)).view(torch.float8_e4m3fn)
++            best_i = torch.where(take, code, best_i)
++    code = best_i.view(e, n, k).to(torch.uint8)
++    words = (code[..., 0::2] | (code[..., 1::2] << 4)).contiguous()
++    return words, best_s.view(e, n, k // 16).view(torch.uint8).contiguous(), g
++
++
++def from_fp8(weight: torch.Tensor, scale: torch.Tensor, chunk: int = 8):
++    """FP8 [E, N, K] with 128 x 128 fp32 scales -> an NVFP4 triple for ``nvx.make``, ``chunk`` experts at a time."""
++
++    parts = [_nvfp4(fp8x.dense(weight[e0:e0 + chunk], scale[e0:e0 + chunk]))
++             for e0 in range(0, weight.shape[0], chunk)]
++    return tuple(torch.cat(p) for p in zip(*parts))
++
++
++def make(gate: tuple, up: tuple, down: tuple) -> nvx.Experts4:
++    """The FP8 stacks ``fp8x.make`` takes -> grouped NVFP4 experts (the shared one last, as in the FP8 table)."""
++
++    return nvx.make(from_fp8(*gate), from_fp8(*up), from_fp8(*down))
+diff --git a/src/tensorfold/families/kolibri1/cuda/weights.py b/src/tensorfold/families/kolibri1/cuda/weights.py
+index 7a5f796..bf6d48d 100644
+--- a/src/tensorfold/families/kolibri1/cuda/weights.py
++++ b/src/tensorfold/families/kolibri1/cuda/weights.py
+@@ -11,8 +11,13 @@ from pathlib import Path
+ import torch
+ 
+ from tensorfold.cuda.fp8 import experts as fp8x
++from tensorfold.cuda.nvfp4 import experts as nvx
+ from tensorfold.cuda.nvfp4.linear import Fp8BlockLinear
+ 
++from . import quant
++
++EXPERTS = os.environ.get("TF_KOLIBRI_EXPERTS", "fp8")      # fp8: as shipped; nvfp4: re-quantised at load
++
+ 
+ @dataclass(frozen=True)
+ class Config:
+@@ -69,7 +74,7 @@ class Layer:
+     pre_moe_norm: torch.Tensor
+     router: torch.Tensor            # [E, D] bf16
+     bias: torch.Tensor              # [E] fp32
+-    experts: fp8x.Experts8          # E routed, then the shared expert
++    experts: fp8x.Experts8 | nvx.Experts4   # E routed, then the shared expert
+     post_moe_norm: torch.Tensor
+ 
+ 
+@@ -154,7 +159,8 @@ def load(model_dir: str | Path, device: str = "cuda", *, rank: int = 0, world: i
+             parts.append(cut(fp8(f"{p}mlp.shared_experts.{proj}"), rank * ni, (rank + 1) * ni))
+             mats[proj] = (torch.stack([x for x, _ in parts]), torch.stack([s for _, s in parts]))
+             del parts
+-        ex = fp8x.make(mats["gate_proj"], mats["up_proj"], mats["down_proj"])
++        ex = quant.make(mats["gate_proj"], mats["up_proj"], mats["down_proj"]) if EXPERTS == "nvfp4" \
++            else fp8x.make(mats["gate_proj"], mats["up_proj"], mats["down_proj"])
+         del mats
+         w.layers.append(Layer(
+             input_norm=get(p + "input_layernorm.weight").float().contiguous(),
+-- 
+2.53.0
+

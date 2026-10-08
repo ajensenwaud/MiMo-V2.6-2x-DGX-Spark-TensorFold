@@ -1,0 +1,1596 @@
+From 320042d6529d2236470f64518804f0e6d48af275 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=BCrgen=20Schmied?= <juergenschmied70@gmail.com>
+Date: Sat, 3 Oct 2026 23:21:01 +0200
+Subject: [PATCH 02/23] feat(kolibri1 cuda): Aleph Alpha's Kolibri 1 FP8
+ checkpoint on one GPU: grouped block-FP8 experts, sliding-window rings,
+ sigmoid routing, --parallel streams
+
+---
+ pyproject.toml                                |   1 +
+ src/tensorfold/cli.py                         |   3 +-
+ src/tensorfold/cuda/fp8/__init__.py           |   1 +
+ src/tensorfold/cuda/fp8/experts.cpp           |  23 +++
+ src/tensorfold/cuda/fp8/experts.cu            | 184 ++++++++++++++++++
+ src/tensorfold/cuda/fp8/experts.py            |  97 +++++++++
+ src/tensorfold/families/kolibri1/__init__.py  |  36 ++++
+ .../families/kolibri1/cuda/__init__.py        |   1 +
+ .../families/kolibri1/cuda/attention.py       |  97 +++++++++
+ .../families/kolibri1/cuda/decoder.py         | 103 ++++++++++
+ .../families/kolibri1/cuda/engine.py          |  71 +++++++
+ .../families/kolibri1/cuda/forward.py         | 163 ++++++++++++++++
+ src/tensorfold/families/kolibri1/cuda/moe.py  |  73 +++++++
+ .../families/kolibri1/cuda/weights.py         | 132 +++++++++++++
+ tests/cuda/kolibri1_reference.py              | 133 +++++++++++++
+ tests/cuda/kolibri1_tiny.py                   |  65 +++++++
+ tests/cuda/test_fp8_experts.py                |  69 +++++++
+ tests/cuda/test_kolibri1_attention.py         |  73 +++++++
+ tests/cuda/test_kolibri1_forward.py           |  98 ++++++++++
+ 19 files changed, 1422 insertions(+), 1 deletion(-)
+ create mode 100644 src/tensorfold/cuda/fp8/__init__.py
+ create mode 100644 src/tensorfold/cuda/fp8/experts.cpp
+ create mode 100644 src/tensorfold/cuda/fp8/experts.cu
+ create mode 100644 src/tensorfold/cuda/fp8/experts.py
+ create mode 100644 src/tensorfold/families/kolibri1/__init__.py
+ create mode 100644 src/tensorfold/families/kolibri1/cuda/__init__.py
+ create mode 100644 src/tensorfold/families/kolibri1/cuda/attention.py
+ create mode 100644 src/tensorfold/families/kolibri1/cuda/decoder.py
+ create mode 100644 src/tensorfold/families/kolibri1/cuda/engine.py
+ create mode 100644 src/tensorfold/families/kolibri1/cuda/forward.py
+ create mode 100644 src/tensorfold/families/kolibri1/cuda/moe.py
+ create mode 100644 src/tensorfold/families/kolibri1/cuda/weights.py
+ create mode 100644 tests/cuda/kolibri1_reference.py
+ create mode 100644 tests/cuda/kolibri1_tiny.py
+ create mode 100644 tests/cuda/test_fp8_experts.py
+ create mode 100644 tests/cuda/test_kolibri1_attention.py
+ create mode 100644 tests/cuda/test_kolibri1_forward.py
+
+diff --git a/pyproject.toml b/pyproject.toml
+index df71278..e9dc392 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -65,6 +65,7 @@ where = ["src"]
+ "tensorfold.families.nemotron_h.cuda" = ["*.cu", "*.cpp"]
+ "tensorfold.cuda.exl3" = ["*.cu", "*.cuh", "*.cpp"]
+ "tensorfold.cuda.nvfp4" = ["*.cu", "*.cuh", "*.cpp"]
++"tensorfold.cuda.fp8" = ["*.cu", "*.cpp"]
+ "tensorfold.streaming.hostsync" = ["*.cpp", "CMakeLists.txt"]
+ 
+ [tool.pytest.ini_options]
+diff --git a/src/tensorfold/cli.py b/src/tensorfold/cli.py
+index 930f164..fd639a9 100644
+--- a/src/tensorfold/cli.py
++++ b/src/tensorfold/cli.py
+@@ -317,7 +317,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+     own = getattr(weights, "precision", "") == precision.CHECKPOINT
+     prompts = "FP8 activations" if fp8 else "the checkpoint math" if own else "bf16 activations"
+     print(f"[tensorfold] serving {served} at http://{args.host}:{args.port}/v1 on CUDA{where} "
+-          f"(sampling: {shown}; drafts: {'off' if args.no_drafts else 'on'}; prompts: {prompts}; "
++          f"(sampling: {shown}; drafts: {'on' if getattr(engine, 'drafts', not args.no_drafts) else 'off'}; "
++          f"prompts: {prompts}; "
+           f"context: {'unlimited' if effective_context is None else effective_context}; "
+           f"loaded in {time.perf_counter() - started:.1f}s)", flush=True)
+     app.auth = getattr(args, "auth", None)
+diff --git a/src/tensorfold/cuda/fp8/__init__.py b/src/tensorfold/cuda/fp8/__init__.py
+new file mode 100644
+index 0000000..8b9971c
+--- /dev/null
++++ b/src/tensorfold/cuda/fp8/__init__.py
+@@ -0,0 +1 @@
++"""Block-FP8 (128 x 128, fp32 scales) kernels on CUDA."""
+diff --git a/src/tensorfold/cuda/fp8/experts.cpp b/src/tensorfold/cuda/fp8/experts.cpp
+new file mode 100644
+index 0000000..4d772e5
+--- /dev/null
++++ b/src/tensorfold/cuda/fp8/experts.cpp
+@@ -0,0 +1,23 @@
++#include <torch/extension.h>
++
++void fp8_experts_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
++                      const at::Tensor& scale, int64_t kg, int64_t nb, const at::Tensor& items,
++                      const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n, double limit,
++                      int64_t skip, int64_t max_units);
++
++// epi 2: out [pairs, n] bf16 SwiGLU of gate and up; 0: fp32 down; 3: bf16 down. w: [E, n/32, K/32, M, 32, 2] uint4.
++void experts(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
++             const at::Tensor& scale, int64_t kg, int64_t nb, const at::Tensor& items, const at::Tensor& counts,
++             const at::Tensor& members, at::Tensor out, int64_t n, double limit, int64_t skip, int64_t max_units) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.stride(-1) == 1, "x: bf16 rows");
++    TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.scalar_type() == at::kInt, "w: int32 blocks");
++    TORCH_CHECK(scale.is_cuda() && scale.is_contiguous() && scale.scalar_type() == at::kFloat, "scale: fp32");
++    TORCH_CHECK(kg % 4 == 0 && (nb * 32) % 128 == 0, "K and n in 128 x 128 scale blocks");
++    TORCH_CHECK(out.is_cuda() && out.is_contiguous(), "out: contiguous");
++    fp8_experts_cuda(epi, x, x_stride, slots, w, scale, kg, nb, items, counts, members, out, n, limit, skip,
++                     max_units);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("experts", &experts);
++}
+diff --git a/src/tensorfold/cuda/fp8/experts.cu b/src/tensorfold/cuda/fp8/experts.cu
+new file mode 100644
+index 0000000..c28d0aa
+--- /dev/null
++++ b/src/tensorfold/cuda/fp8/experts.cu
+@@ -0,0 +1,184 @@
++// Grouped block-FP8 experts on the shared plan: each 128 inputs' bf16 mma chain from zero, then acc = fma(chain, its
++// fp32 block scale, acc) in block order; one pair an mma row, so no pair affects another.
++
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_bf16.h>
++#include <stdint.h>
++#include <torch/extension.h>
++
++#include "../experts.cuh"
++
++namespace {
++
++constexpr int LANE4 = 2;             // uint4 a lane's words in a (32 columns, 32 inputs) block: k16 halves 0 and 1
++constexpr int BLOCK4 = 32 * LANE4;   // uint4 a (32 columns, 32 inputs) block of one matrix
++constexpr int PER_SCALE = 4;         // 32-input blocks under one 128 x 128 scale
++
++__device__ __forceinline__ uint4 ld_nc(const uint4* p) {
++  uint4 r;
++  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];\n"
++               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
++               : "l"(p));
++  return r;
++}
++
++// bf16x2 of the e4m3 bytes at bits [0, 8) and [8, 16) of v: sign and the seven other bits into bf16's fields, times
++// 2^120 (exact, subnormals included)
++__device__ __forceinline__ uint32_t fp8pair(uint32_t v) {
++  const uint32_t t = ((v & 0x7Fu) << 4) | ((v & 0x80u) << 8) | ((v & 0x7F00u) << 12) | ((v & 0x8000u) << 16);
++  uint32_t r;
++  asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x7B807B80u), "r"(0x80008000u));
++  return r;
++}
++
++template <int M>
++struct Stage {
++  uint4 w[M][LANE4];   // the lane's words: half h's tiles 0-3, each four bytes of inputs 16h + 4t .. 16h + 4t + 3
++  uint2 xa[2], xb[2];  // rows gq and gq + 8: inputs 16h + 4t .. 16h + 4t + 3
++};
++
++template <int M>
++__device__ __forceinline__ void load_stage(Stage<M>& st, const uint4* blk, int g, int lane, int t,
++                                           const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0, bool v1) {
++  const uint4* b = blk + (size_t)g * (M * BLOCK4) + lane * LANE4;
++#pragma unroll
++  for (int m = 0; m < M; ++m)
++#pragma unroll
++    for (int h = 0; h < LANE4; ++h) st.w[m][h] = ld_nc(b + m * BLOCK4 + h);
++  const uint2 zero = make_uint2(0u, 0u);
++  const int k0 = g * 32 + 4 * t;
++#pragma unroll
++  for (int h = 0; h < 2; ++h) {
++    st.xa[h] = v0 ? __ldg(reinterpret_cast<const uint2*>(x0 + k0 + 16 * h)) : zero;
++    st.xb[h] = v1 ? __ldg(reinterpret_cast<const uint2*>(x1 + k0 + 16 * h)) : zero;
++  }
++}
++
++template <int M>
++__device__ __forceinline__ void compute_stage(float (&part)[M][NTW][4], const Stage<M>& st) {
++#pragma unroll
++  for (int m = 0; m < M; ++m)
++#pragma unroll
++    for (int h = 0; h < 2; ++h) {
++      const uint32_t a0 = st.xa[h].x, a2 = st.xa[h].y, a1 = st.xb[h].x, a3 = st.xb[h].y;
++#pragma unroll
++      for (int j = 0; j < NTW; ++j) {
++        const uint32_t word = comp(st.w[m][h], j);
++        mma(part[m][j], a0, a1, a2, a3, fp8pair(word), fp8pair(word >> 16));
++      }
++    }
++}
++
++// The K loop: 32-input blocks two in flight; every PER_SCALE blocks the chain folds into acc under its scale.
++template <int M>
++__device__ __forceinline__ void k_loop(float (&acc)[M][1][NTW][4], const uint4* blk, const float* sc, int KG,
++                                       int lane, int t, const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0,
++                                       bool v1, int sstride) {
++  constexpr int D = 2;
++  Stage<M> st[D];
++  float part[M][NTW][4];
++#pragma unroll
++  for (int d = 0; d < D; ++d)
++    if (d < KG) load_stage<M>(st[d], blk, d, lane, t, x0, x1, v0, v1);
++  for (int g0 = 0; g0 < KG; g0 += D) {
++#pragma unroll
++    for (int d = 0; d < D; ++d) {
++      const int g = g0 + d;
++      if (g < KG) {
++        if (g % PER_SCALE == 0) {
++#pragma unroll
++          for (int m = 0; m < M; ++m)
++#pragma unroll
++            for (int j = 0; j < NTW; ++j) part[m][j][0] = part[m][j][1] = part[m][j][2] = part[m][j][3] = 0.f;
++        }
++        compute_stage<M>(part, st[d]);
++        if (g + D < KG) load_stage<M>(st[d], blk, g + D, lane, t, x0, x1, v0, v1);
++        if (g % PER_SCALE == PER_SCALE - 1) {
++          const int sg = g / PER_SCALE;
++#pragma unroll
++          for (int m = 0; m < M; ++m) {
++            const float s = __ldg(sc + m * sstride + sg);
++#pragma unroll
++            for (int j = 0; j < NTW; ++j)
++#pragma unroll
++              for (int q = 0; q < 4; ++q) acc[m][0][j][q] = fmaf(part[m][j][q], s, acc[m][0][j][q]);
++          }
++        }
++      }
++    }
++  }
++}
++
++// Pair p reads X row p / slots when slots > 0 (X holds tokens), else X row p; an item's pairs go 16 at a time.
++// scale: [E, M, N / 128, K / 128] fp32; a unit's 32 columns lie in one 128-row scale block.
++template <int M, int EPI, int WARPS>
++__global__ void __launch_bounds__(WARPS * 32)
++    fp8_expert_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                      const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                      const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
++                      float limit, int skip) {
++  const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
++  const int units = __ldg(counts) * NB;
++  const int SG = KG / PER_SCALE, NR = (NB * COLS) / 128;
++  for (int unit = blockIdx.x * WARPS + (threadIdx.x >> 5); unit < units; unit += gridDim.x * WARPS) {
++    const int it = unit / NB, cb = unit - it * NB;
++    const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
++    if (e == skip) continue;
++    const uint4* blk = W + ((size_t)e * NB + cb) * (size_t)KG * (M * BLOCK4);
++    const float* sc = scale + ((size_t)e * M * NR + (cb * COLS) / 128) * SG;
++    for (int r0 = 0; r0 < cnt; r0 += 16) {
++      const bool v0 = r0 + gq < cnt, v1 = r0 + gq + 8 < cnt;
++      const int pr0 = v0 ? __ldg(members + first + r0 + gq) : 0;
++      const int pr1 = v1 ? __ldg(members + first + r0 + gq + 8) : 0;
++      const int x0r = slots ? pr0 / slots : pr0, x1r = slots ? pr1 / slots : pr1;
++      const __nv_bfloat16* x0 = X + (size_t)x0r * x_stride;
++      const __nv_bfloat16* x1 = X + (size_t)x1r * x_stride;
++      float acc[M][1][NTW][4];
++#pragma unroll
++      for (int m = 0; m < M; ++m)
++#pragma unroll
++        for (int j = 0; j < NTW; ++j) acc[m][0][j][0] = acc[m][0][j][1] = acc[m][0][j][2] = acc[m][0][j][3] = 0.f;
++      k_loop<M>(acc, blk, sc, KG, lane, t, x0, x1, v0, v1, NR * SG);
++      epilogue<EPI, M, 1>(acc, 0, out, N, cb * COLS + 2 * t, pr0, pr1, v0, v1, limit);
++    }
++  }
++}
++
++template <int M, int EPI>
++void launch(const at::Tensor& x, int x_stride, int slots, const at::Tensor& w, const at::Tensor& scale, int kg,
++            int nb, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& out,
++            int n, float limit, int skip, int64_t max_units) {
++  constexpr int WARPS = 4;
++  static int per_sm = 0;
++  static int sms = 0;
++  if (per_sm == 0) {
++    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, fp8_expert_kernel<M, EPI, WARPS>, WARPS * 32, 0);
++    sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++    per_sm = per_sm < 1 ? 1 : per_sm;
++  }
++  const int64_t need = (max_units + WARPS - 1) / WARPS;
++  const int grid = static_cast<int>(need < (int64_t)per_sm * sms ? need : (int64_t)per_sm * sms);
++  if (grid < 1) return;
++  fp8_expert_kernel<M, EPI, WARPS><<<grid, WARPS * 32, 0, at::cuda::getCurrentCUDAStream()>>>(
++      reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), x_stride, slots,
++      reinterpret_cast<const uint4*>(w.data_ptr()), scale.data_ptr<float>(), kg, nb, items.data_ptr<int>(),
++      counts.data_ptr<int>(), members.data_ptr<int>(), out.data_ptr(), n, limit, skip);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++}  // namespace
++
++void fp8_experts_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
++                      const at::Tensor& scale, int64_t kg, int64_t nb, const at::Tensor& items,
++                      const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n, double limit,
++                      int64_t skip, int64_t max_units) {
++  const c10::cuda::CUDAGuard guard(x.device());
++  const int xs = static_cast<int>(x_stride), sl = static_cast<int>(slots), k = static_cast<int>(kg);
++  const int b = static_cast<int>(nb), nn = static_cast<int>(n), sk = static_cast<int>(skip);
++  const float lim = static_cast<float>(limit);
++  if (epi == 2) launch<2, 2>(x, xs, sl, w, scale, k, b, items, counts, members, out, nn, lim, sk, max_units);
++  else if (epi == 0) launch<1, 0>(x, xs, sl, w, scale, k, b, items, counts, members, out, nn, lim, sk, max_units);
++  else if (epi == 3) launch<1, 3>(x, xs, sl, w, scale, k, b, items, counts, members, out, nn, lim, sk, max_units);
++  else TORCH_CHECK(false, "fp8 experts: epilogue 0 (fp32 down), 2 (SwiGLU) or 3 (bf16 down), not ", epi);
++}
+diff --git a/src/tensorfold/cuda/fp8/experts.py b/src/tensorfold/cuda/fp8/experts.py
+new file mode 100644
+index 0000000..1f34398
+--- /dev/null
++++ b/src/tensorfold/cuda/fp8/experts.py
+@@ -0,0 +1,97 @@
++"""Grouped block-FP8 experts on ``tensorfold.cuda.experts``' plan: a pair's bits never depend on the others."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++from tensorfold.cuda import experts as grouped
++
++COLS = 32                 # output columns a warp
++BLOCK = 128               # the checkpoint's scale block, both ways
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import MIN_CAPABILITY, load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_fp8_experts_v1", sources=[str(here / "experts.cpp"), str(here / "experts.cu")],
++                need=MIN_CAPABILITY, extra_cuda_cflags=["-O3"], verbose=False)
++
++
++def pack(weight: torch.Tensor) -> torch.Tensor:
++    """e4m3 [E, N, K] -> int32 [E, N/32, K/32, 32, 2, 4]: lane (gq, t)'s half h, tile j: inputs 16h + 4t + 0..3."""
++
++    e, n, k = weight.shape
++    if n % BLOCK or k % BLOCK:
++        raise ValueError(f"FP8 experts [{e}, {n}, {k}]: N and K must be multiples of {BLOCK}")
++    words = weight.contiguous().view(torch.int32).view(e, n // COLS, 4, 8, k // 32, 2, 4)   # [E, cb, j, gq, g, h, t]
++    return words.permute(0, 1, 4, 3, 6, 5, 2).reshape(e, n // COLS, k // 32, 32, 2, 4).contiguous()
++
++
++@dataclass
++class Experts8:
++    """One layer's experts (the shared one last): gate and up (SwiGLU) and down, each with fp32 128 x 128 scales."""
++
++    up: torch.Tensor          # [E, NI/32, D/32, 2, 32, 2, 4] int32
++    down: torch.Tensor        # [E, D/32, NI/32, 1, 32, 2, 4]
++    up_scale: torch.Tensor    # [E, 2, NI/128, D/128] fp32 (gate, up)
++    down_scale: torch.Tensor  # [E, 1, D/128, NI/128]
++    width: int                # NI
++    dims: int                 # D
++    limit: float = 0.0
++
++    @property
++    def count(self) -> int:
++        return int(self.up.shape[0])
++
++    def nbytes(self) -> int:
++        return sum(t.numel() * t.element_size() for t in (self.up, self.down, self.up_scale, self.down_scale))
++
++
++def make(gate: tuple, up: tuple, down: tuple, *, limit: float = 0.0) -> Experts8:
++    """Each of gate, up, down: (e4m3 weights [E, N, K], fp32 scales [E, N/128, K/128]), as the checkpoint has them."""
++
++    width, dims = int(gate[0].shape[1]), int(gate[0].shape[2])
++    for name, (w, s) in (("gate", gate), ("up", up), ("down", down)):
++        n, k = w.shape[1:]
++        if tuple(s.shape) != (w.shape[0], n // BLOCK, k // BLOCK):
++            raise ValueError(f"{name}: scales {tuple(s.shape)} do not tile [{n}, {k}] in {BLOCK} x {BLOCK} blocks")
++    u = torch.stack([pack(gate[0]), pack(up[0])], dim=3)
++    d = pack(down[0]).unsqueeze(3)
++    us = torch.stack([gate[1], up[1]], dim=1).to(torch.float32).contiguous()
++    ds = down[1].to(torch.float32).unsqueeze(1).contiguous()
++    return Experts8(u, d, us, ds, width, dims, float(limit))
++
++
++def _run(epi: int, x: torch.Tensor, slots: int, w: torch.Tensor, scale: torch.Tensor, kg: int, nb: int,
++         plan: grouped.Plan, out: torch.Tensor, n: int, limit: float, skip: int, rows: int) -> None:
++    units = grouped.max_items(rows * plan.slots, plan.experts, plan.tile) * nb
++    _ext().experts(epi, x, x.stride(0), slots, w, scale, kg, nb, plan.items, plan.counts, plan.members, out, n,
++                   limit, skip, units)
++
++
++def gate_up(x: torch.Tensor, ex: Experts8, plan: grouped.Plan, out: torch.Tensor, rows: int, skip: int = -1) -> None:
++    """x [R, D] bf16 -> out [R * slots, NI] bf16, each routed pair's SwiGLU; pairs of expert ``skip`` untouched."""
++
++    _run(2, x, plan.slots, ex.up, ex.up_scale, ex.dims // 32, ex.width // COLS, plan, out, ex.width, ex.limit, skip,
++         rows)
++
++
++def down(act: torch.Tensor, ex: Experts8, plan: grouped.Plan, out: torch.Tensor, rows: int, skip: int = -1) -> None:
++    """act [R * slots, NI] bf16 -> out [R * slots, D] in ``out``'s dtype; pairs of expert ``skip`` untouched."""
++
++    _run(0 if out.dtype == torch.float32 else 3, act, 0, ex.down, ex.down_scale, ex.width // 32, ex.dims // COLS,
++         plan, out, ex.dims, 0.0, skip, rows)
++
++
++def dense(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
++    """fp32 [..., N, K]: e4m3 times its block's scale (a reference)."""
++
++    n, k = weight.shape[-2:]
++    full = scale.float().repeat_interleave(BLOCK, -2)[..., :n, :].repeat_interleave(BLOCK, -1)[..., :k]
++    return weight.float() * full
+diff --git a/src/tensorfold/families/kolibri1/__init__.py b/src/tensorfold/families/kolibri1/__init__.py
+new file mode 100644
+index 0000000..d3f1f64
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/__init__.py
+@@ -0,0 +1,36 @@
++"""Kolibri 1 (kolibri1): Aleph Alpha's MoE with sliding-window and position-free full attention, on CUDA."""
++# Every MLP routes 6 of 384 experts by sigmoid weight beside an ungated shared expert; FP8 is read as it ships.
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any
++
++MODEL_TYPES = ("kolibri1",)
++TITLE = "Kolibri 1"
++MODELS = ("Aleph-Alpha/Kolibri-1",)
++QUANT_METHODS = {"cuda": ("fp8",)}
++
++
++def check(model_dir: str | Path) -> None:
++    """The FP8 checkpoint: 128 x 128 blocks, fp32 scales."""
++
++    from .cuda.weights import Config
++
++    Config.read(model_dir)
++
++
++def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
++                master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None,
++                context: int | None = None, **options: Any):
++    """One GPU, ``--parallel`` requests decoded together (Kolibri 1 ships no draft head); the context fits memory."""
++
++    if drafter:
++        raise ValueError(f"{TITLE} has no draft model on CUDA yet: drop --drafter")
++    if int(tp) != 1:
++        raise ValueError(f"{TITLE} runs on one GPU: drop --tp")
++    from .cuda.engine import Kolibri1Engine
++
++    return Kolibri1Engine(Path(model_dir), context=int(context) if context else None,
++                          explicit=bool(options.get("context_explicit")),
++                          streams=max(1, int(options.get("parallel") or 1)))
+diff --git a/src/tensorfold/families/kolibri1/cuda/__init__.py b/src/tensorfold/families/kolibri1/cuda/__init__.py
+new file mode 100644
+index 0000000..f92a3d4
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/cuda/__init__.py
+@@ -0,0 +1 @@
++"""Kolibri 1 on CUDA."""
+diff --git a/src/tensorfold/families/kolibri1/cuda/attention.py b/src/tensorfold/families/kolibri1/cuda/attention.py
+new file mode 100644
+index 0000000..458d8c7
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/cuda/attention.py
+@@ -0,0 +1,97 @@
++"""Kolibri 1's attention: sliding-window rows over their last ``window`` keys, full rows on the shared kernels."""
++# A sliding row walks 64-key tiles by absolute position: its bits never depend on its chunk or the rows beside it.
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++BN = 64           # keys a tile
++GP = 16           # query heads a program holds (a key head's group, padded)
++
++
++@triton.jit
++def _tile(q, k, v, m, l, o, valid, SCALE: tl.constexpr):
++    s = tl.dot(q, tl.trans(k)).to(tl.float32) * SCALE
++    s = tl.where(valid[None, :], s, float("-inf"))
++    tile_m = tl.max(s, 1)
++    active = tile_m != float("-inf")
++    next_m = tl.where(active, tl.maximum(m, tile_m), m)
++    alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
++    p = tl.where(valid[None, :] & active[:, None], tl.exp(s - next_m[:, None]), 0.0)
++    o = o * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
++    l = l * alpha + tl.sum(p, 1)
++    return next_m, l, o
++
++
++@triton.jit
++def _sliding(Q, KC, VC, OUT, POS, SLOT, H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr, G: tl.constexpr,
++             WIN: tl.constexpr, RING: tl.constexpr, SCALE: tl.constexpr, BN: tl.constexpr, GP: tl.constexpr):
++    """Program (row, key head): the row's G query heads over keys (pos - WIN, pos], key p at ring slot p % RING."""
++
++    r = tl.program_id(0)
++    hk = tl.program_id(1)
++    pos = tl.load(POS + r)
++    base = tl.load(SLOT + r).to(tl.int64) * RING
++    gg = tl.arange(0, GP)
++    d = tl.arange(0, D)
++    hm = gg < G
++    q = tl.load(Q + (r * H + hk * G + gg[:, None]) * D + d[None, :], mask=hm[:, None], other=0.0)
++    lo = tl.maximum(pos - WIN + 1, 0)
++    m = tl.full((GP,), float("-inf"), tl.float32)
++    l = tl.zeros((GP,), tl.float32)
++    o = tl.zeros((GP, D), tl.float32)
++    for t in range(lo // BN, pos // BN + 1):
++        keys = t * BN + tl.arange(0, BN)
++        valid = (keys >= lo) & (keys <= pos)
++        at = (base + keys % RING)[:, None] * HK + hk
++        k = tl.load(KC + at * D + d[None, :], mask=valid[:, None], other=0.0)
++        v = tl.load(VC + at * D + d[None, :], mask=valid[:, None], other=0.0)
++        m, l, o = _tile(q, k, v, m, l, o, valid, SCALE)
++    out = o / l[:, None]
++    tl.store(OUT + (r * H + hk * G + gg[:, None]) * D + d[None, :], out.to(tl.bfloat16), mask=hm[:, None])
++
++
++def ring_size(rows: int, window: int) -> int:
++    """Ring slots a sliding layer keeps: a forward writes ``rows`` keys before its first row reads ``window`` back."""
++
++    return -(-(rows + window) // BN) * BN
++
++
++def sliding(q: torch.Tensor, k_ring: torch.Tensor, v_ring: torch.Tensor, positions: torch.Tensor,
++            slots: torch.Tensor, *, window: int, scale: float) -> torch.Tensor:
++    """q (W, H, D) bf16 at ``positions`` (W,) int32 of streams ``slots`` (W,) int32; rings (S, RING, HK, D)."""
++
++    w, h, d = q.shape
++    hk, ring = k_ring.shape[2], k_ring.shape[1]
++    if h % hk or h // hk > GP or d not in (64, 128, 256) or positions.shape != (w,) or slots.shape != (w,):
++        raise ValueError("sliding attention: heads a multiple of key heads (at most 16 a group), D 64/128/256")
++    if not (q.is_contiguous() and k_ring.is_contiguous() and v_ring.is_contiguous()):
++        raise ValueError("sliding attention takes contiguous tensors")
++    out = torch.empty_like(q)
++    _sliding[(w, hk)](q, k_ring, v_ring, out, positions, slots, H=h, HK=hk, D=d, G=h // hk, WIN=int(window),
++                      RING=int(ring), SCALE=float(scale), BN=BN, GP=GP, num_warps=4, num_stages=2)
++    return out
++
++
++def full_prompt(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, p0: int, *,
++                scale: float) -> torch.Tensor:
++    """Prompt rows at [p0, p0 + W) over every key before them (the caches hold the chunk's keys)."""
++
++    from tensorfold.cuda.kernels import prefill_attention
++
++    return prefill_attention.attention(q, k_cache, v_cache, p0, scale=scale)
++
++
++def full_rows(q: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor,
++              caches: list[tuple[torch.Tensor, torch.Tensor]],
++              groups: list[tuple[int, int]], *, scale: float) -> torch.Tensor:
++    """Streams' serial chains in one call: ``groups`` (rows, committed keys) each over its own (keys, values) cache."""
++
++    from tensorfold.cuda.kernels import attention as tree
++
++    plan = tree.plan([[i - 1 for i in range(n)] for n, _ in groups], [c for _, c in groups],
++                     q.shape[1] // k_new.shape[1], q.device)
++    offs = torch.tensor(tree.offsets(caches, q.device), dtype=torch.int64, device=q.device).view(len(groups), 2)
++    return tree.attention(q, k_new, v_new, offs, plan, scale=scale)
+diff --git a/src/tensorfold/families/kolibri1/cuda/decoder.py b/src/tensorfold/families/kolibri1/cuda/decoder.py
+new file mode 100644
+index 0000000..16d805e
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/cuda/decoder.py
+@@ -0,0 +1,103 @@
++"""The ``Scheduler``'s decoder for Kolibri 1: a prompt chunk a round, then one row of every decoding stream together."""
++# Rows are row-invariant, so a stream's reply equals the one it gets alone.
++
++from __future__ import annotations
++
++import time
++
++from tensorfold.cuda.memory_gate import NoRoom
++from tensorfold.cuda.sampling import sample_rows
++from tensorfold.cuda.streams import Stream, next_fill
++
++from .forward import PROMPT_CHUNK, Chain, Model
++
++STEP = 1024              # prompt rows a round while other streams decode
++
++
++class Decoder:
++    def __init__(self, model: Model, eos: tuple[int, ...]) -> None:
++        self.model, self.eos = model, tuple(eos)
++        self.free = list(range(model.slots))
++        self.streams: dict[int, Stream] = {}      # decoding
++        self.filling: list[Stream] = []           # admitted, prompts still prefilling (oldest first)
++        self.slot: dict[int, int] = {}
++        self.done_at: dict[int, int] = {}         # prompt rows prefilled
++        self.next_id = 0
++
++    def live(self) -> int:
++        return len(self.streams) + len(self.filling)
++
++    def admit(self, s: Stream) -> None:
++        if s.constraint is not None:
++            raise ValueError("Kolibri 1 on CUDA does not take response_format grammars yet")
++        room = self.model.context - len(s.prompt)
++        if len(s.prompt) < 1 or room < 1:
++            raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.model.context}-token "
++                             "context (--context)")
++        if not self.free:
++            raise NoRoom("every stream slot is busy")
++        s.count = min(s.count, room)
++        s.sid = self.next_id
++        self.next_id += 1
++        self.slot[s.sid] = self.free.pop(0)
++        self.done_at[s.sid] = 0
++        self.filling.append(s)
++
++    def _ends(self, s: Stream) -> tuple[int, ...]:
++        return self.eos if s.stop_eos else ()
++
++    def _fill(self) -> list[Stream]:
++        s = next_fill(self.filling)
++        a = self.done_at[s.sid]
++        b = min(len(s.prompt), a + (STEP if self.streams else PROMPT_CHUNK))
++        t0 = time.perf_counter()
++        try:
++            logits = self.model.forward([Chain(self.slot[s.sid], a, s.prompt[a:b])], prompt=True)
++            first = sample_rows(logits, [len(s.prompt)], s.sampling)[0] if b == len(s.prompt) else None
++        except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
++            self.filling.remove(s)
++            s.error, s.done = exc, True
++            return [s]
++        self.done_at[s.sid] = b
++        s.prefill_s += time.perf_counter() - t0
++        if first is None:
++            return []
++        self.filling.remove(s)
++        self.streams[s.sid] = s
++        s.started = time.perf_counter()
++        s.take([first], self._ends(s))
++        return [s] if s.done else []
++
++    def round(self) -> list[Stream]:
++        """A prompt chunk for the next queued prompt, then a row of each decoding stream; returns the finished."""
++
++        done = self._fill() if self.filling else []
++        live = [s for s in self.streams.values() if not s.done]
++        if not live:
++            return done
++        positions = [len(s.prompt) + len(s.out) - 1 for s in live]
++        logits = self.model.step([s.out[-1] for s in live], positions, [self.slot[s.sid] for s in live])
++        for k, s in enumerate(live):
++            tok = sample_rows(logits[k:k + 1], [positions[k] + 1], s.sampling)[0]
++            s.counted(1)
++            s.take([tok], self._ends(s))
++        return done + [s for s in live if s.done]
++
++    def finish(self, done: list[Stream]) -> None:
++        for s in done:
++            self.streams.pop(s.sid, None)
++            if s in self.filling:
++                self.filling.remove(s)
++            slot = self.slot.pop(s.sid, None)
++            if slot is not None:
++                self.free.append(slot)
++                self.free.sort()
++            self.done_at.pop(s.sid, None)
++
++    def drop(self) -> list[Stream]:
++        gone = [s for s in self.streams.values() if not s.done] + list(self.filling)
++        self.streams, self.filling = {}, []
++        self.free = list(range(self.model.slots))
++        self.slot.clear()
++        self.done_at.clear()
++        return gone
+diff --git a/src/tensorfold/families/kolibri1/cuda/engine.py b/src/tensorfold/families/kolibri1/cuda/engine.py
+new file mode 100644
+index 0000000..145c0a5
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/cuda/engine.py
+@@ -0,0 +1,71 @@
++"""Kolibri 1's CUDA engine on one GPU: ``streams`` requests decoded together, the context sized from free memory."""
++
++from __future__ import annotations
++
++import time
++from pathlib import Path
++from typing import Any, Callable
++
++NATIVE = 262144          # the context Kolibri 1 was trained to (it reads further; past this, --context asks for it)
++WORKSPACE = 3 << 30      # activations, prompt chunks and the MoE's scratch beside the caches
++
++
++class Kolibri1Engine:
++    """``eos``, ``generate``, ``context_window`` and ``concurrent`` for ``tensorfold.cuda.server``."""
++
++    def __init__(self, model_dir: Path, *, context: int | None = None, explicit: bool = False,
++                 streams: int = 1) -> None:
++        import torch
++
++        from tensorfold.cuda.capacity import available_bytes
++        from tensorfold.cuda.scheduler import Scheduler
++
++        from .decoder import Decoder
++        from .forward import Model
++        from .weights import load
++
++        torch.cuda.set_device(0)
++        started = time.perf_counter()
++        self.w = load(model_dir)
++        torch.cuda.empty_cache()
++        cfg = self.w.config
++        budget = available_bytes(torch) - WORKSPACE
++        fits = max(0, budget // streams)
++        per = Model.slot_bytes(cfg, 1024) - Model.slot_bytes(cfg, 0)
++        most = (fits - Model.slot_bytes(cfg, 0)) // per * 1024 if fits > Model.slot_bytes(cfg, 0) else 0
++        if explicit and context:
++            if context > most:
++                raise ValueError(f"--context {context} with {streams} stream(s) needs "
++                                 f"{streams * Model.slot_bytes(cfg, context) / 2**30:.1f} GiB of caches; "
++                                 f"{max(0, budget) / 2**30:.1f} GiB is free after the weights, which fits {most}")
++            window = int(context)
++        else:
++            window = min(int(context) if context else NATIVE, most)
++        if window < 4096:
++            raise ValueError(f"{streams} stream(s) leave room for {most} tokens each; free memory or lower --parallel")
++        self.context_window = window
++        self.model = Model(self.w, window, streams)
++        self.eos = tuple(cfg.eos)
++        self.decoder = Decoder(self.model, self.eos)
++        self.scheduler = Scheduler(self.decoder, max_streams=streams)
++        self.concurrent = streams > 1
++        self.drafts = False
++        print(f"[tensorfold] kolibri1: {streams} stream(s) of {window} tokens "
++              f"({streams * Model.slot_bytes(cfg, window) / 2**30:.1f} GiB of caches; sliding layers keep a "
++              f"{self.model.ring}-key ring), ready in {time.perf_counter() - started:.0f}s", flush=True)
++
++    def close(self) -> None:
++        if self.scheduler is not None:
++            self.scheduler.close()
++            self.scheduler = None
++
++    def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens: Callable[[list[int]], bool | None],
++                 draft: bool = True, stop_eos: bool = True, constraint=None,
++                 background: bool = False) -> dict[str, Any]:
++        if len(prompt) >= self.context_window:
++            raise ValueError(f"prompt of {len(prompt)} tokens exceeds the {self.context_window}-token context; "
++                             "shorten it or start with a larger --context")
++        max_tokens = max(1, min(int(max_tokens), self.context_window - len(prompt)))
++        extra = {"constraint": constraint} if constraint is not None else {}
++        return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, stop_eos=stop_eos,
++                                     background=background, **extra)
+diff --git a/src/tensorfold/families/kolibri1/cuda/forward.py b/src/tensorfold/families/kolibri1/cuda/forward.py
+new file mode 100644
+index 0000000..a2fbcdb
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/cuda/forward.py
+@@ -0,0 +1,163 @@
++"""Kolibri 1's forward over streams' serial chains of rows: prompt chunks and decode rows, a cache slot a stream."""
++# Every kernel is row-invariant, so a row's bits never depend on its chunk or the streams beside it.
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Sequence
++
++import torch
++import triton
++import triton.language as tl
++
++from tensorfold.cuda import moe as shared
++
++from . import attention, moe
++from .weights import Weights
++
++PROMPT_CHUNK = 2048
++
++
++@triton.jit
++def _rms(X, W, OUT, N: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.constexpr, BF16: tl.constexpr):
++    """Program r: row r times rsqrt(mean of squares + eps) times the weight, in fp32 (bf16 out when BF16)."""
++
++    r = tl.program_id(0)
++    c = tl.arange(0, BLOCK)
++    ok = c < N
++    x = tl.load(X + r.to(tl.int64) * N + c, mask=ok, other=0.0).to(tl.float32)
++    w = tl.load(W + c, mask=ok, other=0.0)
++    y = x * tl.rsqrt(tl.sum(x * x, 0) / N + EPS) * w
++    tl.store(OUT + r.to(tl.int64) * N + c, y.to(tl.bfloat16) if BF16 else y, mask=ok)
++
++
++def rms(x: torch.Tensor, weight: torch.Tensor, eps: float, *, bf16: bool) -> torch.Tensor:
++    """RMSNorm over the last dimension, a program a row (its bits never depend on the other rows)."""
++
++    n = x.shape[-1]
++    x = x.contiguous()
++    out = torch.empty(x.shape, dtype=torch.bfloat16 if bf16 else torch.float32, device=x.device)
++    _rms[(x.numel() // n,)](x, weight, out, N=n, EPS=float(eps), BLOCK=triton.next_power_of_2(n), BF16=bf16,
++                            num_warps=4 if n > 256 else 1)
++    return out
++
++
++@dataclass
++class Chain:
++    """A stream's rows in one forward: its cache slot, first position, tokens."""
++
++    slot: int
++    p0: int
++    tokens: Sequence[int]
++
++
++class Model:
++    """The weights and ``slots`` streams' caches: full layers keep ``context`` positions, sliding ones a ring."""
++
++    def __init__(self, w: Weights, context: int, slots: int = 1, device: str = "cuda") -> None:
++        cfg = w.config
++        self.w, self.cfg, self.context, self.slots = w, cfg, int(context), int(slots)
++        self.ring = attention.ring_size(PROMPT_CHUNK, cfg.window)
++        kv = (cfg.kv_heads, cfg.head_dim)
++        self.k, self.v = [], []
++        for full in cfg.full:
++            shape = (self.slots, self.context if full else self.ring, *kv)
++            self.k.append(torch.zeros(shape, dtype=torch.bfloat16, device=device))
++            self.v.append(torch.zeros(shape, dtype=torch.bfloat16, device=device))
++        steps = torch.arange(0, cfg.head_dim, 2, dtype=torch.float64, device=device) / cfg.head_dim
++        ang = torch.arange(self.context, dtype=torch.float64, device=device)[:, None] / cfg.rope_theta ** steps
++        self.cos = torch.cat([ang.cos(), ang.cos()], -1).float()          # [context, D] (neox halves)
++        self.sin = torch.cat([ang.sin(), ang.sin()], -1).float()
++        self.half = cfg.head_dim // 2
++        self.scale = cfg.head_dim ** -0.5
++
++    @staticmethod
++    def slot_bytes(cfg, context: int) -> int:
++        """Cache bytes a stream takes at ``context`` positions."""
++
++        row = 2 * cfg.kv_heads * cfg.head_dim * 2
++        full = sum(cfg.full)
++        return row * (full * context + (len(cfg.full) - full) * attention.ring_size(PROMPT_CHUNK, cfg.window))
++
++    def _rope(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
++        cos, sin = self.cos[pos][:, None], self.sin[pos][:, None]
++        rot = torch.cat([-x[..., self.half:], x[..., :self.half]], -1)
++        return x * cos + rot * sin
++
++    @torch.no_grad()
++    def forward(self, chains: Sequence[Chain], *, prompt: bool, rows: Sequence[int] | None = None) -> torch.Tensor:
++        """fp32 logits of ``rows`` (default: each chain's last); ``prompt``: one chain on the prompt kernels."""
++
++        cfg, w = self.cfg, self.w
++        if prompt and len(chains) != 1:
++            raise ValueError("a prompt forward takes one stream's chunk")
++        dev = w.embed.device
++        ids = torch.tensor([t for c in chains for t in c.tokens], dtype=torch.int64)
++        pos_l = [c.p0 + i for c in chains for i in range(len(c.tokens))]
++        slot_l = [c.slot for c in chains for _ in c.tokens]
++        for c in chains:
++            if len(c.tokens) > self.ring - cfg.window:             # its first row's window must survive its writes
++                raise ValueError(f"a chain of {len(c.tokens)} rows overruns the {self.ring}-key sliding ring")
++            if c.p0 + len(c.tokens) > self.context:
++                raise ValueError(f"positions through {c.p0 + len(c.tokens)} exceed the {self.context}-token cache")
++        n = len(pos_l)
++        ids = ids.to(dev, non_blocking=True)
++        pos = torch.tensor(pos_l, dtype=torch.int64).to(dev, non_blocking=True)
++        pos32, slot32 = pos.to(torch.int32), torch.tensor(slot_l, dtype=torch.int32).to(dev, non_blocking=True)
++        slot64 = slot32.to(torch.int64)
++        ring_at = pos % self.ring
++        groups = [(len(c.tokens), c.p0) for c in chains]
++        res = w.embed[ids].float()
++        h, hk, d, eps = cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.eps
++        for i, L in enumerate(w.layers):
++            x = rms(res, L.input_norm, eps, bf16=True)
++            qkv = L.qkv(x)
++            q = rms(qkv[:, :h * d].reshape(n, h, d), L.q_norm, eps, bf16=False)
++            k = rms(qkv[:, h * d:(h + hk) * d].reshape(n, hk, d), L.k_norm, eps, bf16=False)
++            v = qkv[:, (h + hk) * d:].reshape(n, hk, d).contiguous()
++            if not cfg.full[i]:
++                q, k = self._rope(q, pos), self._rope(k, pos)
++            q, k = q.to(torch.bfloat16).contiguous(), k.to(torch.bfloat16).contiguous()
++            if not cfg.full[i]:
++                self.k[i][slot64, ring_at] = k
++                self.v[i][slot64, ring_at] = v
++                a = attention.sliding(q, self.k[i], self.v[i], pos32, slot32, window=cfg.window, scale=self.scale)
++            elif prompt:
++                c = chains[0]
++                kc, vc = self.k[i][c.slot], self.v[i][c.slot]
++                kc[c.p0:c.p0 + n] = k
++                vc[c.p0:c.p0 + n] = v
++                a = attention.full_prompt(q, kc, vc, c.p0, scale=self.scale)
++            else:
++                caches = [(self.k[i][c.slot], self.v[i][c.slot]) for c in chains]
++                a = attention.full_rows(q, k, v, caches, groups, scale=self.scale)
++                self.k[i][slot64, pos] = k
++                self.v[i][slot64, pos] = v
++            o = L.o(a.view(n, h * d))
++            res = res + rms(o, L.post_attn_norm, eps, bf16=False)
++            x = rms(res, L.pre_moe_norm, eps, bf16=True)
++            m = moe.run(x, L.router, L.bias, L.experts, cfg.top_k, prefill=prompt)
++            res = res + rms(m, L.post_moe_norm, eps, bf16=False)
++        if rows is None:
++            ends, at = [], 0
++            for c in chains:
++                at += len(c.tokens)
++                ends.append(at - 1)
++            rows = ends
++        x = rms(res[torch.tensor(list(rows), device=dev)], w.norm, eps, bf16=True)
++        return shared.router(x, w.head)
++
++    def prefill(self, prompt: Sequence[int], start: int = 0, slot: int = 0, chunk: int | None = None) -> torch.Tensor:
++        """The prompt from ``start`` in chunks; the last row's logits [1, V]."""
++
++        chunk = chunk or self.ring - self.cfg.window
++        logits = None
++        for a in range(start, len(prompt), chunk):
++            b = min(len(prompt), a + chunk)
++            logits = self.forward([Chain(slot, a, prompt[a:b])], prompt=True)
++        return logits
++
++    def step(self, tokens: Sequence[int], positions: Sequence[int], slots: Sequence[int]) -> torch.Tensor:
++        """One decode row a stream: logits [streams, V]."""
++
++        return self.forward([Chain(s, p, [t]) for t, p, s in zip(tokens, positions, slots)], prompt=False)
+diff --git a/src/tensorfold/families/kolibri1/cuda/moe.py b/src/tensorfold/families/kolibri1/cuda/moe.py
+new file mode 100644
+index 0000000..73cc30f
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/cuda/moe.py
+@@ -0,0 +1,73 @@
++"""Kolibri 1's MoE: top-k over logits plus the expert bias, each weighted by sigmoid(logit), then the shared expert."""
++# Ties go to the lower id; the shared expert rides in the grouped table as id E with weight 1.
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++from tensorfold.cuda import experts as grouped
++from tensorfold.cuda import moe as shared
++from tensorfold.cuda.fp8 import experts as fp8x
++
++
++@triton.jit
++def _topk(L, BIAS, PICK, WTS, NE: tl.constexpr, TOPK: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.constexpr,
++          SLOTP: tl.constexpr):
++    r = tl.program_id(0)
++    ar = tl.arange(0, BLOCK)
++    ak = tl.arange(0, SLOTP)
++    logit = tl.load(L + r * NE + ar, mask=ar < NE, other=float("-inf"))
++    v = logit + tl.load(BIAS + ar, mask=ar < NE, other=0.0)
++    picks = tl.zeros((SLOTP,), dtype=tl.int32)
++    w = tl.zeros((SLOTP,), dtype=tl.float32)
++    for k in tl.static_range(TOPK):
++        top = tl.max(v, axis=0)
++        idx = tl.min(tl.where(v == top, ar, BLOCK), axis=0)
++        lg = tl.sum(tl.where(ar == idx, logit, 0.0), axis=0)
++        picks = tl.where(ak == k, idx, picks)
++        w = tl.where(ak == k, 1.0 / (1.0 + tl.exp(-lg)), w)
++        v = tl.where(ar == idx, float("-inf"), v)
++    picks = tl.where(ak == TOPK, NE, picks)
++    w = tl.where(ak == TOPK, 1.0, w)
++    tl.store(PICK + r * SLOTS + ak, picks, mask=ak < SLOTS)
++    tl.store(WTS + r * SLOTS + ak, w, mask=ak < SLOTS)
++
++
++class Buffers:
++    """Scratch for up to ``rows`` rows."""
++
++    def __init__(self, rows: int, experts: int, top_k: int, width: int, dims: int, device, *, prefill: bool) -> None:
++        slots = top_k + 1
++        self.rows, self.slots = rows, slots
++        self.logits = torch.empty((rows, experts), dtype=torch.float32, device=device)
++        self.pick = torch.empty((rows, slots), dtype=torch.int32, device=device)
++        self.wts = torch.empty((rows, slots), dtype=torch.float32, device=device)
++        self.plan = grouped.Plan(rows, slots, experts + 1, device, prefill=prefill)
++        self.act = torch.empty((rows * slots, width), dtype=torch.bfloat16, device=device)
++        self.y = torch.empty((rows, slots, dims), dtype=torch.bfloat16 if prefill else torch.float32, device=device)
++
++
++_scratch: dict[tuple, Buffers] = {}
++
++
++def run(x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: fp8x.Experts8, top_k: int, *,
++        prefill: bool = False) -> torch.Tensor:
++    """x [R, D] bf16 -> [R, D] bf16: its top-k experts by sigmoid weight, plus the ungated shared expert."""
++
++    rows = x.shape[0]
++    experts = router.shape[0]
++    size = 1 << max(4, (rows - 1).bit_length())
++    key = (size, experts, top_k, ex.width, ex.dims, prefill, x.device)
++    buf = _scratch.get(key)
++    if buf is None:
++        buf = _scratch[key] = Buffers(size, experts, top_k, ex.width, ex.dims, x.device, prefill=prefill)
++    x = x.contiguous()
++    shared.router(x, router, buf.logits[:rows])
++    _topk[(rows,)](buf.logits, bias, buf.pick, buf.wts, NE=experts, TOPK=top_k, SLOTS=top_k + 1,
++                   BLOCK=triton.next_power_of_2(experts), SLOTP=triton.next_power_of_2(top_k + 1), num_warps=4)
++    grouped.route(buf.pick[:rows], buf.plan, 16)
++    fp8x.gate_up(x, ex, buf.plan, buf.act[:rows * buf.slots], rows)
++    fp8x.down(buf.act[:rows * buf.slots], ex, buf.plan, buf.y[:rows].view(-1, ex.dims), rows)
++    return shared.combine(buf.y[:rows], buf.wts[:rows])
+diff --git a/src/tensorfold/families/kolibri1/cuda/weights.py b/src/tensorfold/families/kolibri1/cuda/weights.py
+new file mode 100644
+index 0000000..091683f
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/cuda/weights.py
+@@ -0,0 +1,132 @@
++"""Kolibri 1's FP8 checkpoint on the GPU: block-FP8 projections, grouped FP8 experts (shared last), bf16 rest."""
++
++from __future__ import annotations
++
++import json
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++
++import torch
++
++from tensorfold.cuda.fp8 import experts as fp8x
++from tensorfold.cuda.nvfp4.linear import Fp8BlockLinear
++
++
++@dataclass(frozen=True)
++class Config:
++    layers: int
++    hidden: int
++    heads: int
++    kv_heads: int
++    head_dim: int
++    vocab: int
++    experts: int
++    top_k: int
++    moe_width: int
++    shared_width: int
++    window: int
++    full: tuple[bool, ...]          # each layer: full attention (no positions) or sliding (RoPE)
++    rope_theta: float
++    eps: float
++    eos: tuple[int, ...]
++
++    @classmethod
++    def read(cls, model_dir: str | Path) -> "Config":
++        c = json.loads((Path(model_dir) / "config.json").read_text())
++        if c.get("model_type") != "kolibri1":
++            raise ValueError(f"not a Kolibri 1 checkpoint: model_type {c.get('model_type')!r}")
++        q = c.get("quantization_config") or {}
++        if q.get("quant_method") != "fp8" or list(q.get("weight_block_size") or []) != [128, 128]:
++            raise ValueError("Kolibri 1's CUDA engine reads its FP8 checkpoint (128 x 128 blocks, fp32 scales)")
++        if c.get("norm_topk_prob"):
++            raise ValueError("Kolibri 1 routes by unnormalised sigmoid weights; norm_topk_prob is not supported")
++        eos = c.get("eos_token_id")
++        eos = eos if isinstance(eos, list) else [eos]
++        gen = Path(model_dir) / "generation_config.json"
++        if gen.is_file():                       # the released files end replies on <|im_end|> and <|endoftext|>
++            more = json.loads(gen.read_text()).get("eos_token_id") or []
++            eos += [e for e in (more if isinstance(more, list) else [more]) if e not in eos]
++        rope = c.get("rope_parameters") or {}
++        return cls(int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["num_attention_heads"]),
++                   int(c["num_key_value_heads"]), int(c["head_dim"]), int(c["vocab_size"]), int(c["num_experts"]),
++                   int(c["num_experts_per_tok"]), int(c["moe_intermediate_size"]),
++                   int(c["shared_expert_intermediate_size"]), int(c["sliding_window"]),
++                   tuple(t == "full_attention" for t in c["layer_types"]),
++                   float(rope.get("rope_theta", c.get("rope_theta", 10000.0))), float(c["rms_norm_eps"]),
++                   tuple(int(e) for e in eos if e is not None))
++
++
++@dataclass
++class Layer:
++    input_norm: torch.Tensor
++    qkv: Fp8BlockLinear
++    q_norm: torch.Tensor
++    k_norm: torch.Tensor
++    o: Fp8BlockLinear
++    post_attn_norm: torch.Tensor
++    pre_moe_norm: torch.Tensor
++    router: torch.Tensor            # [E, D] bf16
++    bias: torch.Tensor              # [E] fp32
++    experts: fp8x.Experts8          # E routed, then the shared expert
++    post_moe_norm: torch.Tensor
++
++
++@dataclass
++class Weights:
++    config: Config
++    embed: torch.Tensor             # [V, D] bf16
++    layers: list[Layer] = field(default_factory=list)
++    norm: torch.Tensor | None = None
++    head: torch.Tensor | None = None  # [V, D] bf16
++
++
++def load(model_dir: str | Path, device: str = "cuda") -> Weights:
++    from tensorfold.cuda.direct_read import SafeTensors
++
++    model_dir = Path(model_dir)
++    cfg = Config.read(model_dir)
++    index = json.loads((model_dir / "model.safetensors.index.json").read_text())["weight_map"]
++    f = SafeTensors(sorted({model_dir / v for v in index.values()}))
++    t0 = time.perf_counter()
++
++    def get(name: str) -> torch.Tensor:
++        return f.get(name, device)
++
++    def fp8(name: str) -> tuple[torch.Tensor, torch.Tensor]:
++        return get(name + ".weight").view(torch.float8_e4m3fn), get(name + ".weight_scale_inv").float()
++
++    def linear(*names: str) -> Fp8BlockLinear:
++        parts = [fp8(n) for n in names]
++        return Fp8BlockLinear.from_checkpoint(torch.cat([w for w, _ in parts]), torch.cat([s for _, s in parts]))
++
++    w = Weights(cfg, get("model.embed_tokens.weight").to(torch.bfloat16).contiguous())
++    for i in range(cfg.layers):
++        p = f"model.layers.{i}."
++        a = p + "self_attn."
++        mats = {}
++        for proj in ("gate_proj", "up_proj", "down_proj"):
++            parts = [fp8(f"{p}mlp.experts.{e}.{proj}") for e in range(cfg.experts)]
++            parts.append(fp8(f"{p}mlp.shared_experts.{proj}"))
++            mats[proj] = (torch.stack([x for x, _ in parts]), torch.stack([s for _, s in parts]))
++            del parts
++        ex = fp8x.make(mats["gate_proj"], mats["up_proj"], mats["down_proj"])
++        del mats
++        w.layers.append(Layer(
++            input_norm=get(p + "input_layernorm.weight").float().contiguous(),
++            qkv=linear(a + "q_proj", a + "k_proj", a + "v_proj"),
++            q_norm=get(a + "q_norm.weight").float().contiguous(),
++            k_norm=get(a + "k_norm.weight").float().contiguous(),
++            o=linear(a + "o_proj"),
++            post_attn_norm=get(p + "post_attn_norm.weight").float().contiguous(),
++            pre_moe_norm=get(p + "post_attention_layernorm.weight").float().contiguous(),
++            router=get(p + "mlp.gate.weight").to(torch.bfloat16).contiguous(),
++            bias=get(p + "moe.router.expert_bias").float().contiguous(),
++            experts=ex,
++            post_moe_norm=get(p + "post_ffn_norm.weight").float().contiguous()))
++        if i % 10 == 9 or i == cfg.layers - 1:
++            print(f"[tensorfold] kolibri1: {i + 1}/{cfg.layers} layers in {time.perf_counter() - t0:.0f}s", flush=True)
++    w.norm = get("model.norm.weight").float().contiguous()
++    w.head = get("lm_head.weight").to(torch.bfloat16).contiguous()
++    f.close()
++    return w
+diff --git a/tests/cuda/kolibri1_reference.py b/tests/cuda/kolibri1_reference.py
+new file mode 100644
+index 0000000..f81fd29
+--- /dev/null
++++ b/tests/cuda/kolibri1_reference.py
+@@ -0,0 +1,133 @@
++"""Kolibri 1's fp32 reference forward, after Aleph Alpha's vLLM plugin: weights dequantized from FP8 per matmul."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import torch
++from safetensors import safe_open
++
++
++class Kolibri:
++    def __init__(self, model_dir: str | Path, device: str = "cuda") -> None:
++        self.dir = Path(model_dir)
++        self.cfg = json.loads((self.dir / "config.json").read_text())
++        self.dev = device
++        index = json.loads((self.dir / "model.safetensors.index.json").read_text())["weight_map"]
++        self.w: dict[str, torch.Tensor] = {}
++        for shard in sorted(set(index.values())):
++            with safe_open(str(self.dir / shard), framework="pt", device=device) as f:
++                for name in f.keys():
++                    self.w[name] = f.get_tensor(name)
++        c = self.cfg
++        self.L, self.H = c["num_hidden_layers"], c["num_attention_heads"]
++        self.HK, self.D = c["num_key_value_heads"], c["head_dim"]
++        self.eps, self.window, self.top_k = c["rms_norm_eps"], c["sliding_window"], c["num_experts_per_tok"]
++        self.full = [t == "full_attention" for t in c["layer_types"]]
++        theta = float((c.get("rope_parameters") or {}).get("rope_theta", c.get("rope_theta", 10000.0)))
++        self.inv_freq = 1.0 / theta ** (torch.arange(0, self.D, 2, device=device, dtype=torch.float64) / self.D)
++        self.caches: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * self.L
++
++    # -- pieces ----------------------------------------------------------------------------------------------------
++    def weight(self, name: str) -> torch.Tensor:
++        """fp32 [N, K]: the FP8 bytes times their block's scale, or the stored bf16 weight."""
++
++        w = self.w[name + ".weight"]
++        s = self.w.get(name + ".weight_scale_inv")
++        if s is None:
++            return w.float()
++        n, k = w.shape
++        full = s.float().repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)[:, :k]
++        return w.float() * full
++
++    def linear(self, x: torch.Tensor, name: str) -> torch.Tensor:
++        return x @ self.weight(name).T
++
++    def norm(self, x: torch.Tensor, name: str) -> torch.Tensor:
++        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.w[name + ".weight"].float()
++
++    def rope(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
++        """Neox halves: x [T, heads, D] at positions ``pos`` [T]."""
++
++        ang = (pos.double()[:, None] * self.inv_freq[None]).float()           # [T, D/2]
++        cos, sin = torch.cat([ang.cos(), ang.cos()], -1)[:, None], torch.cat([ang.sin(), ang.sin()], -1)[:, None]
++        half = self.D // 2
++        rot = torch.cat([-x[..., half:], x[..., :half]], -1)
++        return x * cos + rot * sin
++
++    def attention(self, i: int, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
++        p = f"model.layers.{i}.self_attn."
++        t = x.shape[0]
++        q = self.linear(x, p + "q_proj").view(t, self.H, self.D)
++        k = self.linear(x, p + "k_proj").view(t, self.HK, self.D)
++        v = self.linear(x, p + "v_proj").view(t, self.HK, self.D)
++        q, k = self.norm(q, p + "q_norm"), self.norm(k, p + "k_norm")
++        if not self.full[i]:
++            q, k = self.rope(q, pos), self.rope(k, pos)
++        old = self.caches[i]
++        if old is not None:
++            k, v = torch.cat([old[0], k]), torch.cat([old[1], v])
++        self.caches[i] = (k, v)
++        kpos = torch.arange(k.shape[0], device=x.device)
++        allowed = kpos[None] <= pos[:, None]
++        if not self.full[i]:
++            allowed &= pos[:, None] - kpos[None] < self.window
++        g = self.H // self.HK
++        kk, vv = k.repeat_interleave(g, 1), v.repeat_interleave(g, 1)            # [S, H, D]
++        scores = torch.einsum("thd,shd->hts", q, kk) * self.D ** -0.5
++        scores = scores.masked_fill(~allowed[None], float("-inf"))
++        out = torch.einsum("hts,shd->thd", scores.softmax(-1), vv).reshape(t, self.H * self.D)
++        return self.linear(out, p + "o_proj")
++
++    def mlp(self, x: torch.Tensor, prefix: str) -> torch.Tensor:
++        act = torch.nn.functional.silu(self.linear(x, prefix + "gate_proj")) * self.linear(x, prefix + "up_proj")
++        return self.linear(act, prefix + "down_proj")
++
++    def moe(self, i: int, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        p = f"model.layers.{i}.mlp."
++        logits = x @ self.w[p + "gate.weight"].float().T                          # [T, E] fp32
++        bias = self.w[f"model.layers.{i}.moe.router.expert_bias"].float()
++        ids = torch.topk(logits + bias, self.top_k, dim=-1).indices
++        weights = torch.sigmoid(logits.gather(1, ids))
++        out = self.mlp(x, p + "shared_experts.")
++        for e in ids.unique().tolist():
++            rows, slot = (ids == e).nonzero(as_tuple=True)
++            out[rows] += weights[rows, slot, None] * self.mlp(x[rows], f"{p}experts.{e}.")
++        return out, ids
++
++    # -- model -----------------------------------------------------------------------------------------------------
++    @torch.no_grad()
++    def forward(self, tokens: list[int], start: int) -> tuple[torch.Tensor, list[torch.Tensor]]:
++        """fp32 logits [T, vocab] for ``tokens`` at positions start.., extending the caches; each layer's routing."""
++
++        pos = torch.arange(start, start + len(tokens), device=self.dev)
++        res = self.w["model.embed_tokens.weight"][torch.tensor(tokens, device=self.dev)].float()
++        routes = []
++        for i in range(self.L):
++            p = f"model.layers.{i}."
++            a = self.norm(self.attention(i, self.norm(res, p + "input_layernorm"), pos), p + "post_attn_norm")
++            res = res + a
++            m, ids = self.moe(i, self.norm(res, p + "post_attention_layernorm"))
++            res = res + self.norm(m, p + "post_ffn_norm")
++            routes.append(ids)
++        return self.norm(res, "model.norm") @ self.w["lm_head.weight"].float().T, routes
++
++    def reset(self) -> None:
++        self.caches = [None] * self.L
++
++    @torch.no_grad()
++    def greedy(self, prompt: list[int], new: int, eos: int | None = None) -> tuple[list[int], list[torch.Tensor]]:
++        """Greedy reply (ties to the lower id) and each step's logits row."""
++
++        self.reset()
++        logits, _ = self.forward(prompt, 0)
++        rows, out = [logits[-1]], []
++        for step in range(new):
++            tok = int(rows[-1].argmax())
++            out.append(tok)
++            if tok == eos or step == new - 1:
++                break
++            logits, _ = self.forward([tok], len(prompt) + step)
++            rows.append(logits[-1])
++        return out, rows
+diff --git a/tests/cuda/kolibri1_tiny.py b/tests/cuda/kolibri1_tiny.py
+new file mode 100644
+index 0000000..a895e00
+--- /dev/null
++++ b/tests/cuda/kolibri1_tiny.py
+@@ -0,0 +1,65 @@
++"""A tiny Kolibri 1 checkpoint in the released format: FP8 128 x 128 blocks with fp32 scales, bf16 rest."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import torch
++
++
++def write(dir: Path, *, layers: int = 3, hidden: int = 256, heads: int = 4, kv_heads: int = 2, head_dim: int = 128,
++          vocab: int = 512, experts: int = 8, top_k: int = 3, width: int = 128, window: int = 33, seed: int = 0,
++          full_every: int = 3) -> Path:
++    from safetensors.torch import save_file
++
++    dir.mkdir(parents=True, exist_ok=True)
++    g = torch.Generator().manual_seed(seed)
++
++    def rand(*shape, scale=1.0):
++        return torch.randn(*shape, generator=g) * scale
++
++    t: dict[str, torch.Tensor] = {}
++
++    def fp8(name: str, n: int, k: int, scale: float) -> None:
++        w = (rand(n, k) * 64).clamp(-448, 448).to(torch.float8_e4m3fn)
++        t[name + ".weight"] = w
++        t[name + ".weight_scale_inv"] = (torch.rand(n // 128, k // 128, generator=g) + 0.5) * scale / 64
++
++    def norm(name: str, n: int) -> None:
++        t[name + ".weight"] = (1.0 + rand(n, scale=0.1)).to(torch.bfloat16)
++
++    t["model.embed_tokens.weight"] = rand(vocab, hidden).to(torch.bfloat16)
++    t["lm_head.weight"] = rand(vocab, hidden, scale=hidden ** -0.5).to(torch.bfloat16)
++    norm("model.norm", hidden)
++    for i in range(layers):
++        p = f"model.layers.{i}."
++        for nm in ("input_layernorm", "post_attn_norm", "post_attention_layernorm", "post_ffn_norm"):
++            norm(p + nm, hidden)
++        a = p + "self_attn."
++        fp8(a + "q_proj", heads * head_dim, hidden, hidden ** -0.5)
++        fp8(a + "k_proj", kv_heads * head_dim, hidden, hidden ** -0.5)
++        fp8(a + "v_proj", kv_heads * head_dim, hidden, hidden ** -0.5)
++        fp8(a + "o_proj", hidden, heads * head_dim, (heads * head_dim) ** -0.5)
++        norm(a + "q_norm", head_dim)
++        norm(a + "k_norm", head_dim)
++        t[p + "mlp.gate.weight"] = rand(experts, hidden, scale=hidden ** -0.5).to(torch.bfloat16)
++        t[p + "moe.router.expert_bias"] = rand(experts, scale=0.5).float()
++        for e in [f"experts.{j}" for j in range(experts)] + ["shared_experts"]:
++            fp8(f"{p}mlp.{e}.gate_proj", width, hidden, hidden ** -0.5)
++            fp8(f"{p}mlp.{e}.up_proj", width, hidden, hidden ** -0.5)
++            fp8(f"{p}mlp.{e}.down_proj", hidden, width, width ** -0.5)
++    save_file(t, str(dir / "model-00001-of-00001.safetensors"))
++    (dir / "model.safetensors.index.json").write_text(json.dumps(
++        {"metadata": {}, "weight_map": {k: "model-00001-of-00001.safetensors" for k in t}}))
++    types = ["full_attention" if (i + 1) % full_every == 0 else "sliding_attention" for i in range(layers)]
++    (dir / "config.json").write_text(json.dumps({
++        "architectures": ["Kolibri1ForCausalLM"], "model_type": "kolibri1", "hidden_size": hidden,
++        "num_hidden_layers": layers, "num_attention_heads": heads, "num_key_value_heads": kv_heads,
++        "head_dim": head_dim, "vocab_size": vocab, "num_experts": experts, "num_experts_per_tok": top_k,
++        "moe_intermediate_size": width, "shared_expert_intermediate_size": width, "norm_topk_prob": False,
++        "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "sliding_window": window, "layer_types": types,
++        "eos_token_id": vocab - 1, "max_position_embeddings": 4096,
++        "quantization_config": {"quant_method": "fp8", "activation_scheme": "dynamic",
++                                "weight_block_size": [128, 128]}}))
++    return dir
+diff --git a/tests/cuda/test_fp8_experts.py b/tests/cuda/test_fp8_experts.py
+new file mode 100644
+index 0000000..46baa2a
+--- /dev/null
++++ b/tests/cuda/test_fp8_experts.py
+@@ -0,0 +1,69 @@
++"""Grouped block-FP8 experts: the dense fp32 reference's values, and a pair's bits whatever else the call holds."""
++
++from __future__ import annotations
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++
++
++def fp8(e: int, n: int, k: int, g: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
++    w = (torch.randn(e, n, k, generator=g) * 2).clamp(-400, 400).to(torch.float8_e4m3fn)
++    s = torch.rand(e, n // 128, k // 128, generator=g) * 0.01 + 0.001
++    return w.cuda(), s.cuda()
++
++
++def setup(rows: int, e: int = 6, width: int = 256, dims: int = 512, slots: int = 3, seed: int = 0):
++    from tensorfold.cuda import experts as grouped
++    from tensorfold.cuda.fp8 import experts as fp8x
++
++    g = torch.Generator().manual_seed(seed)
++    gate, up, down = fp8(e, width, dims, g), fp8(e, width, dims, g), fp8(e, dims, width, g)
++    ex = fp8x.make(gate, up, down)
++    x = (torch.randn(rows, dims, generator=g) * 0.5).to(torch.bfloat16).cuda()
++    picks = torch.stack([torch.randperm(e, generator=g)[:slots] for _ in range(rows)]).to(torch.int32).cuda()
++    return grouped, fp8x, ex, (gate, up, down), x, picks
++
++
++def run(grouped, fp8x, ex, x, picks, prefill: bool = False):
++    rows, slots = picks.shape
++    plan = grouped.Plan(rows, slots, ex.count, x.device, prefill=prefill)
++    grouped.route(picks.contiguous(), plan, 16)
++    act = torch.empty((rows * slots, ex.width), dtype=torch.bfloat16, device=x.device)
++    fp8x.gate_up(x, ex, plan, act, rows)
++    y = torch.empty((rows * slots, ex.dims), dtype=torch.float32, device=x.device)
++    fp8x.down(act, ex, plan, y, rows)
++    return act.view(rows, slots, -1), y.view(rows, slots, -1)
++
++
++def test_fp8_experts_match_the_dense_reference():
++    grouped, fp8x, ex, (gate, up, down), x, picks = setup(37)
++    act, y = run(grouped, fp8x, ex, x, picks)
++    dg, du, dd = (fp8x.dense(*m) for m in (gate, up, down))
++    for r in range(x.shape[0]):
++        for s, e in enumerate(picks[r].tolist()):
++            gv = (x[r].float() @ dg[e].T).bfloat16().float()
++            uv = (x[r].float() @ du[e].T).bfloat16().float()
++            ref_act = ((gv * torch.sigmoid(gv)).bfloat16().float() * uv).bfloat16()
++            torch.testing.assert_close(act[r, s].float(), ref_act.float(), rtol=2e-2, atol=2e-2)
++            ref_y = act[r, s].float() @ dd[e].T                         # the kernel's own activation, so down alone
++            torch.testing.assert_close(y[r, s], ref_y, rtol=1e-3, atol=1e-3)
++
++
++def test_a_pairs_bits_never_depend_on_the_other_rows():
++    grouped, fp8x, ex, _, x, picks = setup(40, seed=1)
++    act, y = run(grouped, fp8x, ex, x, picks)
++    for r in (0, 7, 39):
++        a1, y1 = run(grouped, fp8x, ex, x[r:r + 1].contiguous(), picks[r:r + 1])
++        assert torch.equal(act[r], a1[0]) and torch.equal(y[r], y1[0])
++    ap, yp = run(grouped, fp8x, ex, x, picks, prefill=True)            # a prompt plan's grouping, same bits
++    assert torch.equal(act, ap) and torch.equal(y, yp)
++
++
++def test_unaligned_blocks_are_refused():
++    from tensorfold.cuda.fp8 import experts as fp8x
++
++    w = torch.zeros(2, 96, 256, dtype=torch.float8_e4m3fn, device="cuda")
++    with pytest.raises(ValueError, match="multiples of 128"):
++        fp8x.pack(w)
+diff --git a/tests/cuda/test_kolibri1_attention.py b/tests/cuda/test_kolibri1_attention.py
+new file mode 100644
+index 0000000..0a93b72
+--- /dev/null
++++ b/tests/cuda/test_kolibri1_attention.py
+@@ -0,0 +1,73 @@
++"""Kolibri 1's sliding attention: the masked softmax's values, and a row's bits whatever rows share the call."""
++
++from __future__ import annotations
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++
++
++def reference(q, kc, vc, positions, window, scale):
++    out = []
++    g = q.shape[1] // kc.shape[1]
++    for r, p in enumerate(positions.tolist()):
++        lo = max(0, p - window + 1)
++        k = kc[lo:p + 1].float().repeat_interleave(g, 1)
++        v = vc[lo:p + 1].float().repeat_interleave(g, 1)
++        s = torch.einsum("hd,shd->hs", q[r].float(), k) * scale
++        out.append(torch.einsum("hs,shd->hd", s.softmax(-1), v))
++    return torch.stack(out)
++
++
++@pytest.mark.parametrize("window", [513, 64, 1])
++def test_sliding_rows_match_the_masked_softmax(window):
++    from tensorfold.families.kolibri1.cuda.attention import sliding
++
++    g = torch.Generator().manual_seed(0)
++    n, h, hk, d = 1500, 48, 4, 128
++    kc = torch.randn(n, hk, d, generator=g).to(torch.bfloat16).cuda()
++    vc = torch.randn(n, hk, d, generator=g).to(torch.bfloat16).cuda()
++    positions = torch.tensor([0, 1, 63, 64, 511, 512, 513, 700, 1499], dtype=torch.int32).cuda()
++    q = torch.randn(len(positions), h, d, generator=g).to(torch.bfloat16).cuda()
++    slots = torch.zeros_like(positions)
++    got = sliding(q, kc[None].contiguous(), vc[None].contiguous(), positions, slots, window=window, scale=d ** -0.5)
++    torch.testing.assert_close(got.float(), reference(q, kc, vc, positions, window, d ** -0.5), rtol=2e-2, atol=2e-2)
++
++
++def test_a_sliding_rows_bits_never_depend_on_the_call():
++    from tensorfold.families.kolibri1.cuda.attention import sliding
++
++    g = torch.Generator().manual_seed(1)
++    n, h, hk, d = 900, 48, 4, 128
++    kc = torch.randn(n, hk, d, generator=g).to(torch.bfloat16).cuda()
++    vc = torch.randn(n, hk, d, generator=g).to(torch.bfloat16).cuda()
++    positions = torch.arange(300, 900, dtype=torch.int32).cuda()
++    q = torch.randn(len(positions), h, d, generator=g).to(torch.bfloat16).cuda()
++    kr, vr, slots = kc[None].contiguous(), vc[None].contiguous(), torch.zeros_like(positions)
++    whole = sliding(q, kr, vr, positions, slots, window=513, scale=d ** -0.5)
++    for r in (0, 255, 599):
++        one = sliding(q[r:r + 1].contiguous(), kr, vr, positions[r:r + 1], slots[r:r + 1], window=513,
++                      scale=d ** -0.5)
++        assert torch.equal(whole[r], one[0])
++
++
++def test_a_ring_holds_the_window_with_the_same_bits_as_full_caches():
++    from tensorfold.families.kolibri1.cuda.attention import ring_size, sliding
++
++    g = torch.Generator().manual_seed(2)
++    n, h, hk, d, win = 1000, 48, 4, 128, 513
++    kc = torch.randn(n, hk, d, generator=g).to(torch.bfloat16).cuda()
++    vc = torch.randn(n, hk, d, generator=g).to(torch.bfloat16).cuda()
++    positions = torch.arange(900, 1000, dtype=torch.int32).cuda()
++    q = torch.randn(len(positions), h, d, generator=g).to(torch.bfloat16).cuda()
++    ring = ring_size(100, win)
++    kr = torch.zeros(2, ring, hk, d, dtype=torch.bfloat16, device="cuda")      # slot 1 holds it, slot 0 noise
++    vr = torch.zeros_like(kr)
++    kr[0].normal_()
++    keys = torch.arange(n, device="cuda")
++    kr[1, keys % ring], vr[1, keys % ring] = kc, vc                            # the latest key wins its slot
++    ones = torch.ones_like(positions)
++    got = sliding(q, kr, vr, positions, ones, window=win, scale=d ** -0.5)
++    want = sliding(q, kc[None].contiguous(), vc[None].contiguous(), positions, ones * 0, window=win, scale=d ** -0.5)
++    assert torch.equal(got, want)
+diff --git a/tests/cuda/test_kolibri1_forward.py b/tests/cuda/test_kolibri1_forward.py
+new file mode 100644
+index 0000000..a8197d3
+--- /dev/null
++++ b/tests/cuda/test_kolibri1_forward.py
+@@ -0,0 +1,98 @@
++"""Kolibri 1's CUDA forward on a tiny checkpoint: the fp32 reference's logits, chunk- and batch-independent rows."""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++sys.path.insert(0, str(Path(__file__).parent))
++
++from kolibri1_reference import Kolibri  # noqa: E402
++from kolibri1_tiny import write  # noqa: E402
++
++
++@pytest.fixture(scope="module")
++def tiny(tmp_path_factory) -> Path:
++    return write(tmp_path_factory.mktemp("kolibri1-tiny"))
++
++
++@pytest.fixture(scope="module")
++def weights(tiny):
++    from tensorfold.families.kolibri1.cuda.weights import load
++
++    return load(tiny)
++
++
++def tokens(n: int, seed: int = 0) -> list[int]:
++    g = torch.Generator().manual_seed(seed)
++    return torch.randint(0, 500, (n,), generator=g).tolist()
++
++
++def cosines(a, b):
++    return torch.nn.functional.cosine_similarity(a, b, dim=-1)
++
++
++def test_the_forward_matches_the_fp32_reference(tiny, weights):
++    from tensorfold.families.kolibri1.cuda.forward import Chain, Model
++
++    ids = tokens(100)
++    ref = Kolibri(tiny)
++    want, _ = ref.forward(ids, 0)
++    m = Model(weights, 256)
++    got = m.forward([Chain(0, 0, ids)], prompt=True, rows=range(100))
++    assert cosines(got, want).min() > 0.99
++    assert (got.argmax(-1) == want.argmax(-1)).float().mean() > 0.9
++    step = m.step([7], [100], [0])                               # a decode row after the prompt
++    nxt, _ = ref.forward([7], 100)
++    assert cosines(step, nxt).min() > 0.99
++
++
++def test_prompt_chunks_and_decode_rows_agree(weights):
++    from tensorfold.families.kolibri1.cuda.forward import Chain, Model
++
++    ids = tokens(90, seed=1)
++    whole = Model(weights, 256).forward([Chain(0, 0, ids)], prompt=True, rows=range(90))
++    last = Model(weights, 256).prefill(ids, chunk=32)            # three chunks: same rows, same bits
++    assert torch.equal(last[0], whole[-1])
++    c = Model(weights, 256)
++    c.prefill(ids[:60])
++    decoded = torch.cat([c.step([t], [60 + i], [0]) for i, t in enumerate(ids[60:])])
++    cos = cosines(decoded, whole[60:])                            # decode rows: the full layers' other kernel
++    # a near-tie between two of 8 random experts can flip on the last bit (one row of this seed)
++    assert (cos > 0.999).float().mean() >= 0.9 and cos.min() > 0.9, cos
++
++
++def test_streams_decoded_together_equal_each_alone(weights):
++    from tensorfold.families.kolibri1.cuda.forward import Model
++
++    prompts = [tokens(40 + 13 * k, seed=10 + k) for k in range(3)]
++    together = Model(weights, 256, slots=3)
++    alone = [Model(weights, 256) for _ in prompts]
++    nxt = []
++    for k, p in enumerate(prompts):
++        a, b = together.prefill(p, slot=k), alone[k].prefill(p)
++        assert torch.equal(a, b)
++        nxt.append(int(a.argmax()))
++    pos = [len(p) for p in prompts]
++    for _ in range(6):
++        both = together.step(nxt, pos, [0, 1, 2])
++        for k in range(3):
++            assert torch.equal(both[k], alone[k].step([nxt[k]], [pos[k]], [0])[0])
++        nxt = [int(r.argmax()) for r in both]
++        pos = [p + 1 for p in pos]
++
++
++def test_a_prompt_longer_than_the_ring_matches_the_reference(tiny, weights, monkeypatch):
++    from tensorfold.families.kolibri1.cuda import forward
++
++    monkeypatch.setattr(forward, "PROMPT_CHUNK", 64)
++    m = forward.Model(weights, 512)
++    assert m.ring == 128                                        # 64 rows written, then 33 keys back
++    ids = tokens(400, seed=3)
++    got = m.prefill(ids)
++    want, _ = Kolibri(tiny).forward(ids, 0)
++    assert cosines(got[0], want[-1]) > 0.99
+-- 
+2.53.0
+

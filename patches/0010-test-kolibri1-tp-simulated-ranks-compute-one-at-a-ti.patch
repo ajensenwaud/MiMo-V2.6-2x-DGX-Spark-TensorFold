@@ -1,0 +1,150 @@
+From 72e7bf26b8fa6cc45c3f2f186878d9db9cc7d47c Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 13:10:01 +1100
+Subject: [PATCH 10/23] test(kolibri1 tp): simulated ranks compute one at a
+ time; diagnostics
+
+---
+ tests/cuda/test_kolibri1_tp.py | 30 +++++++++++++++++++++---------
+ tools/kolibri_tp_diag.py       | 33 +++++++++++++++++++++++++++++++++
+ tools/kolibri_tp_diag2.py      | 27 +++++++++++++++++++++++++++
+ 3 files changed, 81 insertions(+), 9 deletions(-)
+ create mode 100644 tools/kolibri_tp_diag.py
+ create mode 100644 tools/kolibri_tp_diag2.py
+
+diff --git a/tests/cuda/test_kolibri1_tp.py b/tests/cuda/test_kolibri1_tp.py
+index 1cb5ead..e919a1a 100644
+--- a/tests/cuda/test_kolibri1_tp.py
++++ b/tests/cuda/test_kolibri1_tp.py
+@@ -17,7 +17,8 @@ from kolibri1_tiny import write  # noqa: E402
+ 
+ 
+ class PairComm:
+-    """Two threads' all-gather in rank order: each publishes its send, both copy both."""
++    """Two threads' all-gather in rank order: each publishes its send, both copy both. The threads compute one at
++    a time (a lock released only inside the gather): module-level scratch buffers are per process, not per rank."""
+ 
+     def __init__(self, shared: dict, rank: int) -> None:
+         self.shared, self.rank, self.world = shared, rank, 2
+@@ -25,27 +26,38 @@ class PairComm:
+     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
+         torch.cuda.synchronize()
+         self.shared[self.rank] = send.detach().clone()
+-        self.shared["bar"].wait()
+-        r = recv.view(2, -1)
+-        r[0].copy_(self.shared[0].reshape(-1))
+-        r[1].copy_(self.shared[1].reshape(-1))
+-        torch.cuda.synchronize()
+-        self.shared["bar"].wait()
++        self.shared["lock"].release()
++        try:
++            self.shared["bar"].wait()
++            r = recv.view(2, -1)
++            r[0].copy_(self.shared[0].reshape(-1))
++            r[1].copy_(self.shared[1].reshape(-1))
++            torch.cuda.synchronize()
++            self.shared["bar"].wait()
++        finally:
++            self.shared["lock"].acquire()
+ 
+     def barrier(self) -> None:
+-        self.shared["bar"].wait()
++        self.shared["lock"].release()
++        try:
++            self.shared["bar"].wait()
++        finally:
++            self.shared["lock"].acquire()
+ 
+ 
+ def pair(fn):
+-    shared = {"bar": threading.Barrier(2, timeout=120)}
++    shared = {"bar": threading.Barrier(2, timeout=120), "lock": threading.Lock()}
+     out, errors = [None, None], []
+ 
+     def run(rank):
++        shared["lock"].acquire()
+         try:
+             out[rank] = fn(rank, PairComm(shared, rank))
+         except BaseException as e:              # noqa: BLE001
+             errors.append(e)
+             shared["bar"].abort()
++        finally:
++            shared["lock"].release()
+ 
+     ts = [threading.Thread(target=run, args=(r,)) for r in (0, 1)]
+     for t in ts:
+diff --git a/tools/kolibri_tp_diag.py b/tools/kolibri_tp_diag.py
+new file mode 100644
+index 0000000..b3d1549
+--- /dev/null
++++ b/tools/kolibri_tp_diag.py
+@@ -0,0 +1,33 @@
++"""Diagnostic: TP=1 and TP=2 (simulated) prompt rows against the fp32 reference on the tiny checkpoint."""
++
++import sys
++import tempfile
++from pathlib import Path
++
++import torch
++
++sys.path.insert(0, "tests/cuda")
++from kolibri1_reference import Kolibri  # noqa: E402
++from kolibri1_tiny import write  # noqa: E402
++from test_kolibri1_tp import pair  # noqa: E402
++
++from tensorfold.families.kolibri1.cuda.forward import Chain, Model  # noqa: E402
++from tensorfold.families.kolibri1.cuda.weights import load  # noqa: E402
++
++for width, top_k, experts in ((256, 3, 8), (256, 1, 8)):
++    tiny = write(Path(tempfile.mkdtemp()), width=width, top_k=top_k, experts=experts)
++    ids = torch.randint(0, 500, (100,), generator=torch.Generator().manual_seed(0)).tolist()
++    ref, _ = Kolibri(tiny).forward(ids, 0)
++    one = Model(load(tiny), 256).forward([Chain(0, 0, ids)], prompt=True, rows=range(100))
++
++    def run(rank, comm):
++        return Model(load(tiny, rank=rank, world=2), 256, comm=comm).forward([Chain(0, 0, ids)], prompt=True,
++                                                                             rows=range(100))
++
++    two, _ = pair(run)
++    cos = torch.nn.functional.cosine_similarity
++    for name, x in (("tp1", one), ("tp2", two)):
++        c = cos(x, ref.to(x.device), dim=-1)
++        print(f"top_k={top_k} {name} vs fp32 ref: min {c.min():.4f} mean {c.mean():.5f} rows<0.99 {(c < 0.99).sum().item()}")
++    c = cos(one, two, dim=-1)
++    print(f"top_k={top_k} tp1 vs tp2: min {c.min():.4f} rows<0.99 {(c < 0.99).sum().item()}")
+diff --git a/tools/kolibri_tp_diag2.py b/tools/kolibri_tp_diag2.py
+new file mode 100644
+index 0000000..d636210
+--- /dev/null
++++ b/tools/kolibri_tp_diag2.py
+@@ -0,0 +1,27 @@
++"""Diagnostic: one MoE layer, full width vs the sum of two half-width partials (prompt and decode kernels)."""
++
++import sys
++import tempfile
++from pathlib import Path
++
++import torch
++
++sys.path.insert(0, "tests/cuda")
++from kolibri1_tiny import write  # noqa: E402
++
++from tensorfold.families.kolibri1.cuda import moe  # noqa: E402
++from tensorfold.families.kolibri1.cuda.weights import load  # noqa: E402
++
++tiny = write(Path(tempfile.mkdtemp()), width=256, top_k=3, experts=8)
++full, h0, h1 = load(tiny), load(tiny, rank=0, world=2), load(tiny, rank=1, world=2)
++torch.manual_seed(0)
++cos = torch.nn.functional.cosine_similarity
++for rows in (1, 5, 100):
++    x = torch.randn(rows, 256, device="cuda").to(torch.bfloat16)
++    for prefill in (False, True):
++        L, A, B = full.layers[0], h0.layers[0], h1.layers[0]
++        want = moe.run(x, L.router, L.bias, L.experts, 3, prefill=prefill, partial=True)
++        a = moe.run(x, A.router, A.bias, A.experts, 3, prefill=prefill, partial=True).clone()
++        b = moe.run(x, B.router, B.bias, B.experts, 3, prefill=prefill, partial=True).clone()
++        c = cos(a + b, want, dim=-1)
++        print(f"rows {rows:>3} prefill {prefill!s:<5} min cos {c.min():.5f}")
+-- 
+2.53.0
+

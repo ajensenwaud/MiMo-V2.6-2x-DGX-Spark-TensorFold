@@ -12,7 +12,7 @@ RUN git clone -q "${EXL3_REPO}" /opt/exllamav3 && git -C /opt/exllamav3 checkout
  && cd /opt/exllamav3 && TORCH_CUDA_ARCH_LIST="12.1" MAX_JOBS=${MAX_JOBS} \
     pip install --no-deps --no-build-isolation --no-cache-dir . \
  && pip install --no-deps --no-cache-dir marisa_trie llguidance \
- && python3 -c "import exllamav3, exllamav3_ext; print('exllamav3', exllamav3.__version__)"
+ && python3 -c "import exllamav3, exllamav3_ext; from importlib.metadata import version; print('exllamav3', version('exllamav3'))"
 
 COPY src /opt/tensorfold-mimo/src
 COPY tools /opt/tensorfold-mimo/tools

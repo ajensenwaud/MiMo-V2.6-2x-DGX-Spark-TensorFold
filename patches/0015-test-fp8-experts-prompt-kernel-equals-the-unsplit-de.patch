@@ -1,0 +1,62 @@
+From bd251229477ba3720bc8bcaea436dccf0b628da9 Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 13:38:01 +1100
+Subject: [PATCH 15/23] test(fp8 experts): prompt kernel equals the unsplit
+ decode kernel; split K is the regrouped sum, row-independent
+
+---
+ tests/cuda/test_fp8_experts.py | 29 ++++++++++++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/tests/cuda/test_fp8_experts.py b/tests/cuda/test_fp8_experts.py
+index 857be01..986b966 100644
+--- a/tests/cuda/test_fp8_experts.py
++++ b/tests/cuda/test_fp8_experts.py
+@@ -57,16 +57,43 @@ def test_a_pairs_bits_never_depend_on_the_other_rows():
+     for r in (0, 7, 39):
+         a1, y1 = run(grouped, fp8x, ex, x[r:r + 1].contiguous(), picks[r:r + 1])
+         assert torch.equal(act[r], a1[0]) and torch.equal(y[r], y1[0])
++
++
++def test_the_staged_prompt_kernel_equals_the_unsplit_decode_kernel(monkeypatch):
++    monkeypatch.setenv("TF_FP8_SPLITK_GATEUP", "1")
++    monkeypatch.setenv("TF_FP8_SPLITK_DOWN", "1")
++    grouped, fp8x, ex, _, x, picks = setup(40, seed=1)
++    act, y = run(grouped, fp8x, ex, x, picks)
+     ap, yp = run(grouped, fp8x, ex, x, picks, prefill=True)            # the staged prompt kernel, same bits
+     assert torch.equal(act, ap) and torch.equal(y, yp)
+ 
+ 
+-def test_the_staged_prompt_kernel_equals_the_decode_kernel_on_long_items():
++def test_the_staged_prompt_kernel_equals_the_decode_kernel_on_long_items(monkeypatch):
++    monkeypatch.setenv("TF_FP8_SPLITK_GATEUP", "1")
++    monkeypatch.setenv("TF_FP8_SPLITK_DOWN", "1")
+     grouped, fp8x, ex, _, x, picks = setup(300, e=4, seed=2)          # ~225 pairs an expert: several 64-pair items
+     assert torch.equal(torch.cat(run(grouped, fp8x, ex, x, picks), -1),
+                        torch.cat(run(grouped, fp8x, ex, x, picks, prefill=True), -1))
+ 
+ 
++@pytest.mark.parametrize("parts", ["2", "4"])
++def test_split_k_decode_is_the_unsplit_sum_regrouped(monkeypatch, parts):
++    """Split K regroups the fp32 sum (parts added in order): row-independent, within fp32 rounding of unsplit."""
++
++    grouped, fp8x, ex, _, x, picks = setup(24, seed=3)
++    monkeypatch.setenv("TF_FP8_SPLITK_GATEUP", "1")
++    monkeypatch.setenv("TF_FP8_SPLITK_DOWN", "1")
++    a1, y1 = run(grouped, fp8x, ex, x, picks)
++    monkeypatch.setenv("TF_FP8_SPLITK_GATEUP", parts)
++    monkeypatch.setenv("TF_FP8_SPLITK_DOWN", parts)
++    a2, y2 = run(grouped, fp8x, ex, x, picks)
++    assert (a1.float() - a2.float()).abs().max() <= 0.02 * a1.float().abs().max()     # bf16 ulps at most
++    assert (a1.float() != a2.float()).float().mean() < 0.05
++    for r in (0, 11, 23):
++        ar, yr = run(grouped, fp8x, ex, x[r:r + 1].contiguous(), picks[r:r + 1])
++        assert torch.equal(a2[r], ar[0]) and torch.equal(y2[r], yr[0])
++
++
+ def test_unaligned_blocks_are_refused():
+     from tensorfold.cuda.fp8 import experts as fp8x
+ 
+-- 
+2.53.0
+

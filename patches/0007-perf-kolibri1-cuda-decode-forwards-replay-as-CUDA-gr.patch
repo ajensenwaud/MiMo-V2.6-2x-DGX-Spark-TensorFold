@@ -1,0 +1,446 @@
+From d4257562496ee6bd7733fda1c59efb5a5beb5547 Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 12:56:37 +1100
+Subject: [PATCH 07/23] perf(kolibri1 cuda): decode forwards replay as CUDA
+ graphs; one attention plan a forward
+
+---
+ .../families/kolibri1/cuda/attention.py       |  66 +++++++++
+ .../families/kolibri1/cuda/decoder.py         |  11 +-
+ .../families/kolibri1/cuda/forward.py         |  55 +++++---
+ .../families/kolibri1/cuda/graphs.py          | 133 ++++++++++++++++++
+ tests/cuda/test_kolibri1_graphs.py            |  88 ++++++++++++
+ 5 files changed, 332 insertions(+), 21 deletions(-)
+ create mode 100644 src/tensorfold/families/kolibri1/cuda/graphs.py
+ create mode 100644 tests/cuda/test_kolibri1_graphs.py
+
+diff --git a/src/tensorfold/families/kolibri1/cuda/attention.py b/src/tensorfold/families/kolibri1/cuda/attention.py
+index 458d8c7..4e0e05b 100644
+--- a/src/tensorfold/families/kolibri1/cuda/attention.py
++++ b/src/tensorfold/families/kolibri1/cuda/attention.py
+@@ -95,3 +95,69 @@ def full_rows(q: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor,
+                      q.shape[1] // k_new.shape[1], q.device)
+     offs = torch.tensor(tree.offsets(caches, q.device), dtype=torch.int64, device=q.device).view(len(groups), 2)
+     return tree.attention(q, k_new, v_new, offs, plan, scale=scale)
++
++
++# Full layers' decode attention, planned once a forward. A cache slot's offset from ``tree.base`` is the layer's
++# slot-0 offset plus slot times the slot stride, so a graph computes it on the device from the stream's slot.
++
++def slot_offsets(model) -> tuple[torch.Tensor, torch.Tensor]:
++    """(full layers, 2) int64 slot-0 key/value offsets and (full layers, 2) int64 strides, in bf16 elements."""
++
++    from tensorfold.cuda.kernels import attention as tree
++
++    dev = model.w.embed.device
++    bases, strides = [], []
++    for i, full in enumerate(model.cfg.full):
++        if full:
++            k, v = model.k[i], model.v[i]
++            bases.append(tree.offsets([(k[0], v[0])], dev))
++            strides.append([k.stride(0), v.stride(0)])
++    return (torch.tensor(bases, dtype=torch.int64, device=dev), torch.tensor(strides, dtype=torch.int64, device=dev))
++
++
++def rows_plan(model, chains):
++    """An eager forward's plan and per-full-layer offsets [(S, 2)] for its chains (one copy each to the device)."""
++
++    from tensorfold.cuda.kernels import attention as tree
++
++    if getattr(model, "_slot_offsets", None) is None:
++        model._slot_offsets = slot_offsets(model)
++    bases, strides = model._slot_offsets
++    dev = bases.device
++    group = model.cfg.heads // model.cfg.kv_heads
++    plan = tree.plan([[i - 1 for i in range(len(c.tokens))] for c in chains], [c.p0 for c in chains], group, dev)
++    slots = torch.tensor([c.slot for c in chains], dtype=torch.int64).to(dev, non_blocking=True)
++    offs = (bases[:, None, :] + slots[None, :, None] * strides[:, None, :]).contiguous()
++    return plan, offs
++
++
++def full_planned(q: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor, offs: torch.Tensor, plan, *,
++                 scale: float) -> torch.Tensor:
++    from tensorfold.cuda.kernels import attention as tree
++
++    return tree.attention(q, k_new, v_new, offs, plan, scale=scale)
++
++
++def padded_host(widths, bucket: int, group: int) -> tuple[list[int], int, int]:
++    """``tree.plan_host`` for serial chains of ``widths`` over every group and chunk below ``bucket`` keys.
++
++    The streams' rows (first row, rows, committed keys, partial slots) are refreshed per replay; the kernels skip
++    the items those keys do not fill, so a padded plan gives the bits of the exact one."""
++
++    from tensorfold.cuda.kernels import attention as tree
++
++    rows, streams, items, glob = [], [], [], []
++    start = 0
++    codes = list(range(bucket // tree.SPAN)) + [-1 - j for j in range(bucket // tree.CHUNK)]
++    for s, w in enumerate(widths):
++        if not 1 <= w <= tree.MAX_NODES:
++            raise ValueError(f"a stream's window takes 1..{tree.MAX_NODES} rows")
++        rows += [s] * w
++        streams += [start, w, 0, 0]
++        glob += [-1] + [start + i for i in range(w - 1)]
++        for code in codes:
++            for first in range(0, w * group, tree.QUERY_TILE):
++                items += [s, first, code]
++        start += w
++    most = -(-(bucket + max(widths)) // tree.CHUNK)
++    return rows + streams + items + glob, len(items) // 3, most
+diff --git a/src/tensorfold/families/kolibri1/cuda/decoder.py b/src/tensorfold/families/kolibri1/cuda/decoder.py
+index c688458..eb6515c 100644
+--- a/src/tensorfold/families/kolibri1/cuda/decoder.py
++++ b/src/tensorfold/families/kolibri1/cuda/decoder.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import time
+ 
+ import numpy as np
+@@ -35,6 +36,11 @@ class Decoder:
+         self.kept: dict[int, tuple[np.ndarray, int, int]] = {}   # free slot -> (prompt rows, written, last use)
+         self.tick = 0
+         self.next_id = 0
++        self.graphs = None
++        if os.environ.get("TF_KOLIBRI_GRAPHS", "1") != "0":
++            from .graphs import Graphs
++
++            self.graphs = Graphs(model)
+ 
+     def live(self) -> int:
+         return len(self.streams) + len(self.filling)
+@@ -126,7 +132,10 @@ class Decoder:
+             chains.append(Chain(self.slot[s.sid], p, [s.out[-1], *drafts]))
+             self.written[s.sid] = max(self.written[s.sid], p + 1 + len(drafts))
+         total = sum(len(c.tokens) for c in chains)
+-        logits = self.model.forward(chains, prompt=False, rows=range(total))
++        if self.graphs is not None:
++            logits = self.graphs.forward(chains)
++        else:
++            logits = self.model.forward(chains, prompt=False, rows=range(total))
+         for s, c, a in zip(live, chains, starts):
+             win = list(c.tokens)
+             sampled = sample_rows(logits[a:a + len(win)], [c.p0 + 1 + i for i in range(len(win))], s.sampling)
+diff --git a/src/tensorfold/families/kolibri1/cuda/forward.py b/src/tensorfold/families/kolibri1/cuda/forward.py
+index f2b790b..d167314 100644
+--- a/src/tensorfold/families/kolibri1/cuda/forward.py
++++ b/src/tensorfold/families/kolibri1/cuda/forward.py
+@@ -79,31 +79,44 @@ class Model:
+         full = sum(cfg.full)
+         return row * (full * context + (len(cfg.full) - full) * attention.ring_size(PROMPT_CHUNK, cfg.window))
+ 
+-    @torch.no_grad()
+-    def forward(self, chains: Sequence[Chain], *, prompt: bool, rows: Sequence[int] | None = None,
+-                features: bool = False):
+-        """fp32 logits of ``rows`` (default: each chain's last), or with ``features`` every row's normed state."""
+-
+-        cfg, w = self.cfg, self.w
+-        if prompt and len(chains) != 1:
+-            raise ValueError("a prompt forward takes one stream's chunk")
+-        dev = w.embed.device
+-        ids = torch.tensor([t for c in chains for t in c.tokens], dtype=torch.int64)
+-        pos_l = [c.p0 + i for c in chains for i in range(len(c.tokens))]
+-        slot_l = [c.slot for c in chains for _ in c.tokens]
++    def check(self, chains: Sequence[Chain]) -> None:
+         for c in chains:
+-            if len(c.tokens) > self.ring - cfg.window:             # its first row's window must survive its writes
++            if len(c.tokens) > self.ring - self.cfg.window:        # its first row's window must survive its writes
+                 raise ValueError(f"a chain of {len(c.tokens)} rows overruns the {self.ring}-key sliding ring")
+             if c.p0 + len(c.tokens) > self.context:
+                 raise ValueError(f"positions through {c.p0 + len(c.tokens)} exceed the {self.context}-token cache")
+-        n = len(pos_l)
+-        ids = ids.to(dev, non_blocking=True)
+-        pos = torch.tensor(pos_l, dtype=torch.int64).to(dev, non_blocking=True)
+-        pos32, slot32 = pos.to(torch.int32), torch.tensor(slot_l, dtype=torch.int32).to(dev, non_blocking=True)
+-        groups = [(len(c.tokens), c.p0) for c in chains]
++
++    @torch.no_grad()
++    def forward(self, chains: Sequence[Chain] | None, *, prompt: bool, rows: Sequence[int] | None = None,
++                features: bool = False, staged=None):
++        """fp32 logits of ``rows`` (default: each chain's last), or with ``features`` every row's normed state.
++
++        ``staged`` (decode only) supplies device inputs, the attention plan and cache offsets from fixed buffers, so
++        the forward launches no host work and replays as a CUDA graph; it computes logits of every row."""
++
++        cfg, w = self.cfg, self.w
++        dev = w.embed.device
++        if staged is not None:
++            ids, pos32, slot32, plan, offs = staged.ids, staged.pos32, staged.slot32, staged.plan, staged.offs
++            n = staged.width
++        else:
++            if prompt and len(chains) != 1:
++                raise ValueError("a prompt forward takes one stream's chunk")
++            self.check(chains)
++            ids = torch.tensor([t for c in chains for t in c.tokens], dtype=torch.int64)
++            pos_l = [c.p0 + i for c in chains for i in range(len(c.tokens))]
++            slot_l = [c.slot for c in chains for _ in c.tokens]
++            n = len(pos_l)
++            ids = ids.to(dev, non_blocking=True)
++            pos32 = torch.tensor(pos_l, dtype=torch.int32).to(dev, non_blocking=True)
++            slot32 = torch.tensor(slot_l, dtype=torch.int32).to(dev, non_blocking=True)
++            plan = offs = None
++            if not prompt:                                     # one plan a forward, shared by the full layers
++                plan, offs = attention.rows_plan(self, chains)
+         res = w.embed[ids].float()
+         h, hk, d, eps = cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.eps
+         x = rms(res, w.layers[0].input_norm, eps, bf16=True)
++        j = 0                                                  # full layers seen
+         for i, L in enumerate(w.layers):
+             q, k, v = glue.qkv(L.qkv(x), self.qk_norms[i], self.cos, self.sin, pos32, slot32, self.k[i], self.v[i],
+                                heads=h, kv_heads=hk, eps=eps, rope=not cfg.full[i])
+@@ -113,12 +126,14 @@ class Model:
+                 c = chains[0]
+                 a = attention.full_prompt(q, self.k[i][c.slot], self.v[i][c.slot], c.p0, scale=self.scale)
+             else:
+-                caches = [(self.k[i][c.slot], self.v[i][c.slot]) for c in chains]
+-                a = attention.full_rows(q, k, v, caches, groups, scale=self.scale)
++                a = attention.full_planned(q, k, v, offs[j], plan, scale=self.scale)
++            j += cfg.full[i]
+             x = glue.add_rms(L.o(a.view(n, h * d)), res, L.post_attn_norm, L.pre_moe_norm, eps)
+             m = moe.run(x, L.router, L.bias, L.experts, cfg.top_k, prefill=prompt)
+             after = w.layers[i + 1].input_norm if i + 1 < len(w.layers) else w.norm
+             x = glue.add_rms(m, res, L.post_moe_norm, after, eps)
++        if staged is not None:
++            return x if features else shared.router(x, w.head)
+         if rows is None:
+             ends, at = [], 0
+             for c in chains:
+diff --git a/src/tensorfold/families/kolibri1/cuda/graphs.py b/src/tensorfold/families/kolibri1/cuda/graphs.py
+new file mode 100644
+index 0000000..d11323d
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/cuda/graphs.py
+@@ -0,0 +1,133 @@
++"""Decode forwards replayed as CUDA graphs per (chain widths, full-attention key bucket); inputs in fixed buffers."""
++# A replay launches the same kernels on the same plan as the eager forward (padded plans skip what the keys don't
++# fill), so its rows carry the eager rows' bits. Shapes outside the graphed set fall back to the eager forward.
++
++from __future__ import annotations
++
++import gc
++import os
++from collections import OrderedDict
++from typing import Sequence
++
++import torch
++
++from . import attention
++from .forward import Chain, Model
++
++BUCKET = 8192            # smallest key span a graph covers; longer contexts take the next power of two
++KEEP = int(os.environ.get("TF_KOLIBRI_GRAPHS_KEEP", "48"))      # graphs held (least recently replayed dropped)
++MAX_ROWS = 32            # widest window graphed
++
++
++class Staged:
++    """A key's fixed device inputs and the pinned host mirror refreshed before each replay."""
++
++    def __init__(self, model: Model, widths: tuple[int, ...], bucket: int) -> None:
++        from tensorfold.cuda.kernels import attention as tree
++
++        dev = model.w.embed.device
++        self.widths, self.width, self.streams = widths, sum(widths), len(widths)
++        w, s = self.width, self.streams
++        group = model.cfg.heads // model.cfg.kv_heads
++        flat, n_items, most = attention.padded_host(widths, bucket, group)
++        self.plan_dev = torch.tensor(flat, dtype=torch.int32, device=dev)
++        self.plan = tree.from_packed(self.plan_dev, s, w, n_items, most)      # paths: the chains', fixed
++        self.table = self.plan_dev[w:w + 4 * s]                               # (first row, rows, keys, slots) a stream
++        self.host32 = torch.zeros(2 * w + 4 * s, dtype=torch.int32).pin_memory()   # pos, slot, table
++        self.dev32 = torch.zeros(2 * w, dtype=torch.int32, device=dev)
++        self.pos32, self.slot32 = self.dev32[:w], self.dev32[w:]
++        self.host64 = torch.zeros(w + s, dtype=torch.int64).pin_memory()     # ids, stream slots
++        self.dev64 = torch.zeros(w + s, dtype=torch.int64, device=dev)
++        self.ids, self.sslot = self.dev64[:w], self.dev64[w:]
++        bases, strides = model._slot_offsets
++        self.bases, self.strides = bases, strides
++        self.offs = torch.empty((bases.shape[0], s, 2), dtype=torch.int64, device=dev)
++
++    def refresh(self, chains: Sequence[Chain]) -> None:
++        from tensorfold.cuda.kernels import attention as tree
++
++        w, s = self.width, self.streams
++        h32, h64 = self.host32.numpy(), self.host64.numpy()
++        at = 0
++        for i, c in enumerate(chains):
++            n = len(c.tokens)
++            h64[at:at + n] = c.tokens
++            h32[at:at + n] = range(c.p0, c.p0 + n)
++            h32[w + at:w + at + n] = c.slot
++            h32[2 * w + 4 * i:2 * w + 4 * i + 4] = (at, n, c.p0, tree.slots(c.p0, n))
++            h64[w + i] = c.slot
++            at += n
++        self.dev32.copy_(self.host32[:2 * w], non_blocking=True)
++        self.table.copy_(self.host32[2 * w:].view(s, 4).flatten(), non_blocking=True)
++        self.dev64.copy_(self.host64, non_blocking=True)
++
++    def stage_offsets(self) -> None:
++        """Captured: each full layer's (stream, key/value) offsets from the streams' slots."""
++
++        torch.add(self.bases[:, None, :], self.sslot[None, :, None] * self.strides[:, None, :], out=self.offs)
++
++
++class Graphs:
++    def __init__(self, model: Model) -> None:
++        self.model = model
++        if getattr(model, "_slot_offsets", None) is None:
++            model._slot_offsets = attention.slot_offsets(model)
++        self.pool = torch.cuda.graph_pool_handle()
++        self.entries: OrderedDict[tuple, tuple] = OrderedDict()
++        self.replays = self.captures = self.eager = 0
++
++    def _bucket(self, end: int) -> int:
++        return min(self.model.context, max(BUCKET, 1 << (end - 1).bit_length()))
++
++    def eligible(self, chains: Sequence[Chain]) -> bool:
++        widths = [len(c.tokens) for c in chains]
++        return max(widths) <= MAX_ROWS and (len(widths) == 1 or max(widths) == 1)
++
++    @torch.no_grad()
++    def forward(self, chains: Sequence[Chain]) -> torch.Tensor:
++        """fp32 logits of every row of ``chains`` (decode rows only)."""
++
++        m = self.model
++        if not self.eligible(chains):
++            self.eager += 1
++            total = sum(len(c.tokens) for c in chains)
++            return m.forward(chains, prompt=False, rows=range(total))
++        m.check(chains)
++        widths = tuple(len(c.tokens) for c in chains)
++        key = (widths, self._bucket(max(c.p0 + len(c.tokens) for c in chains)))
++        entry = self.entries.get(key)
++        if entry is None:
++            entry = self._capture(key, chains)
++        else:
++            self.entries.move_to_end(key)
++        g, staged, out = entry
++        staged.refresh(chains)
++        g.replay()
++        self.replays += 1
++        return out
++
++    def _capture(self, key, chains):
++        while len(self.entries) >= KEEP:
++            self.entries.popitem(last=False)
++        staged = Staged(self.model, key[0], key[1])
++        staged.refresh(chains)
++
++        def run():
++            staged.stage_offsets()
++            return self.model.forward(None, prompt=False, staged=staged)
++
++        # A warm-up run writes the same cache rows the replay will (idempotent: same inputs, same bits).
++        run()
++        torch.cuda.synchronize()
++        g = torch.cuda.CUDAGraph()
++        enabled = gc.isenabled()
++        gc.disable()                                   # collecting an old graph mid-capture invalidates it
++        try:
++            with torch.cuda.graph(g, pool=self.pool):
++                out = run()
++        finally:
++            if enabled:
++                gc.enable()
++        self.captures += 1
++        entry = self.entries[key] = (g, staged, out)
++        return entry
+diff --git a/tests/cuda/test_kolibri1_graphs.py b/tests/cuda/test_kolibri1_graphs.py
+new file mode 100644
+index 0000000..68ff13d
+--- /dev/null
++++ b/tests/cuda/test_kolibri1_graphs.py
+@@ -0,0 +1,88 @@
++"""Kolibri 1's decode graphs: a replay's rows carry the eager forward's bits, across streams, widths and buckets."""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++sys.path.insert(0, str(Path(__file__).parent))
++
++from kolibri1_tiny import write  # noqa: E402
++
++
++@pytest.fixture(scope="module")
++def weights(tmp_path_factory):
++    from tensorfold.families.kolibri1.cuda.weights import load
++
++    return load(write(tmp_path_factory.mktemp("kolibri1-tiny-graphs")))
++
++
++def tokens(n: int, seed: int = 0) -> list[int]:
++    g = torch.Generator().manual_seed(seed)
++    return torch.randint(0, 500, (n,), generator=g).tolist()
++
++
++def pair(weights, context: int, slots: int):
++    from tensorfold.families.kolibri1.cuda.forward import Model
++    from tensorfold.families.kolibri1.cuda.graphs import Graphs
++
++    eager, graphed = Model(weights, context, slots), Model(weights, context, slots)
++    return eager, graphed, Graphs(graphed)
++
++
++def test_graphed_streams_equal_eager_streams(weights):
++    from tensorfold.families.kolibri1.cuda.forward import Chain
++
++    eager, graphed, g = pair(weights, 256, 3)
++    prompts = [tokens(40 + 13 * k, seed=20 + k) for k in range(3)]
++    nxt = []
++    for k, p in enumerate(prompts):
++        a, b = eager.prefill(p, slot=k), graphed.prefill(p, slot=k)
++        assert torch.equal(a, b)
++        nxt.append(int(a.argmax()))
++    pos = [len(p) for p in prompts]
++    for step in range(8):
++        live = [0, 1, 2] if step % 3 else [2, 0]                      # streams come and go: same graph, new slots
++        chains = [Chain(k, pos[k], [nxt[k]]) for k in live]
++        want = eager.forward(chains, prompt=False, rows=range(len(chains)))
++        got = g.forward(chains)
++        assert torch.equal(got, want), step
++        for i, k in enumerate(live):
++            nxt[k], pos[k] = int(want[i].argmax()), pos[k] + 1
++    assert g.captures == 2 and g.replays == 8
++
++
++def test_a_graphed_draft_window_equals_the_eager_window(weights):
++    from tensorfold.families.kolibri1.cuda.forward import Chain
++
++    eager, graphed, g = pair(weights, 256, 1)
++    p = tokens(70, seed=3)
++    eager.prefill(p), graphed.prefill(p)
++    pos = len(p)
++    for width in (1, 5, 5, 12, 1):
++        win = tokens(width, seed=pos)
++        c = [Chain(0, pos, win)]
++        want = eager.forward(c, prompt=False, rows=range(width))
++        assert torch.equal(g.forward(c), want), width
++        pos += width
++
++
++def test_crossing_into_a_larger_bucket_keeps_the_bits(weights, monkeypatch):
++    from tensorfold.families.kolibri1.cuda import graphs
++    from tensorfold.families.kolibri1.cuda.forward import Chain
++
++    monkeypatch.setattr(graphs, "BUCKET", 64)                           # buckets 64, 128, 256 on a 256-token cache
++    eager, graphed, g = pair(weights, 256, 1)
++    p = tokens(50, seed=4)
++    nxt = int(eager.prefill(p).argmax())
++    graphed.prefill(p)
++    for pos in range(50, 140):
++        c = [Chain(0, pos, [nxt])]
++        want = eager.forward(c, prompt=False, rows=range(1))
++        assert torch.equal(g.forward(c), want), pos
++        nxt = int(want[0].argmax())
++    assert {k[1] for k in g.entries} == {64, 128, 256}
+-- 
+2.53.0
+

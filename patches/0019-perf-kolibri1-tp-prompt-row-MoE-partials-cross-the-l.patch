@@ -1,0 +1,78 @@
+From a1d78cdecc7f7c8cae650a413d86344d0d009de7 Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 15:37:19 +1100
+Subject: [PATCH 19/23] perf(kolibri1 tp): prompt-row MoE partials cross the
+ link in bf16 (half the bytes); big-message link bench
+
+---
+ src/tensorfold/families/kolibri1/cuda/moe.py |  5 ++-
+ tools/kolibri_bigcomm_bench.py               | 36 ++++++++++++++++++++
+ 2 files changed, 40 insertions(+), 1 deletion(-)
+ create mode 100644 tools/kolibri_bigcomm_bench.py
+
+diff --git a/src/tensorfold/families/kolibri1/cuda/moe.py b/src/tensorfold/families/kolibri1/cuda/moe.py
+index c7b8361..0d244bd 100644
+--- a/src/tensorfold/families/kolibri1/cuda/moe.py
++++ b/src/tensorfold/families/kolibri1/cuda/moe.py
+@@ -50,6 +50,7 @@ class Buffers:
+ 
+ 
+ _scratch: dict[tuple, Buffers] = {}
++_PROMPT_BF16 = __import__("os").environ.get("TF_KOLIBRI_PROMPT_PARTIAL", "bf16") == "bf16"
+ 
+ 
+ def run(x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: fp8x.Experts8, top_k: int, *,
+@@ -74,5 +75,7 @@ def run(x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: fp8x.Expe
+     fp8x.gate_up(x, ex, buf.plan, buf.act[:rows * buf.slots], rows)
+     fp8x.down(buf.act[:rows * buf.slots], ex, buf.plan, buf.y[:rows].view(-1, ex.dims), rows)
+     if partial:
+-        return (buf.y[:rows].float() * buf.wts[:rows, :, None]).sum(1)
++        out = (buf.y[:rows].float() * buf.wts[:rows, :, None]).sum(1)
++        # prompt rows cross the link in bf16 (their expert outputs are bf16 already): half the bytes
++        return out.to(torch.bfloat16) if prefill and _PROMPT_BF16 else out
+     return shared.combine(buf.y[:rows], buf.wts[:rows])
+diff --git a/tools/kolibri_bigcomm_bench.py b/tools/kolibri_bigcomm_bench.py
+new file mode 100644
+index 0000000..20a2a4b
+--- /dev/null
++++ b/tools/kolibri_bigcomm_bench.py
+@@ -0,0 +1,36 @@
++"""Prefill-sized all-gathers over NCCL: GB/s per rank at Kolibri's 8,192-row partials (and smaller chunks).
++
++  RANK=0|1 MASTER=<rank 0 CX7 address> python3 tools/kolibri_bigcomm_bench.py
++"""
++
++import os
++
++import torch
++
++from tensorfold.cuda.comm import open_comm
++
++rank, master = int(os.environ["RANK"]), os.environ["MASTER"]
++torch.cuda.set_device(0)
++comm = open_comm(rank, 2, master, int(os.environ.get("PORT", "29575")))
++if os.environ.get("BIG_ROCE_MB"):
++    from tensorfold.cuda.roce import RoceComm
++
++    comm = RoceComm(comm, rank, 2, max_bytes=int(os.environ["BIG_ROCE_MB"]) << 20)
++    comm.settle()
++for rows in (1024, 2048, 8192):
++    for dt in (torch.bfloat16, torch.float32):
++        send = torch.ones(rows, 2560, dtype=dt, device="cuda")
++        recv = torch.empty(2, rows, 2560, dtype=dt, device="cuda")
++        for _ in range(3):
++            comm.all_gather(send, recv)
++        torch.cuda.synchronize()
++        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++        a.record()
++        for _ in range(10):
++            comm.all_gather(send, recv)
++        b.record()
++        torch.cuda.synchronize()
++        ms = a.elapsed_time(b) / 10
++        mb = send.numel() * send.element_size() / 1e6
++        if rank == 0:
++            print(f"rows {rows:>5} {str(dt)[6:]:<9} {mb:6.1f} MB/rank  {ms:7.2f} ms  {mb / ms:6.2f} GB/s", flush=True)
+-- 
+2.53.0
+

@@ -1,0 +1,102 @@
+From 05251a52f0710bf394cc4823e30f0ca891b51417 Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 13:21:37 +1100
+Subject: [PATCH 13/23] tools: two-node TP smoke on the tiny checkpoint
+
+---
+ tools/kolibri_tp_smoke.py | 83 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 83 insertions(+)
+ create mode 100644 tools/kolibri_tp_smoke.py
+
+diff --git a/tools/kolibri_tp_smoke.py b/tools/kolibri_tp_smoke.py
+new file mode 100644
+index 0000000..5762f2b
+--- /dev/null
++++ b/tools/kolibri_tp_smoke.py
+@@ -0,0 +1,83 @@
++"""Two real ranks on the tiny checkpoint: RoCE gathers, decode graphs and rank 1 following rank 0's descriptions.
++
++  RANK=0|1 MASTER=<rank 0 CX7 address> python3 tools/kolibri_tp_smoke.py
++Rank 0 checks: both ranks' logits bit-equal (checksums gathered), graphs equal eager, close to one GPU.
++"""
++
++import os
++import sys
++import tempfile
++from pathlib import Path
++
++import torch
++
++sys.path.insert(0, "tests/cuda")
++from kolibri1_tiny import write  # noqa: E402
++
++from tensorfold.cuda.comm import open_comm  # noqa: E402
++from tensorfold.cuda.roce import RoceComm  # noqa: E402
++from tensorfold.families.kolibri1.cuda.forward import Chain, Model  # noqa: E402
++from tensorfold.families.kolibri1.cuda.graphs import Graphs  # noqa: E402
++from tensorfold.families.kolibri1.cuda.tp import DECODE, PROMPT, STOP, Mirror, follow  # noqa: E402
++from tensorfold.families.kolibri1.cuda.weights import load  # noqa: E402
++
++rank, master = int(os.environ["RANK"]), os.environ["MASTER"]
++torch.cuda.set_device(0)
++tiny = write(Path(tempfile.mkdtemp()), width=256, seed=0)
++comm = RoceComm(open_comm(rank, 2, master, int(os.environ.get("PORT", "29573"))), rank, 2)
++comm.settle()
++m = Model(load(tiny, rank=rank, world=2), 512, slots=2, comm=comm)
++graphs = Graphs(m)
++mirror = Mirror(comm, rank)
++prompt = torch.randint(0, 500, (70,), generator=torch.Generator().manual_seed(5)).tolist()
++
++
++def checksum(t):          # both ranks' logits must be bit-equal: compare an exact integer digest
++    v = t.float().contiguous().view(torch.int32).to(torch.int64)
++    s = torch.tensor([int(v.sum()), int((v * torch.arange(v.numel(), device=v.device).view_as(v) % 1000003).sum())],
++                     dtype=torch.int64, device="cuda")
++    both = torch.empty(4, dtype=torch.int64, device="cuda")
++    comm.nccl.all_gather(s, both)
++    return both.view(2, 2).cpu()
++
++
++if rank == 1:
++    follow(m, graphs, mirror)                          # the described forwards, then a checksum phase
++    for _ in range(3):
++        checksum(m.forward([Chain(1, 0, prompt[:5])], prompt=True))
++    print("rank 1 done", flush=True)
++    sys.exit(0)
++
++# rank 0: drive forwards through the mirror, keep logits
++outs = []
++mirror.send(PROMPT, [Chain(0, 0, prompt)])
++outs.append(m.forward([Chain(0, 0, prompt)], prompt=True)[0].clone())
++nxt, pos = int(outs[-1].argmax()), len(prompt)
++for step in range(40):
++    chains = [Chain(0, pos, [nxt])]
++    mirror.send(DECODE, chains)
++    r = graphs.forward(chains)[0].clone()
++    outs.append(r)
++    nxt, pos = int(r.argmax()), pos + 1
++w = [5, 6, 7, 8, 9]
++mirror.send(DECODE, [Chain(0, pos, w)])               # a 5-row draft window: another graph
++win = graphs.forward([Chain(0, pos, w)]).clone()
++mirror.send(STOP)
++# checksum phase (rank 1 runs the same 3 prompt forwards on slot 1)
++digests = [checksum(m.forward([Chain(1, 0, prompt[:5])], prompt=True)) for _ in range(3)]
++equal = all(bool((d[0] == d[1]).all()) for d in digests)
++
++# one-GPU reference on rank 0 (eager), same sequence
++one = Model(load(tiny), 512, slots=1)
++ref = [one.forward([Chain(0, 0, prompt)], prompt=True)[0]]
++nxt, pos = int(ref[0].argmax()), len(prompt)
++for _ in range(40):
++    r = one.forward([Chain(0, pos, [nxt])], prompt=False, rows=range(1))[0]
++    ref.append(r)
++    nxt, pos = int(r.argmax()), pos + 1
++a, b = torch.stack(outs), torch.stack(ref)
++cos = torch.nn.functional.cosine_similarity(a, b, dim=-1)
++agree = (a.argmax(-1) == b.argmax(-1)).float().mean()
++print(f"ranks bit-equal: {equal}; graphs captured {graphs.captures}, replayed {graphs.replays}, eager {graphs.eager}")
++print(f"TP2 vs one GPU over 41 rows: min cos {cos.min():.4f} mean {cos.mean():.5f} top1 agree {agree:.3f}")
++print(f"window rows: {tuple(win.shape)}")
+-- 
+2.53.0
+

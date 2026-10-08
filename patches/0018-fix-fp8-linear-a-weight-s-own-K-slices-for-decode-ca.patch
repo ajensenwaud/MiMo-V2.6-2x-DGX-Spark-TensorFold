@@ -1,0 +1,135 @@
+From ea36c89e135fc5882e17e09636dc31893a17de5d Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 14:25:18 +1100
+Subject: [PATCH 18/23] fix(fp8 linear): a weight's own K slices for decode
+ calls only, row tiles at any M (no fused-path refusal); prompt rows keep the
+ shape rule; KL tool saves logits
+
+---
+ src/tensorfold/cuda/nvfp4/linear.py           | 13 +++++---
+ .../families/kolibri1/cuda/forward.py         |  3 +-
+ tests/cuda/test_fp8_block_own_slices.py       | 33 +++++++++++++++++++
+ tools/kolibri_kl.py                           |  5 ++-
+ 4 files changed, 48 insertions(+), 6 deletions(-)
+ create mode 100644 tests/cuda/test_fp8_block_own_slices.py
+
+diff --git a/src/tensorfold/cuda/nvfp4/linear.py b/src/tensorfold/cuda/nvfp4/linear.py
+index b026aa4..b69f876 100644
+--- a/src/tensorfold/cuda/nvfp4/linear.py
++++ b/src/tensorfold/cuda/nvfp4/linear.py
+@@ -405,9 +405,12 @@ class Fp8BlockLinear:
+         return _matmul(FP8G, self.w8, self.bs, 1.0, self.n, self.k, self.npad, x, out, self.sk)
+ 
+     def prefill(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+-        """bf16 prompt rows on the lane matmul (FP8G): the stored bytes exactly, fp32 sums; --prefill-fp8: the FP8 GEMM."""
++        """bf16 prompt rows on the lane matmul (FP8G): the stored bytes exactly, fp32 sums; --prefill-fp8: the FP8 GEMM.
++        Prompt rows keep the shape rule's K slices (``sk`` is for decode calls)."""
+ 
+-        return self.prefill8(x, out) if prompt_precision.fp8() else self(x, out)
++        if prompt_precision.fp8():
++            return self.prefill8(x, out)
++        return _matmul(FP8G, self.w8, self.bs, 1.0, self.n, self.k, self.npad, x, out)
+ 
+     def prefill8(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+         """Opt-in FP8 prompt rows through the FP8 GEMM and the stored bytes, each block scale as bf16."""
+@@ -476,10 +479,12 @@ def _matmul(mode: int, w: torch.Tensor, bs: torch.Tensor | None, scale: float, n
+     m = x.shape[0]
+     y = out if out is not None and out.is_contiguous() and out.dtype == torch.bfloat16 else \
+         torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
++    sk_own = sk
+     sk = sk or qmm.split_k(n, k)
+     part = torch.empty((sk, m, n), dtype=torch.float32, device=x.device) if sk > 8 else None
+-    # prompt rows: each block sums its tile's slices itself (bm 0), the cluster's order without the cluster
+-    bm = 0 if sk > 1 and m >= FUSED_ROWS else qmm.bucket(m)
++    # prompt rows: each block sums its tile's slices itself (bm 0), the cluster's order without the cluster;
++    # a weight's own slices always take row tiles (any M, the same per-row bits)
++    bm = 0 if sk > 1 and m >= FUSED_ROWS and not sk_own else qmm.bucket(m)
+     _ext().qmmf(x, w, bs, scale, y, part if bm else None, mode, n, sk, npad, bm, False)
+     if out is not None and y is not out:
+         out.copy_(y)
+diff --git a/src/tensorfold/families/kolibri1/cuda/forward.py b/src/tensorfold/families/kolibri1/cuda/forward.py
+index c413af7..77b2fd2 100644
+--- a/src/tensorfold/families/kolibri1/cuda/forward.py
++++ b/src/tensorfold/families/kolibri1/cuda/forward.py
+@@ -149,7 +149,8 @@ class Model:
+             else:
+                 a = attention.full_planned(q, k, v, offs[j], plan, scale=self.scale)
+             j += cfg.full[i]
+-            x = glue.add_rms(self._sum(L.o(a.view(n, h * d))), res, L.post_attn_norm, L.pre_moe_norm, eps)
++            o = L.o.prefill(a.view(n, h * d)) if prompt else L.o(a.view(n, h * d))   # prompt: the shape rule's slices
++            x = glue.add_rms(self._sum(o), res, L.post_attn_norm, L.pre_moe_norm, eps)
+             m = moe.run(x, L.router, L.bias, L.experts, cfg.top_k, prefill=prompt, partial=self.comm is not None)
+             after = w.layers[i + 1].input_norm if i + 1 < len(w.layers) else w.norm
+             x = glue.add_rms(self._sum(m), res, L.post_moe_norm, after, eps)
+diff --git a/tests/cuda/test_fp8_block_own_slices.py b/tests/cuda/test_fp8_block_own_slices.py
+new file mode 100644
+index 0000000..d0f6870
+--- /dev/null
++++ b/tests/cuda/test_fp8_block_own_slices.py
+@@ -0,0 +1,33 @@
++"""A weight's own K slices (``Fp8BlockLinear.sk``): decode rows batch-independent at any M; prompt rows untouched."""
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++
++
++def make(n=2560, k=6144, sk=16):
++    from tensorfold.cuda.nvfp4.linear import Fp8BlockLinear
++
++    torch.manual_seed(0)
++    w = (torch.randn(n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn)
++    s = torch.rand(n // 128, k // 128, device="cuda") * 0.01 + 0.001
++    lin = Fp8BlockLinear.from_checkpoint(w, s)
++    lin.sk = sk
++    return lin
++
++
++def test_own_slices_keep_rows_independent_of_m_including_fused_sizes():
++    lin = make()
++    x = torch.randn(300, lin.k, device="cuda").to(torch.bfloat16)
++    full = lin(x)                                            # 300 rows: past FUSED_ROWS, must not refuse
++    for m in (1, 7, 33, 256):
++        assert torch.equal(lin(x[:m].contiguous()), full[:m])
++
++
++def test_prompt_rows_use_the_shape_rule():
++    lin = make()
++    x = torch.randn(40, lin.k, device="cuda").to(torch.bfloat16)
++    got = lin.prefill(x)
++    lin.sk = None
++    assert torch.equal(got, lin(x))
+diff --git a/tools/kolibri_kl.py b/tools/kolibri_kl.py
+index 23c24c1..a4bf5f7 100644
+--- a/tools/kolibri_kl.py
++++ b/tools/kolibri_kl.py
+@@ -78,7 +78,7 @@ def engine(model_dir, ref_path, tp, rank, master):
+         from tensorfold.families.kolibri1.cuda.graphs import Graphs
+ 
+         graphs = Graphs(m)
+-    kls_p, kls_d, agree_p, agree_d = [], [], [], []
++    kls_p, kls_d, agree_p, agree_d, all_logits = [], [], [], [], []
+     for ids, want in zip(data["ids"], data["logits"]):
+         got_p = m.forward([Chain(0, 0, ids[:PROMPT])], prompt=True, rows=range(PROMPT)).float().cpu()
+         got_d = []
+@@ -87,6 +87,7 @@ def engine(model_dir, ref_path, tp, rank, master):
+             r = graphs.forward(c) if graphs is not None else m.forward(c, prompt=False, rows=range(1))
+             got_d.append(r[0].float().cpu())
+         got = torch.cat([got_p, torch.stack(got_d)])
++        all_logits.append(got)
+         lp, lq = torch.log_softmax(want, -1), torch.log_softmax(got, -1)
+         kl = (lp.exp() * (lp - lq)).sum(-1)
+         top = want.argmax(-1) == got.argmax(-1)
+@@ -95,6 +96,8 @@ def engine(model_dir, ref_path, tp, rank, master):
+         agree_p.append(top[:PROMPT])
+         agree_d.append(top[PROMPT:])
+     if rank == 0:
++        if os.environ.get("KL_SAVE"):
++            torch.save(all_logits, os.environ["KL_SAVE"])
+         kp, kd = torch.cat(kls_p), torch.cat(kls_d)
+         ap, ad = torch.cat(agree_p).float().mean(), torch.cat(agree_d).float().mean()
+         label = f"tp={tp} graphs={'on' if graphs else 'off'}"
+-- 
+2.53.0
+

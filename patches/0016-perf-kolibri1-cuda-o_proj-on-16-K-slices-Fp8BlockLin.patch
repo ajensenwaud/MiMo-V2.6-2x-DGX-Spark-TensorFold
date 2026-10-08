@@ -1,0 +1,155 @@
+From 008f19a591ca54fb2e43c0fa93fc671fcc72377f Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 13:51:59 +1100
+Subject: [PATCH 16/23] perf(kolibri1 cuda): o_proj on 16 K slices
+ (Fp8BlockLinear.sk, shape-fixed); qmm split sweep tool
+
+---
+ src/tensorfold/cuda/nvfp4/linear.py           | 10 ++--
+ .../families/kolibri1/cuda/weights.py         | 12 ++++-
+ tools/kolibri_qmm_sweep.py                    | 54 +++++++++++++++++++
+ 3 files changed, 71 insertions(+), 5 deletions(-)
+ create mode 100644 tools/kolibri_qmm_sweep.py
+
+diff --git a/src/tensorfold/cuda/nvfp4/linear.py b/src/tensorfold/cuda/nvfp4/linear.py
+index b1f82f1..b026aa4 100644
+--- a/src/tensorfold/cuda/nvfp4/linear.py
++++ b/src/tensorfold/cuda/nvfp4/linear.py
+@@ -360,6 +360,7 @@ class Fp8BlockLinear:
+     layout: str = "fp8block"
+     groups: torch.Tensor | None = None   # bf16 [K/64, npad] (``prefill8``, made on first use)
+     lane: bool = False                   # ``prefill8`` on the lane matmul too: a head's few rows
++    sk: int | None = None                # K slices of the lane matmul (None: ``qmm.split_k``'s shape rule)
+ 
+     @staticmethod
+     def column_scales(scale_inv: torch.Tensor, n: int, k: int, block=(128, 128)) -> torch.Tensor:
+@@ -401,7 +402,7 @@ class Fp8BlockLinear:
+         return self.w8.numel() + self.bs.numel() + (self.groups.numel() * 2 if self.groups is not None else 0)
+ 
+     def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+-        return _matmul(FP8G, self.w8, self.bs, 1.0, self.n, self.k, self.npad, x, out)
++        return _matmul(FP8G, self.w8, self.bs, 1.0, self.n, self.k, self.npad, x, out, self.sk)
+ 
+     def prefill(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+         """bf16 prompt rows on the lane matmul (FP8G): the stored bytes exactly, fp32 sums; --prefill-fp8: the FP8 GEMM."""
+@@ -464,8 +465,9 @@ FUSED_ROWS = int(__import__("os").environ.get("TF_QMMF_FUSED_ROWS", "256"))   #
+ 
+ 
+ def _matmul(mode: int, w: torch.Tensor, bs: torch.Tensor | None, scale: float, n: int, k: int, npad: int,
+-            x: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
+-    """x (M, K) bf16 -> (M, n) bf16; K slices from the shape alone, so a row's bits never depend on M."""
++            x: torch.Tensor, out: torch.Tensor | None, sk: int | None = None) -> torch.Tensor:
++    """x (M, K) bf16 -> (M, n) bf16; K slices from the shape alone (or the weight's own ``sk``), so a row's bits
++    never depend on M."""
+ 
+     from tensorfold.cuda.kernels import qmm
+ 
+@@ -474,7 +476,7 @@ def _matmul(mode: int, w: torch.Tensor, bs: torch.Tensor | None, scale: float, n
+     m = x.shape[0]
+     y = out if out is not None and out.is_contiguous() and out.dtype == torch.bfloat16 else \
+         torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+-    sk = qmm.split_k(n, k)
++    sk = sk or qmm.split_k(n, k)
+     part = torch.empty((sk, m, n), dtype=torch.float32, device=x.device) if sk > 8 else None
+     # prompt rows: each block sums its tile's slices itself (bm 0), the cluster's order without the cluster
+     bm = 0 if sk > 1 and m >= FUSED_ROWS else qmm.bucket(m)
+diff --git a/src/tensorfold/families/kolibri1/cuda/weights.py b/src/tensorfold/families/kolibri1/cuda/weights.py
+index 38e056f..7a5f796 100644
+--- a/src/tensorfold/families/kolibri1/cuda/weights.py
++++ b/src/tensorfold/families/kolibri1/cuda/weights.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ import time
+ from dataclasses import dataclass, field
+ from pathlib import Path
+@@ -132,6 +133,15 @@ def load(model_dir: str | Path, device: str = "cuda", *, rank: int = 0, world: i
+     def linear(*parts) -> Fp8BlockLinear:
+         return Fp8BlockLinear.from_checkpoint(torch.cat([w for w, _ in parts]), torch.cat([s for _, s in parts]))
+ 
++    def o_linear(pair) -> Fp8BlockLinear:
++        """o_proj: a wide K into 2,560 outputs; 16 K slices keep the GB10's memory busy (shape-fixed: rows unchanged)."""
++
++        lin = linear(pair)
++        groups, sk = lin.k // 64, int(os.environ.get("TF_KOLIBRI_O_SPLITK", "16"))
++        if sk > 1 and groups % sk == 0:
++            lin.sk = sk
++        return lin
++
+     w = Weights(cfg, get("model.embed_tokens.weight").to(torch.bfloat16).contiguous(), rank=rank, world=world,
+                 full=full)
+     for i in range(cfg.layers):
+@@ -153,7 +163,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, rank: int = 0, world: i
+                        out_rows(fp8(a + "v_proj"), rank * kh * hd, (rank + 1) * kh * hd)),
+             q_norm=get(a + "q_norm.weight").float().contiguous(),
+             k_norm=get(a + "k_norm.weight").float().contiguous(),
+-            o=linear(in_cols(fp8(a + "o_proj"), rank * qh * hd, (rank + 1) * qh * hd)),
++            o=o_linear(in_cols(fp8(a + "o_proj"), rank * qh * hd, (rank + 1) * qh * hd)),
+             post_attn_norm=get(p + "post_attn_norm.weight").float().contiguous(),
+             pre_moe_norm=get(p + "post_attention_layernorm.weight").float().contiguous(),
+             router=get(p + "mlp.gate.weight").to(torch.bfloat16).contiguous(),
+diff --git a/tools/kolibri_qmm_sweep.py b/tools/kolibri_qmm_sweep.py
+new file mode 100644
+index 0000000..480cfb1
+--- /dev/null
++++ b/tools/kolibri_qmm_sweep.py
+@@ -0,0 +1,54 @@
++"""Sweep qmm.split_k's program target for Kolibri's decode projections (TP1 and TP2 shapes), DRAM-bound timing."""
++
++import torch
++
++from tensorfold.cuda.kernels import qmm
++from tensorfold.cuda.nvfp4.linear import Fp8BlockLinear
++
++COPIES, REPS = 16, 200
++orig = qmm.split_k
++
++
++def lin(n, k):
++    w = (torch.randn(n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn)
++    return Fp8BlockLinear.from_checkpoint(w, torch.rand(-(-n // 128), k // 128, device="cuda") * 0.01 + 0.001)
++
++
++def gpu_us(fn):
++    fn(0)
++    torch.cuda.synchronize()
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        for i in range(REPS):
++            fn(i % COPIES)
++    g.replay()
++    torch.cuda.synchronize()
++    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++    a.record()
++    for _ in range(5):
++        g.replay()
++    b.record()
++    torch.cuda.synchronize()
++    return a.elapsed_time(b) * 1000 / (5 * REPS)
++
++
++shapes = {"tp1 qkv": (7168, 2560), "tp1 o": (2560, 6144), "tp2 qkv": (3584, 2560), "tp2 o": (2560, 3072)}
++for name, (n, k) in shapes.items():
++    ws = [lin(n, k) for _ in range(COPIES)]
++    x = torch.randn(1, k, device="cuda").to(torch.bfloat16)
++    want = ws[0](x).float()
++    row = []
++    for target in (192, 384, 768, 1536):
++        qmm.split_k = lambda n_, k_, gs=64, target_=target: _sk(n_, k_, gs, target_)
++
++        def _sk(n_, k_, gs, t):
++            tiles, groups, sk = -(-n_ // 64), k_ // gs, 1
++            while sk < 32 and tiles * sk < t and groups % (sk * 2) == 0 and groups // (sk * 2) >= 2:
++                sk *= 2
++            return sk
++        globals()["_sk"] = _sk
++        us = gpu_us(lambda i: ws[i](x))
++        err = (ws[0](x).float() - want).abs().max().item()
++        row.append(f"t{target}: sk {_sk(n, k, 64, target):>2} {us:6.1f} us {n * k / us / 1e3:5.0f} GB/s (dmax {err:.1e})")
++    qmm.split_k = orig
++    print(f"{name:<8}", " | ".join(row), flush=True)
+-- 
+2.53.0
+

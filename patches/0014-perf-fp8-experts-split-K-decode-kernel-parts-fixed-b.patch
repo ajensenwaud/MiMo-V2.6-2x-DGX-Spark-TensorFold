@@ -1,0 +1,362 @@
+From a80ed87fbd37adbfddab2fb330b0a6392fd9e625 Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 13:35:48 +1100
+Subject: [PATCH 14/23] perf(fp8 experts): split-K decode kernel (parts fixed
+ by shape, partials summed in part order); moe breakdown and bits tools
+
+---
+ src/tensorfold/cuda/fp8/experts.cpp |  20 +++++
+ src/tensorfold/cuda/fp8/experts.cu  | 130 ++++++++++++++++++++++++++++
+ src/tensorfold/cuda/fp8/experts.py  |  19 ++++
+ tools/kolibri_experts_bits.py       |  40 +++++++++
+ tools/kolibri_moe_breakdown.py      |  70 +++++++++++++++
+ 5 files changed, 279 insertions(+)
+ create mode 100644 tools/kolibri_experts_bits.py
+ create mode 100644 tools/kolibri_moe_breakdown.py
+
+diff --git a/src/tensorfold/cuda/fp8/experts.cpp b/src/tensorfold/cuda/fp8/experts.cpp
+index 9b263a8..940c8ef 100644
+--- a/src/tensorfold/cuda/fp8/experts.cpp
++++ b/src/tensorfold/cuda/fp8/experts.cpp
+@@ -10,6 +10,25 @@ void fp8_experts_prompt_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride,
+                              const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n,
+                              double limit, int64_t skip, int64_t max_units);
+ 
++void fp8_experts_split_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
++                            const at::Tensor& scale, int64_t kg, int64_t nb, int64_t s, const at::Tensor& items,
++                            const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n,
++                            double limit, int64_t max_units, at::Tensor& partials, int64_t pairs);
++
++// Decode with K split in ``s`` parts of whole scale groups: fp32 partials [s, pairs, M, n], then their sum in part
++// order through the epilogue. Every pair must be routed to a computed expert (no skip).
++void split(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
++           const at::Tensor& scale, int64_t kg, int64_t nb, int64_t s, const at::Tensor& items, const at::Tensor& counts,
++           const at::Tensor& members, at::Tensor out, int64_t n, double limit, int64_t max_units, at::Tensor partials,
++           int64_t pairs) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.stride(-1) == 1, "x: bf16 rows");
++    TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.scalar_type() == at::kInt, "w: int32 blocks");
++    TORCH_CHECK(scale.is_cuda() && scale.is_contiguous() && scale.scalar_type() == at::kFloat, "scale: fp32");
++    TORCH_CHECK(out.is_cuda() && out.is_contiguous(), "out: contiguous");
++    fp8_experts_split_cuda(epi, x, x_stride, slots, w, scale, kg, nb, s, items, counts, members, out, n, limit,
++                           max_units, partials, pairs);
++}
++
+ // epi 2: out [pairs, n] bf16 SwiGLU of gate and up; 0: fp32 down; 3: bf16 down. w: [E, n/32, K/32, M, 32, 2] uint4.
+ void experts(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
+              const at::Tensor& scale, int64_t kg, int64_t nb, const at::Tensor& items, const at::Tensor& counts,
+@@ -37,4 +56,5 @@ void prompt(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, c
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("experts", &experts);
+     m.def("prompt", &prompt);
++    m.def("split", &split);
+ }
+diff --git a/src/tensorfold/cuda/fp8/experts.cu b/src/tensorfold/cuda/fp8/experts.cu
+index cb4d357..da138bc 100644
+--- a/src/tensorfold/cuda/fp8/experts.cu
++++ b/src/tensorfold/cuda/fp8/experts.cu
+@@ -145,6 +145,118 @@ __global__ void __launch_bounds__(WARPS * 32)
+   }
+ }
+ 
++// Split K (decode): unit (item, column block, part) runs the scale groups [part * SG / S, (part + 1) * SG / S) as
++// k_loop does (each 128 inputs' chain folded into acc under its scale, in block order) from a zero acc, and writes
++// its fp32 partial; fp8_split_reduce adds the S partials in part order and applies the epilogue. S is fixed by the
++// weight's shape, never by the rows, so a pair's bits still never depend on the other pairs.
++template <int M, int WARPS>
++__global__ void __launch_bounds__(WARPS * 32)
++    fp8_expert_split_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
++                            const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB, int S,
++                            const int* __restrict__ items, const int* __restrict__ counts,
++                            const int* __restrict__ members, float* __restrict__ part_out, int pairs, int N) {
++  const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
++  const int units = __ldg(counts) * NB * S;
++  const int SG = KG / PER_SCALE, NR = (NB * COLS) / 128, KGp = KG / S;
++  for (int unit = blockIdx.x * WARPS + (threadIdx.x >> 5); unit < units; unit += gridDim.x * WARPS) {
++    const int part = unit % S, rest = unit / S;
++    const int it = rest / NB, cb = rest - it * NB;
++    const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
++    const uint4* blk = W + ((size_t)e * NB + cb) * (size_t)KG * (M * BLOCK4) + (size_t)part * KGp * (M * BLOCK4);
++    const float* sc = scale + ((size_t)e * M * NR + (cb * COLS) / 128) * SG + part * (KGp / PER_SCALE);
++    for (int r0 = 0; r0 < cnt; r0 += 16) {
++      const bool v0 = r0 + gq < cnt, v1 = r0 + gq + 8 < cnt;
++      const int pr0 = v0 ? __ldg(members + first + r0 + gq) : 0;
++      const int pr1 = v1 ? __ldg(members + first + r0 + gq + 8) : 0;
++      const int x0r = slots ? pr0 / slots : pr0, x1r = slots ? pr1 / slots : pr1;
++      const __nv_bfloat16* x0 = X + (size_t)x0r * x_stride + part * KGp * 32;
++      const __nv_bfloat16* x1 = X + (size_t)x1r * x_stride + part * KGp * 32;
++      float acc[M][1][NTW][4];
++#pragma unroll
++      for (int m = 0; m < M; ++m)
++#pragma unroll
++        for (int j = 0; j < NTW; ++j) acc[m][0][j][0] = acc[m][0][j][1] = acc[m][0][j][2] = acc[m][0][j][3] = 0.f;
++      k_loop<M>(acc, blk, sc, KGp, lane, t, x0, x1, v0, v1, NR * SG);
++      const int col0 = cb * COLS + 2 * t;
++#pragma unroll
++      for (int h = 0; h < 2; ++h) {
++        if (!(h ? v1 : v0)) continue;
++        const int pr = h ? pr1 : pr0;
++#pragma unroll
++        for (int m = 0; m < M; ++m)
++#pragma unroll
++          for (int j = 0; j < NTW; ++j) {
++            float* dst = part_out + (((size_t)part * pairs + pr) * M + m) * N + col0 + 8 * j;
++            *reinterpret_cast<float2*>(dst) = make_float2(acc[m][0][j][2 * h], acc[m][0][j][2 * h + 1]);
++          }
++      }
++    }
++  }
++}
++
++// Program a (pair, column pair): the S partials added in part order, then the epilogue's math (epilogue in
++// experts.cuh) on the sums.
++template <int M, int EPI>
++__global__ void fp8_split_reduce(const float* __restrict__ part_in, int S, int pairs, int N, void* __restrict__ out,
++                                 float limit) {
++  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
++  const int half = N / 2;
++  if (idx >= pairs * half) return;
++  const int pr = idx / half, col = 2 * (idx - pr * half);
++  float a[M][2];
++#pragma unroll
++  for (int m = 0; m < M; ++m) a[m][0] = a[m][1] = 0.f;
++  for (int p = 0; p < S; ++p)
++#pragma unroll
++    for (int m = 0; m < M; ++m) {
++      const float2 v = *reinterpret_cast<const float2*>(part_in + (((size_t)p * pairs + pr) * M + m) * N + col);
++      a[m][0] += v.x;
++      a[m][1] += v.y;
++    }
++  const size_t row = (size_t)pr * N;
++  if constexpr (EPI == 0) {
++    *reinterpret_cast<float2*>(reinterpret_cast<float*>(out) + row + col) = make_float2(a[0][0], a[0][1]);
++  } else {
++    float o0, o1;
++    if constexpr (EPI == 2) {
++      o0 = swiglu(a[0][0], a[M - 1][0], limit);
++      o1 = swiglu(a[0][1], a[M - 1][1], limit);
++    } else {
++      o0 = a[0][0];
++      o1 = a[0][1];
++    }
++    *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(out) + row + col) =
++        __floats2bfloat162_rn(o0, o1);
++  }
++}
++
++template <int M, int EPI>
++void launch_split(const at::Tensor& x, int x_stride, int slots, const at::Tensor& w, const at::Tensor& scale, int kg,
++                  int nb, int S, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
++                  at::Tensor& out, int n, float limit, int64_t max_units, at::Tensor& partials, int pairs) {
++  constexpr int WARPS = 4;
++  static int per_sm = 0;
++  static int sms = 0;
++  if (per_sm == 0) {
++    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, fp8_expert_split_kernel<M, WARPS>, WARPS * 32, 0);
++    sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++    per_sm = per_sm < 1 ? 1 : per_sm;
++  }
++  const int64_t need = (max_units * S + WARPS - 1) / WARPS;
++  const int grid = static_cast<int>(need < (int64_t)per_sm * sms ? need : (int64_t)per_sm * sms);
++  if (grid < 1) return;
++  auto stream = at::cuda::getCurrentCUDAStream();
++  fp8_expert_split_kernel<M, WARPS><<<grid, WARPS * 32, 0, stream>>>(
++      reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), x_stride, slots,
++      reinterpret_cast<const uint4*>(w.data_ptr()), scale.data_ptr<float>(), kg, nb, S, items.data_ptr<int>(),
++      counts.data_ptr<int>(), members.data_ptr<int>(), partials.data_ptr<float>(), pairs, n);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++  const int threads = 256, total = pairs * (n / 2);
++  fp8_split_reduce<M, EPI><<<(total + threads - 1) / threads, threads, 0, stream>>>(
++      partials.data_ptr<float>(), S, pairs, n, out.data_ptr(), limit);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ template <int M, int EPI>
+ void launch(const at::Tensor& x, int x_stride, int slots, const at::Tensor& w, const at::Tensor& scale, int kg,
+             int nb, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& out,
+@@ -339,6 +451,24 @@ void fp8_experts_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_
+   else TORCH_CHECK(false, "fp8 experts: epilogue 0 (fp32 down), 2 (SwiGLU) or 3 (bf16 down), not ", epi);
+ }
+ 
++void fp8_experts_split_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
++                            const at::Tensor& scale, int64_t kg, int64_t nb, int64_t s, const at::Tensor& items,
++                            const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n,
++                            double limit, int64_t max_units, at::Tensor& partials, int64_t pairs) {
++  const c10::cuda::CUDAGuard guard(x.device());
++  TORCH_CHECK(s >= 1 && kg % (s * PER_SCALE) == 0, "split K: parts of whole 128-input scale groups");
++  TORCH_CHECK(partials.is_cuda() && partials.is_contiguous() && partials.scalar_type() == at::kFloat &&
++                  partials.numel() >= s * pairs * (epi == 2 ? 2 : 1) * n,
++              "split K: fp32 partials [S, pairs, M, n]");
++  const int xs = static_cast<int>(x_stride), sl = static_cast<int>(slots), k = static_cast<int>(kg);
++  const int b = static_cast<int>(nb), ss = static_cast<int>(s), nn = static_cast<int>(n), pp = static_cast<int>(pairs);
++  const float lim = static_cast<float>(limit);
++  if (epi == 2) launch_split<2, 2>(x, xs, sl, w, scale, k, b, ss, items, counts, members, out, nn, lim, max_units, partials, pp);
++  else if (epi == 0) launch_split<1, 0>(x, xs, sl, w, scale, k, b, ss, items, counts, members, out, nn, lim, max_units, partials, pp);
++  else if (epi == 3) launch_split<1, 3>(x, xs, sl, w, scale, k, b, ss, items, counts, members, out, nn, lim, max_units, partials, pp);
++  else TORCH_CHECK(false, "fp8 split experts: epilogue 0, 2 or 3, not ", epi);
++}
++
+ void fp8_experts_prompt_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
+                              const at::Tensor& scale, int64_t kg, int64_t nb, const at::Tensor& items,
+                              const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n,
+diff --git a/src/tensorfold/cuda/fp8/experts.py b/src/tensorfold/cuda/fp8/experts.py
+index 175d8b1..361bf2f 100644
+--- a/src/tensorfold/cuda/fp8/experts.py
++++ b/src/tensorfold/cuda/fp8/experts.py
+@@ -69,6 +69,17 @@ def make(gate: tuple, up: tuple, down: tuple, *, limit: float = 0.0) -> Experts8
+     return Experts8(u, d, us, ds, width, dims, float(limit))
+ 
+ 
++def _parts(env: str, default: int, kg: int) -> int:
++    """K parts for a decode matmul of ``kg`` 32-input blocks: fixed by the shape (never the rows), whole scale groups."""
++
++    import os
++
++    s = int(os.environ.get(env, default))
++    while s > 1 and kg % (s * 4):
++        s -= 1
++    return max(1, s)
++
++
+ def _run(epi: int, x: torch.Tensor, slots: int, w: torch.Tensor, scale: torch.Tensor, kg: int, nb: int,
+          plan: grouped.Plan, out: torch.Tensor, n: int, limit: float, skip: int, rows: int) -> None:
+     units = grouped.max_items(rows * plan.slots, plan.experts, plan.tile) * nb
+@@ -76,6 +87,14 @@ def _run(epi: int, x: torch.Tensor, slots: int, w: torch.Tensor, scale: torch.Te
+         _ext().prompt(epi, x, x.stride(0), slots, w, scale, kg, nb, plan.items, plan.counts, plan.members, out, n,
+                       limit, skip, units)
+         return
++    s = 1 if plan.prefill or skip >= 0 else (_parts("TF_FP8_SPLITK_GATEUP", 4, kg) if epi == 2
++                                              else _parts("TF_FP8_SPLITK_DOWN", 1, kg))
++    if s > 1:                                          # decode: more warps on the few experts a row reads
++        pairs = rows * plan.slots
++        partials = torch.empty((s, pairs, 2 if epi == 2 else 1, n), dtype=torch.float32, device=x.device)
++        _ext().split(epi, x, x.stride(0), slots, w, scale, kg, nb, s, plan.items, plan.counts, plan.members, out, n,
++                     limit, units, partials, pairs)
++        return
+     _ext().experts(epi, x, x.stride(0), slots, w, scale, kg, nb, plan.items, plan.counts, plan.members, out, n,
+                    limit, skip, units)
+ 
+diff --git a/tools/kolibri_experts_bits.py b/tools/kolibri_experts_bits.py
+new file mode 100644
+index 0000000..8ce1945
+--- /dev/null
++++ b/tools/kolibri_experts_bits.py
+@@ -0,0 +1,40 @@
++"""Save (or compare against) the expert kernels' outputs on fixed inputs: a pipeline change must keep every bit."""
++
++import sys
++
++import torch
++
++from tensorfold.cuda import experts as grouped
++from tensorfold.cuda.fp8 import experts as fp8x
++
++torch.manual_seed(1)
++D, E, NI = 2560, 64, 512
++
++
++def mats(n, k):
++    return ((torch.randn(E + 1, n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn),
++            torch.rand(E + 1, n // 128, k // 128, device="cuda") * 0.01 + 0.001)
++
++
++ex = fp8x.make(mats(NI, D), mats(NI, D), mats(D, NI))
++outs = []
++for rows in (1, 3, 16):
++    x = torch.randn(rows, D, device="cuda").to(torch.bfloat16)
++    picks = torch.stack([torch.randperm(E, device="cuda")[:6] for _ in range(rows)]).int()
++    picks = torch.cat([picks, torch.full((rows, 1), E, device="cuda", dtype=torch.int32)], 1).contiguous()
++    plan = grouped.Plan(16, 7, E + 1, "cuda")
++    grouped.route(picks, plan, 16)
++    act = torch.empty(rows * 7, NI, device="cuda", dtype=torch.bfloat16)
++    y = torch.empty(rows * 7, D, device="cuda", dtype=torch.float32)
++    fp8x.gate_up(x, ex, plan, act, rows)
++    fp8x.down(act, ex, plan, y, rows)
++    outs += [act.clone(), y.clone()]
++mode, path = sys.argv[1], sys.argv[2]
++if mode == "save":
++    torch.save([o.cpu() for o in outs], path)
++    print("saved")
++else:
++    ref = torch.load(path)
++    same = all(torch.equal(a.cpu(), b) for a, b in zip(outs, ref))
++    print("bit-identical:", same)
++    sys.exit(0 if same else 1)
+diff --git a/tools/kolibri_moe_breakdown.py b/tools/kolibri_moe_breakdown.py
+new file mode 100644
+index 0000000..7788d93
+--- /dev/null
++++ b/tools/kolibri_moe_breakdown.py
+@@ -0,0 +1,70 @@
++"""MoE decode step, one row, broken into its launches (graph-replayed, 16 rotated layers so weights miss L2)."""
++
++import torch
++import triton
++
++from tensorfold.cuda import experts as grouped
++from tensorfold.cuda import moe as shared
++from tensorfold.cuda.fp8 import experts as fp8x
++from tensorfold.families.kolibri1.cuda import moe
++
++torch.manual_seed(0)
++D, E, NI, COPIES, REPS = 2560, 384, 512, 16, 100
++
++
++def experts8():
++    def mats(n, k):
++        return ((torch.randn(E + 1, n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn),
++                torch.rand(E + 1, n // 128, k // 128, device="cuda") * 0.01 + 0.001)
++    return fp8x.make(mats(NI, D), mats(NI, D), mats(D, NI))
++
++
++exs = [experts8() for _ in range(COPIES)]
++routers = [(torch.randn(E, D, device="cuda") * 0.02).to(torch.bfloat16) for _ in range(COPIES)]
++bias = torch.zeros(E, device="cuda")
++x = torch.randn(1, D, device="cuda").to(torch.bfloat16)
++moe.run(x, routers[0], bias, exs[0], 6)
++buf = next(iter(moe._scratch.values()))
++
++
++def timed(fn):
++    fn(0)
++    torch.cuda.synchronize()
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        for i in range(REPS):
++            fn(i % COPIES)
++    g.replay()
++    torch.cuda.synchronize()
++    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++    a.record()
++    for _ in range(5):
++        g.replay()
++    b.record()
++    torch.cuda.synchronize()
++    return a.elapsed_time(b) * 1000 / (5 * REPS)
++
++
++steps = {
++    "router gemm": lambda i: shared.router(x, routers[i], buf.logits[:1]),
++    "topk": lambda i: moe._topk[(1,)](buf.logits, bias, buf.pick, buf.wts, NE=E, TOPK=6, SLOTS=7,
++                                      BLOCK=triton.next_power_of_2(E), SLOTP=8, num_warps=4),
++    "route plan": lambda i: grouped.route(buf.pick[:1], buf.plan, 16),
++    "gate_up (7 experts)": lambda i: fp8x.gate_up(x, exs[i], buf.plan, buf.act[:7], 1),
++    "down (7 experts)": lambda i: fp8x.down(buf.act[:7], exs[i], buf.plan, buf.y[:1].view(-1, D), 1),
++    "combine": lambda i: shared.combine(buf.y[:1], buf.wts[:1]),
++    "whole moe.run": lambda i: moe.run(x, routers[i], bias, exs[i], 6),
++}
++gu_bytes, dn_bytes = 7 * 2 * NI * D, 7 * D * NI
++total = 0.0
++for name, fn in steps.items():
++    us = timed(fn)
++    extra = ""
++    if name.startswith("gate_up"):
++        extra = f"  {gu_bytes / us / 1e3:.0f} GB/s"
++    if name.startswith("down"):
++        extra = f"  {dn_bytes / us / 1e3:.0f} GB/s"
++    if name != "whole moe.run":
++        total += us
++    print(f"{name:<22} {us:7.1f} us{extra}")
++print(f"{'sum of parts':<22} {total:7.1f} us")
+-- 
+2.53.0
+

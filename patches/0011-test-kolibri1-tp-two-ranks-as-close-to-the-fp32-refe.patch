@@ -1,0 +1,54 @@
+From fb2aec74a87abf29d54a460a916b0d7da21f29e4 Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 13:10:33 +1100
+Subject: [PATCH 11/23] test(kolibri1 tp): two ranks as close to the fp32
+ reference as one GPU
+
+---
+ tests/cuda/test_kolibri1_tp.py | 23 ++++++++++++++++++++---
+ 1 file changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/tests/cuda/test_kolibri1_tp.py b/tests/cuda/test_kolibri1_tp.py
+index e919a1a..8ef7791 100644
+--- a/tests/cuda/test_kolibri1_tp.py
++++ b/tests/cuda/test_kolibri1_tp.py
+@@ -95,6 +95,9 @@ def test_two_ranks_agree_bit_for_bit_and_track_one_gpu(tiny):
+     from tensorfold.families.kolibri1.cuda.forward import Model
+     from tensorfold.families.kolibri1.cuda.weights import load
+ 
++    sys.path.insert(0, str(Path(__file__).parent))
++    from kolibri1_reference import Kolibri
++
+     prompt = tokens(60, seed=7)
+     one = decode(Model(load(tiny), 256), prompt, 12)
+ 
+@@ -104,9 +107,23 @@ def test_two_ranks_agree_bit_for_bit_and_track_one_gpu(tiny):
+     r0, r1 = pair(rank_run)
+     assert torch.equal(r0, r1)
+     assert r0.shape == one.shape
+-    cos = torch.nn.functional.cosine_similarity(r0, one, dim=-1)
+-    assert cos.min() > 0.995, cos
+-    assert (r0.argmax(-1) == one.argmax(-1)).all()
++    # A random tiny MoE is full of routing near-ties, so a last-bit change flips experts on some rows on either
++    # engine: two ranks must stay as close to the fp32 reference as one GPU does.
++    ids = tokens(100, seed=0)
++    ref, _ = Kolibri(tiny).forward(ids, 0)
++    from tensorfold.families.kolibri1.cuda.forward import Chain
++
++    p1 = Model(load(tiny), 256).forward([Chain(0, 0, ids)], prompt=True, rows=range(100))
++
++    def prompt_run(rank, comm):
++        m = Model(load(tiny, rank=rank, world=2), 256, comm=comm)
++        return m.forward([Chain(0, 0, ids)], prompt=True, rows=range(100))
++
++    p2, _ = pair(prompt_run)
++    cos = torch.nn.functional.cosine_similarity
++    c1, c2 = cos(p1, ref.to(p1.device), dim=-1), cos(p2, ref.to(p2.device), dim=-1)
++    assert c2.mean() > c1.mean() - 0.002, (c1.mean(), c2.mean())
++    assert (c2 < 0.99).sum() <= (c1 < 0.99).sum() + 3
+ 
+ 
+ def test_a_ranks_share_halves_heads_experts_and_vocab(tiny):
+-- 
+2.53.0
+

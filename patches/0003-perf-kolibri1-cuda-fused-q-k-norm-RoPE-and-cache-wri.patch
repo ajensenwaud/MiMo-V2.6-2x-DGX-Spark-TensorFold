@@ -1,0 +1,506 @@
+From bc08cfc628547c8e7866e746274cd6e438ac3fda Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=BCrgen=20Schmied?= <juergenschmied70@gmail.com>
+Date: Sat, 3 Oct 2026 23:55:25 +0200
+Subject: [PATCH 03/23] perf(kolibri1 cuda): fused q/k norm, RoPE and cache
+ writes; residual adds fused with the next norm; prompt experts staged a
+ 64-pair item a CTA; 8,192-row prompt chunks
+
+---
+ src/tensorfold/cuda/fp8/experts.cpp           |  17 ++
+ src/tensorfold/cuda/fp8/experts.cu            | 171 ++++++++++++++++++
+ src/tensorfold/cuda/fp8/experts.py            |   7 +-
+ .../families/kolibri1/cuda/forward.py         |  42 ++---
+ src/tensorfold/families/kolibri1/cuda/glue.py |  88 +++++++++
+ src/tensorfold/families/kolibri1/cuda/moe.py  |   2 +-
+ tests/cuda/test_fp8_experts.py                |  10 +-
+ 7 files changed, 302 insertions(+), 35 deletions(-)
+ create mode 100644 src/tensorfold/families/kolibri1/cuda/glue.py
+
+diff --git a/src/tensorfold/cuda/fp8/experts.cpp b/src/tensorfold/cuda/fp8/experts.cpp
+index 4d772e5..9b263a8 100644
+--- a/src/tensorfold/cuda/fp8/experts.cpp
++++ b/src/tensorfold/cuda/fp8/experts.cpp
+@@ -5,6 +5,11 @@ void fp8_experts_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_
+                       const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n, double limit,
+                       int64_t skip, int64_t max_units);
+ 
++void fp8_experts_prompt_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
++                             const at::Tensor& scale, int64_t kg, int64_t nb, const at::Tensor& items,
++                             const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n,
++                             double limit, int64_t skip, int64_t max_units);
++
+ // epi 2: out [pairs, n] bf16 SwiGLU of gate and up; 0: fp32 down; 3: bf16 down. w: [E, n/32, K/32, M, 32, 2] uint4.
+ void experts(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
+              const at::Tensor& scale, int64_t kg, int64_t nb, const at::Tensor& items, const at::Tensor& counts,
+@@ -18,6 +23,18 @@ void experts(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots,
+                      max_units);
+ }
+ 
++// The same on prompt items of up to 64 pairs, each block staged once for the item (the same bits).
++void prompt(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
++            const at::Tensor& scale, int64_t kg, int64_t nb, const at::Tensor& items, const at::Tensor& counts,
++            const at::Tensor& members, at::Tensor out, int64_t n, double limit, int64_t skip, int64_t max_units) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.stride(-1) == 1, "x: bf16 rows");
++    TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.scalar_type() == at::kInt, "w: int32 blocks");
++    TORCH_CHECK(kg % 4 == 0 && (nb * 32) % 128 == 0, "K and n in 128 x 128 scale blocks");
++    fp8_experts_prompt_cuda(epi, x, x_stride, slots, w, scale, kg, nb, items, counts, members, out, n, limit, skip,
++                            max_units);
++}
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("experts", &experts);
++    m.def("prompt", &prompt);
+ }
+diff --git a/src/tensorfold/cuda/fp8/experts.cu b/src/tensorfold/cuda/fp8/experts.cu
+index c28d0aa..cb4d357 100644
+--- a/src/tensorfold/cuda/fp8/experts.cu
++++ b/src/tensorfold/cuda/fp8/experts.cu
+@@ -167,6 +167,162 @@ void launch(const at::Tensor& x, int x_stride, int slots, const at::Tensor& w, c
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++
++// Prompt items of up to 64 pairs: a CTA of four warps, CW column blocks by 64 / (16 RT) row groups, stages each block
++// once; a warp converts a weight fragment once for its RT row tiles. Per pair the arithmetic of fp8_expert_kernel.
++constexpr int PWARPS = 4, PSTAGES = 4, PMIN = 1;
++
++template <int M, int RT, int CW>
++struct PromptCfg {
++  static constexpr int RW = PWARPS / CW;              // row groups
++  static_assert(RW * RT * 16 == 64, "a prompt item holds 64 pairs");
++};
++
++template <int M, int EPI, int RT, int CW>
++__global__ void __launch_bounds__(PWARPS * 32, PMIN)
++    fp8_expert_prompt_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
++                             const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
++                             const int* __restrict__ items, const int* __restrict__ counts,
++                             const int* __restrict__ members, void* __restrict__ out, int N, float limit, int skip) {
++  constexpr int RW = PromptCfg<M, RT, CW>::RW;
++  __shared__ uint4 sw[PSTAGES][CW][M][LANE4][32];       // half-major so a warp's reads hit all banks
++  __shared__ uint4 sx[PSTAGES][64][4];                  // the item's 64 rows, 32 inputs each
++  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
++  const int cw = warp % CW, rw = warp / CW;
++  const int groups = NB / CW;
++  const int units = __ldg(counts) * groups;
++  const int SG = KG / PER_SCALE, NR = (NB * COLS) / 128;
++  for (int unit = blockIdx.x; unit < units; unit += gridDim.x) {
++    const int it = unit / groups, cg = unit - it * groups;
++    const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
++    if (e == skip) continue;
++    const int cb = cg * CW + cw;
++    const float* sc = scale + ((size_t)e * M * NR + (cb * COLS) / 128) * SG;
++    int pr0[RT], pr1[RT];
++    bool v0[RT], v1[RT];
++#pragma unroll
++    for (int r = 0; r < RT; ++r) {
++      const int r0 = (rw * RT + r) * 16;
++      v0[r] = r0 + gq < cnt;
++      v1[r] = r0 + gq + 8 < cnt;
++      pr0[r] = v0[r] ? __ldg(members + first + r0 + gq) : 0;
++      pr1[r] = v1[r] ? __ldg(members + first + r0 + gq + 8) : 0;
++    }
++    const __nv_bfloat16* xrow[2];                       // this thread's two staged rows (past cnt: the last pair's)
++#pragma unroll
++    for (int c = 0; c < 2; ++c) {
++      const int p = min((threadIdx.x + c * PWARPS * 32) / 4, cnt - 1);
++      const int pr = __ldg(members + first + p);
++      xrow[c] = X + (size_t)(slots ? pr / slots : pr) * x_stride + ((threadIdx.x + c * PWARPS * 32) % 4) * 8;
++    }
++    const uint4* base = W + ((size_t)e * NB + cg * CW) * (size_t)KG * (M * BLOCK4);
++    auto stage = [&](int g) {                           // CW blocks of M * 64 uint4, then 64 rows' 32 inputs
++#pragma unroll
++      for (int c = 0; c < 2; ++c) {
++        const int i = threadIdx.x + c * PWARPS * 32;
++        cp16(&sx[g % PSTAGES][i / 4][i % 4], xrow[c] + g * 32);
++      }
++      for (int i = threadIdx.x; i < CW * M * BLOCK4; i += PWARPS * 32) {
++        const int c = i / (M * BLOCK4), j = i % (M * BLOCK4);
++        const int m = j / BLOCK4, l = (j % BLOCK4) / LANE4, h = j % LANE4;
++        cp16(&sw[g % PSTAGES][c][m][h][l], base + ((size_t)c * KG + g) * (M * BLOCK4) + j);
++      }
++    };
++    __syncthreads();                                    // the previous unit's readers are done with every slot
++#pragma unroll
++    for (int g = 0; g < PSTAGES - 1; ++g) {
++      if (g < KG) stage(g);
++      cp_commit();
++    }
++    float acc[M][RT][NTW][4];
++    float part[M][RT][NTW][4];
++#pragma unroll
++    for (int m = 0; m < M; ++m)
++#pragma unroll
++      for (int r = 0; r < RT; ++r)
++#pragma unroll
++        for (int j = 0; j < NTW; ++j) acc[m][r][j][0] = acc[m][r][j][1] = acc[m][r][j][2] = acc[m][r][j][3] = 0.f;
++    const bool live = rw * RT * 16 < cnt;
++    for (int g = 0; g < KG; ++g) {
++      cp_wait<PSTAGES - 2>();
++      __syncthreads();
++      if (g + PSTAGES - 1 < KG) stage(g + PSTAGES - 1);
++      cp_commit();
++      if (!live) continue;
++      if (g % PER_SCALE == 0) {
++#pragma unroll
++        for (int m = 0; m < M; ++m)
++#pragma unroll
++          for (int r = 0; r < RT; ++r)
++#pragma unroll
++            for (int j = 0; j < NTW; ++j)
++              part[m][r][j][0] = part[m][r][j][1] = part[m][r][j][2] = part[m][r][j][3] = 0.f;
++      }
++#pragma unroll
++      for (int h = 0; h < 2; ++h) {
++        uint2 xa[RT], xb[RT];
++#pragma unroll
++        for (int r = 0; r < RT; ++r) {                  // inputs 16h + 4t .. 16h + 4t + 3 of rows gq and gq + 8
++          const int r0 = (rw * RT + r) * 16 + gq;
++          xa[r] = reinterpret_cast<const uint2*>(&sx[g % PSTAGES][r0][0])[4 * h + t];
++          xb[r] = reinterpret_cast<const uint2*>(&sx[g % PSTAGES][r0 + 8][0])[4 * h + t];
++        }
++#pragma unroll
++        for (int m = 0; m < M; ++m) {
++          const uint4 wv = sw[g % PSTAGES][cw][m][h][lane];
++#pragma unroll
++          for (int j = 0; j < NTW; ++j) {
++            const uint32_t word = comp(wv, j);
++            const uint32_t b0 = fp8pair(word), b1 = fp8pair(word >> 16);
++#pragma unroll
++            for (int r = 0; r < RT; ++r) mma(part[m][r][j], xa[r].x, xb[r].x, xa[r].y, xb[r].y, b0, b1);
++          }
++        }
++      }
++      if (g % PER_SCALE == PER_SCALE - 1) {
++#pragma unroll
++        for (int m = 0; m < M; ++m) {
++          const float s = __ldg(sc + m * NR * SG + g / PER_SCALE);
++#pragma unroll
++          for (int r = 0; r < RT; ++r)
++#pragma unroll
++            for (int j = 0; j < NTW; ++j)
++#pragma unroll
++              for (int q = 0; q < 4; ++q) acc[m][r][j][q] = fmaf(part[m][r][j][q], s, acc[m][r][j][q]);
++        }
++      }
++    }
++    cp_wait<0>();
++    if (live) {
++#pragma unroll
++      for (int r = 0; r < RT; ++r)
++        epilogue<EPI, M, RT>(acc, r, out, N, cb * COLS + 2 * t, pr0[r], pr1[r], v0[r], v1[r], limit);
++    }
++  }
++}
++
++template <int M, int EPI, int RT, int CW>
++void launch_prompt(const at::Tensor& x, int x_stride, int slots, const at::Tensor& w, const at::Tensor& scale,
++                   int kg, int nb, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
++                   at::Tensor& out, int n, float limit, int skip, int64_t max_units) {
++  TORCH_CHECK(nb % CW == 0, "fp8 prompt experts: column blocks in groups of ", CW);
++  static int per_sm = 0;
++  static int sms = 0;
++  if (per_sm == 0) {
++    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, fp8_expert_prompt_kernel<M, EPI, RT, CW>, PWARPS * 32, 0);
++    sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++    per_sm = per_sm < 1 ? 1 : per_sm;
++  }
++  const int64_t units = max_units / nb * (nb / CW);
++  const int grid = static_cast<int>(units < (int64_t)per_sm * sms ? units : (int64_t)per_sm * sms);
++  if (grid < 1) return;
++  fp8_expert_prompt_kernel<M, EPI, RT, CW><<<grid, PWARPS * 32, 0, at::cuda::getCurrentCUDAStream()>>>(
++      reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), x_stride, slots,
++      reinterpret_cast<const uint4*>(w.data_ptr()), scale.data_ptr<float>(), kg, nb, items.data_ptr<int>(),
++      counts.data_ptr<int>(), members.data_ptr<int>(), out.data_ptr(), n, limit, skip);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ }  // namespace
+ 
+ void fp8_experts_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
+@@ -182,3 +338,18 @@ void fp8_experts_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_
+   else if (epi == 3) launch<1, 3>(x, xs, sl, w, scale, k, b, items, counts, members, out, nn, lim, sk, max_units);
+   else TORCH_CHECK(false, "fp8 experts: epilogue 0 (fp32 down), 2 (SwiGLU) or 3 (bf16 down), not ", epi);
+ }
++
++void fp8_experts_prompt_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
++                             const at::Tensor& scale, int64_t kg, int64_t nb, const at::Tensor& items,
++                             const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n,
++                             double limit, int64_t skip, int64_t max_units) {
++  const c10::cuda::CUDAGuard guard(x.device());
++  const int xs = static_cast<int>(x_stride), sl = static_cast<int>(slots), k = static_cast<int>(kg);
++  const int b = static_cast<int>(nb), nn = static_cast<int>(n), sk = static_cast<int>(skip);
++  const float lim = static_cast<float>(limit);
++  const int64_t mu = max_units;
++  if (epi == 2) launch_prompt<2, 2, 2, 2>(x, xs, sl, w, scale, k, b, items, counts, members, out, nn, lim, sk, mu);
++  else if (epi == 0) launch_prompt<1, 0, 4, 4>(x, xs, sl, w, scale, k, b, items, counts, members, out, nn, lim, sk, mu);
++  else if (epi == 3) launch_prompt<1, 3, 4, 4>(x, xs, sl, w, scale, k, b, items, counts, members, out, nn, lim, sk, mu);
++  else TORCH_CHECK(false, "fp8 prompt experts: epilogue 0, 2 or 3, not ", epi);
++}
+diff --git a/src/tensorfold/cuda/fp8/experts.py b/src/tensorfold/cuda/fp8/experts.py
+index 1f34398..175d8b1 100644
+--- a/src/tensorfold/cuda/fp8/experts.py
++++ b/src/tensorfold/cuda/fp8/experts.py
+@@ -12,6 +12,7 @@ from tensorfold.cuda import experts as grouped
+ 
+ COLS = 32                 # output columns a warp
+ BLOCK = 128               # the checkpoint's scale block, both ways
++PROMPT_TILE = 64          # pairs a prompt item holds: four warps of 16 share each staged block
+ 
+ 
+ @lru_cache(maxsize=1)
+@@ -19,7 +20,7 @@ def _ext():
+     from tensorfold.cuda.build import MIN_CAPABILITY, load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_fp8_experts_v1", sources=[str(here / "experts.cpp"), str(here / "experts.cu")],
++    return load(name="tensorfold_fp8_experts_v6", sources=[str(here / "experts.cpp"), str(here / "experts.cu")],
+                 need=MIN_CAPABILITY, extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+@@ -71,6 +72,10 @@ def make(gate: tuple, up: tuple, down: tuple, *, limit: float = 0.0) -> Experts8
+ def _run(epi: int, x: torch.Tensor, slots: int, w: torch.Tensor, scale: torch.Tensor, kg: int, nb: int,
+          plan: grouped.Plan, out: torch.Tensor, n: int, limit: float, skip: int, rows: int) -> None:
+     units = grouped.max_items(rows * plan.slots, plan.experts, plan.tile) * nb
++    if plan.prefill and plan.tile == PROMPT_TILE:      # an item a CTA, its blocks staged once
++        _ext().prompt(epi, x, x.stride(0), slots, w, scale, kg, nb, plan.items, plan.counts, plan.members, out, n,
++                      limit, skip, units)
++        return
+     _ext().experts(epi, x, x.stride(0), slots, w, scale, kg, nb, plan.items, plan.counts, plan.members, out, n,
+                    limit, skip, units)
+ 
+diff --git a/src/tensorfold/families/kolibri1/cuda/forward.py b/src/tensorfold/families/kolibri1/cuda/forward.py
+index a2fbcdb..636a982 100644
+--- a/src/tensorfold/families/kolibri1/cuda/forward.py
++++ b/src/tensorfold/families/kolibri1/cuda/forward.py
+@@ -12,10 +12,10 @@ import triton.language as tl
+ 
+ from tensorfold.cuda import moe as shared
+ 
+-from . import attention, moe
++from . import attention, glue, moe
+ from .weights import Weights
+ 
+-PROMPT_CHUNK = 2048
++PROMPT_CHUNK = 8192            # prompt rows a forward: every chunk reads all experts once, so wider is cheaper
+ 
+ 
+ @triton.jit
+@@ -68,7 +68,7 @@ class Model:
+         ang = torch.arange(self.context, dtype=torch.float64, device=device)[:, None] / cfg.rope_theta ** steps
+         self.cos = torch.cat([ang.cos(), ang.cos()], -1).float()          # [context, D] (neox halves)
+         self.sin = torch.cat([ang.sin(), ang.sin()], -1).float()
+-        self.half = cfg.head_dim // 2
++        self.qk_norms = [torch.stack([L.q_norm, L.k_norm]).contiguous() for L in w.layers]
+         self.scale = cfg.head_dim ** -0.5
+ 
+     @staticmethod
+@@ -79,11 +79,6 @@ class Model:
+         full = sum(cfg.full)
+         return row * (full * context + (len(cfg.full) - full) * attention.ring_size(PROMPT_CHUNK, cfg.window))
+ 
+-    def _rope(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+-        cos, sin = self.cos[pos][:, None], self.sin[pos][:, None]
+-        rot = torch.cat([-x[..., self.half:], x[..., :self.half]], -1)
+-        return x * cos + rot * sin
+-
+     @torch.no_grad()
+     def forward(self, chains: Sequence[Chain], *, prompt: bool, rows: Sequence[int] | None = None) -> torch.Tensor:
+         """fp32 logits of ``rows`` (default: each chain's last); ``prompt``: one chain on the prompt kernels."""
+@@ -104,47 +99,32 @@ class Model:
+         ids = ids.to(dev, non_blocking=True)
+         pos = torch.tensor(pos_l, dtype=torch.int64).to(dev, non_blocking=True)
+         pos32, slot32 = pos.to(torch.int32), torch.tensor(slot_l, dtype=torch.int32).to(dev, non_blocking=True)
+-        slot64 = slot32.to(torch.int64)
+-        ring_at = pos % self.ring
+         groups = [(len(c.tokens), c.p0) for c in chains]
+         res = w.embed[ids].float()
+         h, hk, d, eps = cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.eps
++        x = rms(res, w.layers[0].input_norm, eps, bf16=True)
+         for i, L in enumerate(w.layers):
+-            x = rms(res, L.input_norm, eps, bf16=True)
+-            qkv = L.qkv(x)
+-            q = rms(qkv[:, :h * d].reshape(n, h, d), L.q_norm, eps, bf16=False)
+-            k = rms(qkv[:, h * d:(h + hk) * d].reshape(n, hk, d), L.k_norm, eps, bf16=False)
+-            v = qkv[:, (h + hk) * d:].reshape(n, hk, d).contiguous()
+-            if not cfg.full[i]:
+-                q, k = self._rope(q, pos), self._rope(k, pos)
+-            q, k = q.to(torch.bfloat16).contiguous(), k.to(torch.bfloat16).contiguous()
++            q, k, v = glue.qkv(L.qkv(x), self.qk_norms[i], self.cos, self.sin, pos32, slot32, self.k[i], self.v[i],
++                               heads=h, kv_heads=hk, eps=eps, rope=not cfg.full[i])
+             if not cfg.full[i]:
+-                self.k[i][slot64, ring_at] = k
+-                self.v[i][slot64, ring_at] = v
+                 a = attention.sliding(q, self.k[i], self.v[i], pos32, slot32, window=cfg.window, scale=self.scale)
+             elif prompt:
+                 c = chains[0]
+-                kc, vc = self.k[i][c.slot], self.v[i][c.slot]
+-                kc[c.p0:c.p0 + n] = k
+-                vc[c.p0:c.p0 + n] = v
+-                a = attention.full_prompt(q, kc, vc, c.p0, scale=self.scale)
++                a = attention.full_prompt(q, self.k[i][c.slot], self.v[i][c.slot], c.p0, scale=self.scale)
+             else:
+                 caches = [(self.k[i][c.slot], self.v[i][c.slot]) for c in chains]
+                 a = attention.full_rows(q, k, v, caches, groups, scale=self.scale)
+-                self.k[i][slot64, pos] = k
+-                self.v[i][slot64, pos] = v
+-            o = L.o(a.view(n, h * d))
+-            res = res + rms(o, L.post_attn_norm, eps, bf16=False)
+-            x = rms(res, L.pre_moe_norm, eps, bf16=True)
++            x = glue.add_rms(L.o(a.view(n, h * d)), res, L.post_attn_norm, L.pre_moe_norm, eps)
+             m = moe.run(x, L.router, L.bias, L.experts, cfg.top_k, prefill=prompt)
+-            res = res + rms(m, L.post_moe_norm, eps, bf16=False)
++            after = w.layers[i + 1].input_norm if i + 1 < len(w.layers) else w.norm
++            x = glue.add_rms(m, res, L.post_moe_norm, after, eps)
+         if rows is None:
+             ends, at = [], 0
+             for c in chains:
+                 at += len(c.tokens)
+                 ends.append(at - 1)
+             rows = ends
+-        x = rms(res[torch.tensor(list(rows), device=dev)], w.norm, eps, bf16=True)
++        x = x[torch.tensor(list(rows), device=dev)]
+         return shared.router(x, w.head)
+ 
+     def prefill(self, prompt: Sequence[int], start: int = 0, slot: int = 0, chunk: int | None = None) -> torch.Tensor:
+diff --git a/src/tensorfold/families/kolibri1/cuda/glue.py b/src/tensorfold/families/kolibri1/cuda/glue.py
+new file mode 100644
+index 0000000..6565892
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/cuda/glue.py
+@@ -0,0 +1,88 @@
++"""Kolibri 1's fused glue: q/k norms with RoPE and cache writes; residual adds with the next norm (a row a program)."""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _qkv(QKV, NW, COS, SIN, POS, SLOT, Q, KO, VO, KC, VC, LEN, H: tl.constexpr, HK: tl.constexpr,
++         D: tl.constexpr, EPS: tl.constexpr, ROPE: tl.constexpr):
++    """Program (row, head of H + HK + HK): q and k RMS-normed (RoPE'd when ROPE), v as is; k, v into the cache too."""
++
++    r = tl.program_id(0)
++    hd = tl.program_id(1)
++    d = tl.arange(0, D)
++    src = QKV + r.to(tl.int64) * (H + 2 * HK) * D + hd * D
++    x = tl.load(src + d).to(tl.float32)
++    pos = tl.load(POS + r)
++    if hd < H + HK:
++        is_q = hd < H
++        wrow = NW + (hd >= H).to(tl.int32) * D                 # q_norm, then k_norm
++        w = tl.load(wrow + d)
++        rstd = tl.rsqrt(tl.sum(x * x, 0) / D + EPS)
++        y = x * rstd * w
++        if ROPE:
++            half: tl.constexpr = D // 2
++            perm = (d + half) % D
++            yp = tl.load(src + perm).to(tl.float32) * rstd * tl.load(wrow + perm)
++            cos = tl.load(COS + pos.to(tl.int64) * D + d)
++            sin = tl.load(SIN + pos.to(tl.int64) * D + d)
++            y = y * cos + tl.where(d < half, -yp, yp) * sin
++        y = y.to(tl.bfloat16)
++        if is_q:
++            tl.store(Q + (r.to(tl.int64) * H + hd) * D + d, y)
++        else:
++            k = hd - H
++            tl.store(KO + (r.to(tl.int64) * HK + k) * D + d, y)
++            at = (tl.load(SLOT + r).to(tl.int64) * LEN + pos % LEN) * HK + k
++            tl.store(KC + at * D + d, y)
++    else:
++        k = hd - H - HK
++        y = x.to(tl.bfloat16)
++        tl.store(VO + (r.to(tl.int64) * HK + k) * D + d, y)
++        at = (tl.load(SLOT + r).to(tl.int64) * LEN + pos % LEN) * HK + k
++        tl.store(VC + at * D + d, y)
++
++
++def qkv(qkv_rows: torch.Tensor, norms: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
++        pos: torch.Tensor, slots: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, *, heads: int,
++        kv_heads: int, eps: float, rope: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """qkv rows [n, (H + 2 HK) D] bf16, norms [2, D] (q, k) -> q [n, H, D], k, v [n, HK, D]; caches at pos % LEN."""
++
++    n, width = qkv_rows.shape
++    d = width // (heads + 2 * kv_heads)
++    q = torch.empty((n, heads, d), dtype=torch.bfloat16, device=qkv_rows.device)
++    k = torch.empty((n, kv_heads, d), dtype=torch.bfloat16, device=qkv_rows.device)
++    v = torch.empty_like(k)
++    _qkv[(n, heads + 2 * kv_heads)](qkv_rows.contiguous(), norms, cos, sin, pos, slots, q, k, v, k_cache,
++                                    v_cache, k_cache.shape[1], H=heads, HK=kv_heads, D=d, EPS=float(eps), ROPE=rope,
++                                    num_warps=1)
++    return q, k, v
++
++
++@triton.jit
++def _add_rms(X, RES, W1, W2, OUT, N: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.constexpr):
++    """Program r: res += rms(x) * w1 (fp32, in place), then out = bf16(rms(res) * w2)."""
++
++    r = tl.program_id(0)
++    c = tl.arange(0, BLOCK)
++    ok = c < N
++    x = tl.load(X + r.to(tl.int64) * N + c, mask=ok, other=0.0).to(tl.float32)
++    y = x * tl.rsqrt(tl.sum(x * x, 0) / N + EPS) * tl.load(W1 + c, mask=ok, other=0.0)
++    res = tl.load(RES + r.to(tl.int64) * N + c, mask=ok, other=0.0) + y
++    tl.store(RES + r.to(tl.int64) * N + c, res, mask=ok)
++    z = res * tl.rsqrt(tl.sum(res * res, 0) / N + EPS) * tl.load(W2 + c, mask=ok, other=0.0)
++    tl.store(OUT + r.to(tl.int64) * N + c, z.to(tl.bfloat16), mask=ok)
++
++
++def add_rms(x: torch.Tensor, res: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, eps: float) -> torch.Tensor:
++    """``res`` (fp32, in place) += rms(x) * w1; returns bf16 rms(res) * w2."""
++
++    n = x.shape[-1]
++    out = torch.empty(res.shape, dtype=torch.bfloat16, device=res.device)
++    _add_rms[(res.shape[0],)](x.contiguous(), res, w1, w2, out, N=n, EPS=float(eps),
++                              BLOCK=triton.next_power_of_2(n), num_warps=4)
++    return out
+diff --git a/src/tensorfold/families/kolibri1/cuda/moe.py b/src/tensorfold/families/kolibri1/cuda/moe.py
+index 73cc30f..3bee323 100644
+--- a/src/tensorfold/families/kolibri1/cuda/moe.py
++++ b/src/tensorfold/families/kolibri1/cuda/moe.py
+@@ -67,7 +67,7 @@ def run(x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: fp8x.Expe
+     shared.router(x, router, buf.logits[:rows])
+     _topk[(rows,)](buf.logits, bias, buf.pick, buf.wts, NE=experts, TOPK=top_k, SLOTS=top_k + 1,
+                    BLOCK=triton.next_power_of_2(experts), SLOTP=triton.next_power_of_2(top_k + 1), num_warps=4)
+-    grouped.route(buf.pick[:rows], buf.plan, 16)
++    grouped.route(buf.pick[:rows], buf.plan, fp8x.PROMPT_TILE if prefill else 16)
+     fp8x.gate_up(x, ex, buf.plan, buf.act[:rows * buf.slots], rows)
+     fp8x.down(buf.act[:rows * buf.slots], ex, buf.plan, buf.y[:rows].view(-1, ex.dims), rows)
+     return shared.combine(buf.y[:rows], buf.wts[:rows])
+diff --git a/tests/cuda/test_fp8_experts.py b/tests/cuda/test_fp8_experts.py
+index 46baa2a..857be01 100644
+--- a/tests/cuda/test_fp8_experts.py
++++ b/tests/cuda/test_fp8_experts.py
+@@ -29,7 +29,7 @@ def setup(rows: int, e: int = 6, width: int = 256, dims: int = 512, slots: int =
+ def run(grouped, fp8x, ex, x, picks, prefill: bool = False):
+     rows, slots = picks.shape
+     plan = grouped.Plan(rows, slots, ex.count, x.device, prefill=prefill)
+-    grouped.route(picks.contiguous(), plan, 16)
++    grouped.route(picks.contiguous(), plan, fp8x.PROMPT_TILE if prefill else 16)
+     act = torch.empty((rows * slots, ex.width), dtype=torch.bfloat16, device=x.device)
+     fp8x.gate_up(x, ex, plan, act, rows)
+     y = torch.empty((rows * slots, ex.dims), dtype=torch.float32, device=x.device)
+@@ -57,10 +57,16 @@ def test_a_pairs_bits_never_depend_on_the_other_rows():
+     for r in (0, 7, 39):
+         a1, y1 = run(grouped, fp8x, ex, x[r:r + 1].contiguous(), picks[r:r + 1])
+         assert torch.equal(act[r], a1[0]) and torch.equal(y[r], y1[0])
+-    ap, yp = run(grouped, fp8x, ex, x, picks, prefill=True)            # a prompt plan's grouping, same bits
++    ap, yp = run(grouped, fp8x, ex, x, picks, prefill=True)            # the staged prompt kernel, same bits
+     assert torch.equal(act, ap) and torch.equal(y, yp)
+ 
+ 
++def test_the_staged_prompt_kernel_equals_the_decode_kernel_on_long_items():
++    grouped, fp8x, ex, _, x, picks = setup(300, e=4, seed=2)          # ~225 pairs an expert: several 64-pair items
++    assert torch.equal(torch.cat(run(grouped, fp8x, ex, x, picks), -1),
++                       torch.cat(run(grouped, fp8x, ex, x, picks, prefill=True), -1))
++
++
+ def test_unaligned_blocks_are_refused():
+     from tensorfold.cuda.fp8 import experts as fp8x
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,211 @@
+From dd158a3837e9624da734797fba8f5f8714405944 Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 13:16:31 +1100
+Subject: [PATCH 12/23] tools: kolibri KL quality gate against the fp32
+ reference (prompt and decode rows, any TP)
+
+---
+ tools/kolibri_kl.py       | 115 ++++++++++++++++++++++++++++++++++++++
+ tools/kolibri_tp_diag.py  |  33 -----------
+ tools/kolibri_tp_diag2.py |  27 ---------
+ 3 files changed, 115 insertions(+), 60 deletions(-)
+ create mode 100644 tools/kolibri_kl.py
+ delete mode 100644 tools/kolibri_tp_diag.py
+ delete mode 100644 tools/kolibri_tp_diag2.py
+
+diff --git a/tools/kolibri_kl.py b/tools/kolibri_kl.py
+new file mode 100644
+index 0000000..b1fd425
+--- /dev/null
++++ b/tools/kolibri_kl.py
+@@ -0,0 +1,115 @@
++"""Quality gate: KL(fp32 reference || engine) on real text, prompt rows and decode rows, for any engine config.
++
++  ref:    python3 tools/kolibri_kl.py ref    MODEL OUT.pt                 (one GPU, nothing else loaded)
++  engine: python3 tools/kolibri_kl.py engine MODEL REF.pt [--tp 2 --rank R --master ADDR]  (rank 0 prints)
++
++Each text is tokenized, its first PROMPT tokens run as a prompt (every row's logits kept), and the next DECODE tokens
++are fed one at a time (teacher-forced) through the decode path (graphs unless TF_KOLIBRI_GRAPHS=0).
++"""
++
++import argparse
++import os
++import sys
++
++import torch
++
++TEXTS = [
++    "Die Hauptstadt von Frankreich ist Paris. Sie liegt an der Seine und ist seit dem Mittelalter das politische und "
++    "kulturelle Zentrum des Landes. Zu den bekanntesten Sehenswürdigkeiten gehören der Eiffelturm, der Louvre und "
++    "die Kathedrale Notre-Dame, die nach dem Brand im Jahr 2019 aufwendig restauriert wurde.",
++    "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number iteratively.\"\"\"\n    a, b = 0, 1\n    for _ in range(n):\n"
++    "        a, b = b, a + b\n    return a\n\n\nif __name__ == \"__main__\":\n    for i in range(10):\n        print(i, fibonacci(i))\n",
++    "The mitochondrion is a double-membrane-bound organelle found in most eukaryotic organisms. Mitochondria generate "
++    "most of the cell's supply of adenosine triphosphate, which is used as a source of chemical energy. They were "
++    "first discovered by Albert von Kölliker in 1857 in the voluntary muscles of insects.",
++    "Sehr geehrte Damen und Herren,\n\nhiermit kündige ich meinen Vertrag mit der Kundennummer 4711 fristgerecht zum "
++    "nächstmöglichen Zeitpunkt. Bitte senden Sie mir eine schriftliche Bestätigung der Kündigung unter Angabe des "
++    "Beendigungszeitpunktes zu.\n\nMit freundlichen Grüßen",
++]
++PROMPT, DECODE = 40, 24
++
++
++def token_ids(model_dir):
++    from transformers import AutoTokenizer
++
++    tok = AutoTokenizer.from_pretrained(model_dir)
++    out = []
++    for t in TEXTS:
++        ids = tok(t, add_special_tokens=False)["input_ids"]
++        if len(ids) < PROMPT + DECODE:
++            raise SystemExit(f"text too short: {len(ids)} tokens")
++        out.append(ids[:PROMPT + DECODE])
++    return out
++
++
++def ref(model_dir, out):
++    sys.path.insert(0, "tests/cuda")
++    from kolibri1_reference import Kolibri
++
++    seqs = token_ids(model_dir)
++    k = Kolibri(model_dir)
++    logits = []
++    for ids in seqs:
++        k.caches = [None] * k.L
++        got, _ = k.forward(ids, 0)
++        logits.append(got.float().cpu())
++    torch.save({"ids": seqs, "logits": logits}, out)
++    print(f"saved {len(seqs)} x {logits[0].shape} reference logits to {out}")
++
++
++def engine(model_dir, ref_path, tp, rank, master):
++    from tensorfold.families.kolibri1.cuda.forward import Chain, Model
++    from tensorfold.families.kolibri1.cuda.weights import load
++
++    torch.cuda.set_device(0)
++    comm = None
++    if tp == 2:
++        from tensorfold.cuda.comm import open_comm
++        from tensorfold.cuda.roce import RoceComm
++
++        comm = RoceComm(open_comm(rank, 2, master, int(os.environ.get("PORT", "29571"))), rank, 2)
++        comm.settle()
++    data = torch.load(ref_path)
++    m = Model(load(model_dir, rank=rank, world=tp), 4096, slots=1, comm=comm)
++    graphs = None
++    if os.environ.get("TF_KOLIBRI_GRAPHS", "1") != "0":
++        from tensorfold.families.kolibri1.cuda.graphs import Graphs
++
++        graphs = Graphs(m)
++    kls_p, kls_d, agree_p, agree_d = [], [], [], []
++    for ids, want in zip(data["ids"], data["logits"]):
++        got_p = m.forward([Chain(0, 0, ids[:PROMPT])], prompt=True, rows=range(PROMPT)).float().cpu()
++        got_d = []
++        for i in range(PROMPT, PROMPT + DECODE):
++            c = [Chain(0, i, [ids[i]])]
++            r = graphs.forward(c) if graphs is not None else m.forward(c, prompt=False, rows=range(1))
++            got_d.append(r[0].float().cpu())
++        got = torch.cat([got_p, torch.stack(got_d)])
++        lp, lq = torch.log_softmax(want, -1), torch.log_softmax(got, -1)
++        kl = (lp.exp() * (lp - lq)).sum(-1)
++        top = want.argmax(-1) == got.argmax(-1)
++        kls_p.append(kl[:PROMPT])
++        kls_d.append(kl[PROMPT:])
++        agree_p.append(top[:PROMPT])
++        agree_d.append(top[PROMPT:])
++    if rank == 0:
++        kp, kd = torch.cat(kls_p), torch.cat(kls_d)
++        ap, ad = torch.cat(agree_p).float().mean(), torch.cat(agree_d).float().mean()
++        label = f"tp={tp} graphs={'on' if graphs else 'off'}"
++        print(f"{label}: prompt rows KL mean {kp.mean():.5f} max {kp.max():.4f} top1 {ap:.3f} | "
++              f"decode rows KL mean {kd.mean():.5f} max {kd.max():.4f} top1 {ad:.3f}")
++
++
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("mode", choices=("ref", "engine"))
++    p.add_argument("model")
++    p.add_argument("path")
++    p.add_argument("--tp", type=int, default=1)
++    p.add_argument("--rank", type=int, default=0)
++    p.add_argument("--master", default="")
++    a = p.parse_args()
++    if a.mode == "ref":
++        ref(a.model, a.path)
++    else:
++        engine(a.model, a.path, a.tp, a.rank, a.master)
+diff --git a/tools/kolibri_tp_diag.py b/tools/kolibri_tp_diag.py
+deleted file mode 100644
+index b3d1549..0000000
+--- a/tools/kolibri_tp_diag.py
++++ /dev/null
+@@ -1,33 +0,0 @@
+-"""Diagnostic: TP=1 and TP=2 (simulated) prompt rows against the fp32 reference on the tiny checkpoint."""
+-
+-import sys
+-import tempfile
+-from pathlib import Path
+-
+-import torch
+-
+-sys.path.insert(0, "tests/cuda")
+-from kolibri1_reference import Kolibri  # noqa: E402
+-from kolibri1_tiny import write  # noqa: E402
+-from test_kolibri1_tp import pair  # noqa: E402
+-
+-from tensorfold.families.kolibri1.cuda.forward import Chain, Model  # noqa: E402
+-from tensorfold.families.kolibri1.cuda.weights import load  # noqa: E402
+-
+-for width, top_k, experts in ((256, 3, 8), (256, 1, 8)):
+-    tiny = write(Path(tempfile.mkdtemp()), width=width, top_k=top_k, experts=experts)
+-    ids = torch.randint(0, 500, (100,), generator=torch.Generator().manual_seed(0)).tolist()
+-    ref, _ = Kolibri(tiny).forward(ids, 0)
+-    one = Model(load(tiny), 256).forward([Chain(0, 0, ids)], prompt=True, rows=range(100))
+-
+-    def run(rank, comm):
+-        return Model(load(tiny, rank=rank, world=2), 256, comm=comm).forward([Chain(0, 0, ids)], prompt=True,
+-                                                                             rows=range(100))
+-
+-    two, _ = pair(run)
+-    cos = torch.nn.functional.cosine_similarity
+-    for name, x in (("tp1", one), ("tp2", two)):
+-        c = cos(x, ref.to(x.device), dim=-1)
+-        print(f"top_k={top_k} {name} vs fp32 ref: min {c.min():.4f} mean {c.mean():.5f} rows<0.99 {(c < 0.99).sum().item()}")
+-    c = cos(one, two, dim=-1)
+-    print(f"top_k={top_k} tp1 vs tp2: min {c.min():.4f} rows<0.99 {(c < 0.99).sum().item()}")
+diff --git a/tools/kolibri_tp_diag2.py b/tools/kolibri_tp_diag2.py
+deleted file mode 100644
+index d636210..0000000
+--- a/tools/kolibri_tp_diag2.py
++++ /dev/null
+@@ -1,27 +0,0 @@
+-"""Diagnostic: one MoE layer, full width vs the sum of two half-width partials (prompt and decode kernels)."""
+-
+-import sys
+-import tempfile
+-from pathlib import Path
+-
+-import torch
+-
+-sys.path.insert(0, "tests/cuda")
+-from kolibri1_tiny import write  # noqa: E402
+-
+-from tensorfold.families.kolibri1.cuda import moe  # noqa: E402
+-from tensorfold.families.kolibri1.cuda.weights import load  # noqa: E402
+-
+-tiny = write(Path(tempfile.mkdtemp()), width=256, top_k=3, experts=8)
+-full, h0, h1 = load(tiny), load(tiny, rank=0, world=2), load(tiny, rank=1, world=2)
+-torch.manual_seed(0)
+-cos = torch.nn.functional.cosine_similarity
+-for rows in (1, 5, 100):
+-    x = torch.randn(rows, 256, device="cuda").to(torch.bfloat16)
+-    for prefill in (False, True):
+-        L, A, B = full.layers[0], h0.layers[0], h1.layers[0]
+-        want = moe.run(x, L.router, L.bias, L.experts, 3, prefill=prefill, partial=True)
+-        a = moe.run(x, A.router, A.bias, A.experts, 3, prefill=prefill, partial=True).clone()
+-        b = moe.run(x, B.router, B.bias, B.experts, 3, prefill=prefill, partial=True).clone()
+-        c = cos(a + b, want, dim=-1)
+-        print(f"rows {rows:>3} prefill {prefill!s:<5} min cos {c.min():.5f}")
+-- 
+2.53.0
+

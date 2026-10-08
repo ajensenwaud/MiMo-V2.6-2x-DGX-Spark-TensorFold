@@ -1,0 +1,172 @@
+From 1d18fb0fbafc49ddb7e0a55fced75e8161df220e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=BCrgen=20Schmied?= <juergenschmied70@gmail.com>
+Date: Sun, 4 Oct 2026 00:04:33 +0200
+Subject: [PATCH 04/23] feat(kolibri1 cuda): windows copy what followed the
+ context's last 8 tokens, verified in one forward (drafted equals serial)
+
+---
+ .../families/kolibri1/cuda/decoder.py         | 49 +++++++++++++++----
+ .../families/kolibri1/cuda/engine.py          |  2 +-
+ tests/cuda/test_kolibri1_forward.py           | 34 +++++++++++++
+ 3 files changed, 75 insertions(+), 10 deletions(-)
+
+diff --git a/src/tensorfold/families/kolibri1/cuda/decoder.py b/src/tensorfold/families/kolibri1/cuda/decoder.py
+index 16d805e..4a1cf3e 100644
+--- a/src/tensorfold/families/kolibri1/cuda/decoder.py
++++ b/src/tensorfold/families/kolibri1/cuda/decoder.py
+@@ -1,5 +1,5 @@
+-"""The ``Scheduler``'s decoder for Kolibri 1: a prompt chunk a round, then one row of every decoding stream together."""
+-# Rows are row-invariant, so a stream's reply equals the one it gets alone.
++"""The ``Scheduler``'s decoder for Kolibri 1: a prompt chunk a round, then every decoding stream's window together."""
++# Windows copy what followed the context's last 8 tokens before; rows are row-invariant, so drafted equals serial.
+ 
+ from __future__ import annotations
+ 
+@@ -7,11 +7,14 @@ import time
+ 
+ from tensorfold.cuda.memory_gate import NoRoom
+ from tensorfold.cuda.sampling import sample_rows
+-from tensorfold.cuda.streams import Stream, next_fill
++from tensorfold.cuda.streams import Stream, accept, next_fill
++from tensorfold.families.qwen3_5.cuda.decode import CopyIndex, next_copy_rows
+ 
+ from .forward import PROMPT_CHUNK, Chain, Model
+ 
+ STEP = 1024              # prompt rows a round while other streams decode
++MAX_ROWS = 32            # a copy window's rows: each wrong one reads its own experts
++MIN_MATCH = 8            # context tokens a copy must repeat before it is proposed
+ 
+ 
+ class Decoder:
+@@ -22,6 +25,9 @@ class Decoder:
+         self.filling: list[Stream] = []           # admitted, prompts still prefilling (oldest first)
+         self.slot: dict[int, int] = {}
+         self.done_at: dict[int, int] = {}         # prompt rows prefilled
++        self.copies: dict[int, CopyIndex] = {}
++        self.context: dict[int, list[int]] = {}   # prompt and reply, for the copy index
++        self.width: dict[int, int] = {}
+         self.next_id = 0
+ 
+     def live(self) -> int:
+@@ -65,7 +71,11 @@ class Decoder:
+         self.filling.remove(s)
+         self.streams[s.sid] = s
+         s.started = time.perf_counter()
++        self.context[s.sid] = list(s.prompt)
++        self.copies[s.sid] = CopyIndex(MIN_MATCH)
++        self.width[s.sid] = 16                       # a copy window's rows, doubled after a whole copy
+         s.take([first], self._ends(s))
++        self.context[s.sid].append(first)
+         return [s] if s.done else []
+ 
+     def round(self) -> list[Stream]:
+@@ -75,12 +85,28 @@ class Decoder:
+         live = [s for s in self.streams.values() if not s.done]
+         if not live:
+             return done
+-        positions = [len(s.prompt) + len(s.out) - 1 for s in live]
+-        logits = self.model.step([s.out[-1] for s in live], positions, [self.slot[s.sid] for s in live])
+-        for k, s in enumerate(live):
+-            tok = sample_rows(logits[k:k + 1], [positions[k] + 1], s.sampling)[0]
+-            s.counted(1)
+-            s.take([tok], self._ends(s))
++        chains, starts = [], []
++        for s in live:
++            p = len(s.prompt) + len(s.out) - 1             # the pending token's position
++            room = min(s.count - len(s.out), self.model.context - p) - 1
++            drafts = []
++            if s.draft and room > 0:
++                most = min(room, self.width[s.sid] - 1)
++                drafts = self.copies[s.sid].propose(self.context[s.sid], most)[:most]
++            starts.append(sum(len(c.tokens) for c in chains))
++            chains.append(Chain(self.slot[s.sid], p, [s.out[-1], *drafts]))
++        total = sum(len(c.tokens) for c in chains)
++        logits = self.model.forward(chains, prompt=False, rows=range(total))
++        for s, c, a in zip(live, chains, starts):
++            win = list(c.tokens)
++            sampled = sample_rows(logits[a:a + len(win)], [c.p0 + 1 + i for i in range(len(win))], s.sampling)
++            path, last = accept(win, list(range(-1, len(win) - 1)), sampled, s.count - len(s.out), self._ends(s))
++            new = [win[r] for r in path[1:]] + [last]
++            s.counted(len(win))
++            if len(win) > 1:
++                self.width[s.sid] = next_copy_rows(len(win), len(path) == len(win), 1, MAX_ROWS)
++            s.take(new, self._ends(s))
++            self.context[s.sid].extend(new)
+         return done + [s for s in live if s.done]
+ 
+     def finish(self, done: list[Stream]) -> None:
+@@ -93,6 +119,8 @@ class Decoder:
+                 self.free.append(slot)
+                 self.free.sort()
+             self.done_at.pop(s.sid, None)
++            for d in (self.copies, self.context, self.width):
++                d.pop(s.sid, None)
+ 
+     def drop(self) -> list[Stream]:
+         gone = [s for s in self.streams.values() if not s.done] + list(self.filling)
+@@ -100,4 +128,7 @@ class Decoder:
+         self.free = list(range(self.model.slots))
+         self.slot.clear()
+         self.done_at.clear()
++        self.copies.clear()
++        self.context.clear()
++        self.width.clear()
+         return gone
+diff --git a/src/tensorfold/families/kolibri1/cuda/engine.py b/src/tensorfold/families/kolibri1/cuda/engine.py
+index 145c0a5..57e3a52 100644
+--- a/src/tensorfold/families/kolibri1/cuda/engine.py
++++ b/src/tensorfold/families/kolibri1/cuda/engine.py
+@@ -49,7 +49,7 @@ class Kolibri1Engine:
+         self.decoder = Decoder(self.model, self.eos)
+         self.scheduler = Scheduler(self.decoder, max_streams=streams)
+         self.concurrent = streams > 1
+-        self.drafts = False
++        self.drafts = True                     # copies from the context (Kolibri 1 ships no draft head)
+         print(f"[tensorfold] kolibri1: {streams} stream(s) of {window} tokens "
+               f"({streams * Model.slot_bytes(cfg, window) / 2**30:.1f} GiB of caches; sliding layers keep a "
+               f"{self.model.ring}-key ring), ready in {time.perf_counter() - started:.0f}s", flush=True)
+diff --git a/tests/cuda/test_kolibri1_forward.py b/tests/cuda/test_kolibri1_forward.py
+index a8197d3..eb0ff6e 100644
+--- a/tests/cuda/test_kolibri1_forward.py
++++ b/tests/cuda/test_kolibri1_forward.py
+@@ -96,3 +96,37 @@ def test_a_prompt_longer_than_the_ring_matches_the_reference(tiny, weights, monk
+     got = m.prefill(ids)
+     want, _ = Kolibri(tiny).forward(ids, 0)
+     assert cosines(got[0], want[-1]) > 0.99
++
++
++def test_a_verify_windows_rows_equal_serial_decode_rows(weights):
++    from tensorfold.families.kolibri1.cuda.forward import Chain, Model
++
++    prompt, win = tokens(70, seed=7), tokens(12, seed=8)
++    a, b = Model(weights, 256, 2), Model(weights, 256, 1)
++    a.prefill(prompt, slot=1)
++    b.prefill(prompt)
++    rows = a.forward([Chain(1, 70, win)], prompt=False, rows=range(len(win)))
++    for i, t in enumerate(win):
++        assert torch.equal(rows[i], b.step([t], [70 + i], [0])[0])
++
++
++def test_copy_drafts_equal_the_serial_reply(weights, monkeypatch):
++    from tensorfold.cuda.streams import Stream
++    from tensorfold.engine.exact_sampling import Sampling
++    from tensorfold.families.kolibri1.cuda import decoder
++    from tensorfold.families.kolibri1.cuda.forward import Model
++
++    guesses = tokens(40, seed=9)
++    monkeypatch.setattr(decoder.CopyIndex, "propose", lambda self, context, most: guesses[:most])  # mostly wrong
++
++    def reply(sampling, draft):
++        d = decoder.Decoder(Model(weights, 512, 1), (511,))
++        s = Stream(tokens(50, seed=3), 40, sampling, draft=draft)
++        d.admit(s)
++        while not s.done:
++            d.round()
++        return list(s.out), s.drafted
++
++    for sampling in (None, Sampling(seed=5, temperature=0.8, top_k=20, top_p=0.95)):
++        (drafted, rows), (serial, none) = reply(sampling, True), reply(sampling, False)
++        assert drafted == serial and rows > 0 and none == 0
+-- 
+2.53.0
+

@@ -1,0 +1,1043 @@
+From e282fc56d9c8768cb9ee8bdd40c68a80f10e361b Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Wed, 7 Oct 2026 00:31:20 +1100
+Subject: [PATCH 21/23] perf(kolibri1): opt-in precision levers, each
+ quality-gated: NVFP4 experts with decode split-K (nvfp4 / nvfp4-gu /
+ nvfp4-decode dual copy, on-disk quant cache), FP8 LM head (Triton,
+ per-(row,128) scales, fp32 logits), FP8 full-layer KV cache (shared tree
+ attention reads e4m3 caches), env-tunable n-gram drafting; NLL/KL corpus gate
+ and benches
+
+---
+ src/tensorfold/cuda/kernels/attention.py      |  32 +++--
+ src/tensorfold/cuda/nvfp4/experts.cu          | 128 ++++++++++++++++++
+ src/tensorfold/cuda/nvfp4/experts.py          |  18 +++
+ src/tensorfold/cuda/nvfp4/linear.py           |   2 +-
+ src/tensorfold/cuda/nvfp4/qmmf.cpp            |  19 +++
+ .../families/kolibri1/cuda/attention.py       |  12 +-
+ .../families/kolibri1/cuda/decoder.py         |   4 +-
+ .../families/kolibri1/cuda/forward.py         |  16 ++-
+ src/tensorfold/families/kolibri1/cuda/head.py |  57 ++++++++
+ src/tensorfold/families/kolibri1/cuda/moe.py  |  22 ++-
+ .../families/kolibri1/cuda/quant.py           |  82 +++++++++++
+ .../families/kolibri1/cuda/weights.py         |  25 +++-
+ tests/cuda/test_kolibri1_quant.py             |  81 +++++++++++
+ tools/kolibri_kl.py                           |   4 +
+ tools/kolibri_kv_stats.py                     |  29 ++++
+ tools/kolibri_moe_fp4_bench.py                |  70 ++++++++++
+ tools/kolibri_nll.py                          | 104 ++++++++++++++
+ 17 files changed, 671 insertions(+), 34 deletions(-)
+ create mode 100644 src/tensorfold/families/kolibri1/cuda/head.py
+ create mode 100644 tests/cuda/test_kolibri1_quant.py
+ create mode 100644 tools/kolibri_kv_stats.py
+ create mode 100644 tools/kolibri_moe_fp4_bench.py
+ create mode 100644 tools/kolibri_nll.py
+
+diff --git a/src/tensorfold/cuda/kernels/attention.py b/src/tensorfold/cuda/kernels/attention.py
+index c98ca24..6e13804 100644
+--- a/src/tensorfold/cuda/kernels/attention.py
++++ b/src/tensorfold/cuda/kernels/attention.py
+@@ -146,8 +146,10 @@ def _tail(Q, KN, VN, KC, VC, OFF, STREAM, ROWS, PATHS, DEPTHS, PO, PM, PL, W, H:
+             path_slot = logical - p
+             on_path = (path_slot >= 0) & (path_slot < depth)
+             path_node = tl.load(PATHS + node * MAXD + path_slot, mask=on_path, other=0)
+-            kc = tl.load(KC + koff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None], other=0)
+-            vc = tl.load(VC + voff + (logical[:, None] * HK + hk) * D + d[None, :], mask=committed[:, None], other=0)
++            kc = tl.load(KC + koff + (logical[:, None] * HK + hk) * D + d[None, :],
++                         mask=committed[:, None]).to(tl.bfloat16)          # masked rows: the path's, below
++            vc = tl.load(VC + voff + (logical[:, None] * HK + hk) * D + d[None, :],
++                         mask=committed[:, None]).to(tl.bfloat16)
+             kn = tl.load(KN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
+             vn = tl.load(VN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
+             kk = tl.where(committed[:, None], kc, kn).to(tl.bfloat16)
+@@ -280,36 +282,38 @@ def from_packed(dev: torch.Tensor, streams: int, width: int, n_items: int, chunk
+     return Plan(rows, table, items, parents, paths, depths, chunks, width)
+ 
+ 
+-def base(device) -> torch.Tensor:
+-    """A fixed bf16 tensor that cache offsets are measured from (so an empty cache still has a valid offset)."""
++def base(device, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
++    """A fixed tensor that cache offsets are measured from (so an empty cache still has a valid offset); its dtype is
++    the caches' (bf16, or e4m3 for FP8 caches)."""
+ 
+     device = torch.device(device)
+-    return _base(device.index if device.index is not None else torch.cuda.current_device())
++    return _base(device.index if device.index is not None else torch.cuda.current_device(), dtype)
+ 
+ 
+ @lru_cache(maxsize=None)
+-def _base(index: int) -> torch.Tensor:
+-    return torch.zeros(64, dtype=torch.bfloat16, device=torch.device("cuda", index))
++def _base(index: int, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
++    return torch.zeros(64, dtype=torch.bfloat16, device=torch.device("cuda", index)).to(dtype)
+ 
+ 
+ def offsets(caches: Sequence[tuple[torch.Tensor, torch.Tensor]], device) -> list[int]:
+-    """Each stream's key and value cache as bf16 element offsets from ``base(device)``, in stream order."""
++    """Each stream's key and value cache as element offsets from ``base(device, dtype)``, in stream order."""
+ 
+-    origin = base(device).data_ptr()
++    dtype = caches[0][0].dtype if caches else torch.bfloat16
++    origin = base(device, dtype).data_ptr()
+     out = []
+     for k, v in caches:
+         for t in (k, v):
+-            if t.dtype != torch.bfloat16 or not t.is_contiguous():
+-                raise ValueError("caches: contiguous bf16 tensors")
++            if t.dtype != dtype or dtype not in (torch.bfloat16, torch.float8_e4m3fn) or not t.is_contiguous():
++                raise ValueError("caches: contiguous bf16 (or e4m3) tensors of one dtype")
+             delta = t.data_ptr() - origin
+             if delta % 16:
+                 raise ValueError("caches must be 16-byte aligned")
+-            out.append(delta // 2)
++            out.append(delta // t.element_size())
+     return out
+ 
+ 
+ def attention(q: torch.Tensor, k_nodes: torch.Tensor, v_nodes: torch.Tensor, offs: torch.Tensor, p: Plan, *,
+-              scale: float) -> torch.Tensor:
++              scale: float, kv_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+     """Attend (W, H, D) queries to committed keys and own paths; ``offs`` holds ``offsets`` as device (S, 2) int64."""
+ 
+     w, h, d = q.shape
+@@ -319,7 +323,7 @@ def attention(q: torch.Tensor, k_nodes: torch.Tensor, v_nodes: torch.Tensor, off
+         raise ValueError("unsupported attention shape")
+     if any(x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous() for x in (q, k_nodes, v_nodes)):
+         raise ValueError("q and node keys and values must be contiguous CUDA bf16 tensors")
+-    origin = base(q.device)
++    origin = base(q.device, kv_dtype)
+     if not math.isfinite(scale) or scale <= 0:
+         raise ValueError("scale must be positive and finite")
+     g = h // hk
+diff --git a/src/tensorfold/cuda/nvfp4/experts.cu b/src/tensorfold/cuda/nvfp4/experts.cu
+index 00504ba..36a1f21 100644
+--- a/src/tensorfold/cuda/nvfp4/experts.cu
++++ b/src/tensorfold/cuda/nvfp4/experts.cu
+@@ -169,8 +169,136 @@ void launch(const at::Tensor& x, int x_stride, int slots, const at::Tensor& w, c
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++// Split K (decode): unit (item, column block, part) runs 32-input blocks [part * KG / S, (part + 1) * KG / S) as
++// k_loop does, from a zero acc, times the (expert, matrix) scale, and writes its fp32 partial; nvfp4_split_reduce
++// adds the S partials in part order and applies the epilogue. S is fixed by the weight's shape, never by the rows.
++template <int M, int WARPS>
++__global__ void __launch_bounds__(WARPS * 32)
++    nvfp4_expert_split_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
++                              const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB, int S,
++                              const int* __restrict__ items, const int* __restrict__ counts,
++                              const int* __restrict__ members, float* __restrict__ part_out, int pairs, int N) {
++  const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
++  const int units = __ldg(counts) * NB * S;
++  const int KGp = KG / S;
++  for (int unit = blockIdx.x * WARPS + (threadIdx.x >> 5); unit < units; unit += gridDim.x * WARPS) {
++    const int part = unit % S, rest = unit / S;
++    const int it = rest / NB, cb = rest - it * NB;
++    const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
++    const uint4* blk = W + ((size_t)e * NB + cb) * (size_t)KG * (M * BLOCK4) + (size_t)part * KGp * (M * BLOCK4);
++    for (int r0 = 0; r0 < cnt; r0 += 16) {
++      const bool v0 = r0 + gq < cnt, v1 = r0 + gq + 8 < cnt;
++      const int pr0 = v0 ? __ldg(members + first + r0 + gq) : 0;
++      const int pr1 = v1 ? __ldg(members + first + r0 + gq + 8) : 0;
++      const int x0r = slots ? pr0 / slots : pr0, x1r = slots ? pr1 / slots : pr1;
++      const __nv_bfloat16* x0 = X + (size_t)x0r * x_stride + part * KGp * 32;
++      const __nv_bfloat16* x1 = X + (size_t)x1r * x_stride + part * KGp * 32;
++      float acc[M][1][NTW][4];
++#pragma unroll
++      for (int m = 0; m < M; ++m)
++#pragma unroll
++        for (int j = 0; j < NTW; ++j) acc[m][0][j][0] = acc[m][0][j][1] = acc[m][0][j][2] = acc[m][0][j][3] = 0.f;
++      k_loop<M>(acc, blk, KGp, lane, t, x0, x1, v0, v1);
++      const int col0 = cb * COLS + 2 * t;
++#pragma unroll
++      for (int h = 0; h < 2; ++h) {
++        if (!(h ? v1 : v0)) continue;
++        const int pr = h ? pr1 : pr0;
++#pragma unroll
++        for (int m = 0; m < M; ++m) {
++          const float g = __ldg(scale + e * M + m);
++#pragma unroll
++          for (int j = 0; j < NTW; ++j) {
++            float* dst = part_out + (((size_t)part * pairs + pr) * M + m) * N + col0 + 8 * j;
++            *reinterpret_cast<float2*>(dst) = make_float2(acc[m][0][j][2 * h] * g, acc[m][0][j][2 * h + 1] * g);
++          }
++        }
++      }
++    }
++  }
++}
++
++template <int M, int EPI>
++__global__ void nvfp4_split_reduce(const float* __restrict__ part_in, int S, int pairs, int N, void* __restrict__ out,
++                                   float limit) {
++  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
++  const int half = N / 2;
++  if (idx >= pairs * half) return;
++  const int pr = idx / half, col = 2 * (idx - pr * half);
++  float a[M][2];
++#pragma unroll
++  for (int m = 0; m < M; ++m) a[m][0] = a[m][1] = 0.f;
++  for (int p = 0; p < S; ++p)
++#pragma unroll
++    for (int m = 0; m < M; ++m) {
++      const float2 v = *reinterpret_cast<const float2*>(part_in + (((size_t)p * pairs + pr) * M + m) * N + col);
++      a[m][0] += v.x;
++      a[m][1] += v.y;
++    }
++  const size_t row = (size_t)pr * N;
++  if constexpr (EPI == 0) {
++    *reinterpret_cast<float2*>(reinterpret_cast<float*>(out) + row + col) = make_float2(a[0][0], a[0][1]);
++  } else {
++    float o0, o1;
++    if constexpr (EPI == 2) {
++      o0 = swiglu(a[0][0], a[M - 1][0], limit);
++      o1 = swiglu(a[0][1], a[M - 1][1], limit);
++    } else {
++      o0 = a[0][0];
++      o1 = a[0][1];
++    }
++    *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(out) + row + col) =
++        __floats2bfloat162_rn(o0, o1);
++  }
++}
++
++template <int M, int EPI>
++void launch_split(const at::Tensor& x, int x_stride, int slots, const at::Tensor& w, const at::Tensor& scale, int kg,
++                  int nb, int S, const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members,
++                  at::Tensor& out, int n, float limit, int64_t max_units, at::Tensor& partials, int pairs) {
++  constexpr int WARPS = 4;
++  static int per_sm = 0;
++  static int sms = 0;
++  if (per_sm == 0) {
++    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, nvfp4_expert_split_kernel<M, WARPS>, WARPS * 32, 0);
++    sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++    per_sm = per_sm < 1 ? 1 : per_sm;
++  }
++  const int64_t need = (max_units * S + WARPS - 1) / WARPS;
++  const int grid = static_cast<int>(need < (int64_t)per_sm * sms ? need : (int64_t)per_sm * sms);
++  if (grid < 1) return;
++  auto stream = at::cuda::getCurrentCUDAStream();
++  nvfp4_expert_split_kernel<M, WARPS><<<grid, WARPS * 32, 0, stream>>>(
++      reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), x_stride, slots,
++      reinterpret_cast<const uint4*>(w.data_ptr()), scale.data_ptr<float>(), kg, nb, S, items.data_ptr<int>(),
++      counts.data_ptr<int>(), members.data_ptr<int>(), partials.data_ptr<float>(), pairs, n);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++  const int threads = 256, total = pairs * (n / 2);
++  nvfp4_split_reduce<M, EPI><<<(total + threads - 1) / threads, threads, 0, stream>>>(
++      partials.data_ptr<float>(), S, pairs, n, out.data_ptr(), limit);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ }  // namespace
+ 
++void nvfp4_experts_split_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
++                              const at::Tensor& scale, int64_t kg, int64_t nb, int64_t s, const at::Tensor& items,
++                              const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n,
++                              double limit, int64_t max_units, at::Tensor& partials, int64_t pairs) {
++  const c10::cuda::CUDAGuard guard(x.device());
++  TORCH_CHECK(s >= 1 && kg % (2 * s) == 0, "nvfp4 split K: parts of whole pipeline stages");
++  TORCH_CHECK(partials.is_cuda() && partials.is_contiguous() && partials.scalar_type() == at::kFloat &&
++                  partials.numel() >= s * pairs * (epi == 2 ? 2 : 1) * n,
++              "nvfp4 split K: fp32 partials [S, pairs, M, n]");
++  const int xs = static_cast<int>(x_stride), sl = static_cast<int>(slots), k = static_cast<int>(kg);
++  const int b = static_cast<int>(nb), ss = static_cast<int>(s), nn = static_cast<int>(n), pp = static_cast<int>(pairs);
++  const float lim = static_cast<float>(limit);
++  if (epi == 2) launch_split<2, 2>(x, xs, sl, w, scale, k, b, ss, items, counts, members, out, nn, lim, max_units, partials, pp);
++  else if (epi == 0) launch_split<1, 0>(x, xs, sl, w, scale, k, b, ss, items, counts, members, out, nn, lim, max_units, partials, pp);
++  else if (epi == 3) launch_split<1, 3>(x, xs, sl, w, scale, k, b, ss, items, counts, members, out, nn, lim, max_units, partials, pp);
++  else TORCH_CHECK(false, "nvfp4 split experts: epilogue 0, 2 or 3, not ", epi);
++}
++
+ void nvfp4_experts_cuda(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
+                         const at::Tensor& scale, int64_t kg, int64_t nb, const at::Tensor& items,
+                         const at::Tensor& counts, const at::Tensor& members, at::Tensor& out, int64_t n, double limit,
+diff --git a/src/tensorfold/cuda/nvfp4/experts.py b/src/tensorfold/cuda/nvfp4/experts.py
+index c3f4058..91790dd 100644
+--- a/src/tensorfold/cuda/nvfp4/experts.py
++++ b/src/tensorfold/cuda/nvfp4/experts.py
+@@ -77,11 +77,29 @@ def make(gate: tuple, up: tuple, down: tuple, *, limit: float = 0.0) -> Experts4
+     return Experts4(u, d, us, down[2].to(torch.float32).reshape(-1, 1).contiguous(), width, dims, float(limit))
+ 
+ 
++def _parts(env: str, kg: int) -> int:
++    """K parts for a decode matmul of ``kg`` 32-input blocks, fixed by the shape (never the rows); env unset: 1."""
++
++    import os
++
++    s = int(os.environ.get(env, "1"))
++    while s > 1 and kg % (2 * s):
++        s -= 1
++    return max(1, s)
++
++
+ def _run(epi: int, x: torch.Tensor, slots: int, w: torch.Tensor, scale: torch.Tensor, kg: int, nb: int,
+          plan: grouped.Plan, out: torch.Tensor, n: int, limit: float, skip: int, rows: int) -> None:
+     from .linear import _ext
+ 
+     units = grouped.max_items(rows * plan.slots, plan.experts, plan.tile) * nb
++    s = 1 if plan.prefill or skip >= 0 else _parts("TF_NVFP4_SPLITK_GATEUP" if epi == 2 else "TF_NVFP4_SPLITK_DOWN", kg)
++    if s > 1:                                          # decode: more warps on the few experts a row reads
++        pairs = rows * plan.slots
++        partials = torch.empty((s, pairs, 2 if epi == 2 else 1, n), dtype=torch.float32, device=x.device)
++        _ext().experts_split(epi, x, x.stride(0), slots, w, scale, kg, nb, s, plan.items, plan.counts, plan.members,
++                             out, n, limit, units, partials, pairs)
++        return
+     _ext().experts(epi, x, x.stride(0), slots, w, scale, kg, nb, plan.items, plan.counts, plan.members, out, n,
+                    limit, skip, units)
+ 
+diff --git a/src/tensorfold/cuda/nvfp4/linear.py b/src/tensorfold/cuda/nvfp4/linear.py
+index b69f876..f4ace70 100644
+--- a/src/tensorfold/cuda/nvfp4/linear.py
++++ b/src/tensorfold/cuda/nvfp4/linear.py
+@@ -18,7 +18,7 @@ def _ext():
+     from tensorfold.cuda.build import MIN_CAPABILITY, load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_nvfp4_v3", sources=[str(here / "qmmf.cpp"), str(here / "qmmf.cu"),
++    return load(name="tensorfold_nvfp4_v4", sources=[str(here / "qmmf.cpp"), str(here / "qmmf.cu"),
+                                                       str(here / "experts.cu")], need=MIN_CAPABILITY,
+                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3"], verbose=False)
+ 
+diff --git a/src/tensorfold/cuda/nvfp4/qmmf.cpp b/src/tensorfold/cuda/nvfp4/qmmf.cpp
+index 0c1f4f0..dec3dab 100644
+--- a/src/tensorfold/cuda/nvfp4/qmmf.cpp
++++ b/src/tensorfold/cuda/nvfp4/qmmf.cpp
+@@ -7,6 +7,9 @@ void stage_fp4_cuda(const at::Tensor&, const at::Tensor&, double, at::Tensor&, a
+ void nvfp4_experts_cuda(int64_t, const at::Tensor&, int64_t, int64_t, const at::Tensor&, const at::Tensor&, int64_t,
+                         int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, double,
+                         int64_t, int64_t);
++void nvfp4_experts_split_cuda(int64_t, const at::Tensor&, int64_t, int64_t, const at::Tensor&, const at::Tensor&,
++                              int64_t, int64_t, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                              at::Tensor&, int64_t, double, int64_t, at::Tensor&, int64_t);
+ 
+ // out (M, N) = x (M, K) bf16 @ W: mode 0 NVFP4 (tiled words, e4m3 block scales [npad/64, K/64, 64, 4]), 1 FP8
+ // (fragment-order bytes), 2 MXFP8 (those with e8m0 scales [npad/64, K/64, 64, 2]); ``scale`` the per-tensor factor.
+@@ -56,8 +59,24 @@ void experts(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots,
+                        max_units);
+ }
+ 
++// Decode with K split in ``s`` parts: fp32 partials [s, pairs, M, n], then their sum in part order through the
++// epilogue. Every pair must be routed to a computed expert (no skip).
++void experts_split(int64_t epi, const at::Tensor& x, int64_t x_stride, int64_t slots, const at::Tensor& w,
++                   const at::Tensor& scale, int64_t kg, int64_t nb, int64_t s, const at::Tensor& items,
++                   const at::Tensor& counts, const at::Tensor& members, at::Tensor out, int64_t n, double limit,
++                   int64_t max_units, at::Tensor partials, int64_t pairs) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && x_stride % 4 == 0,
++                "x: bf16 rows, 8-byte aligned");
++    TORCH_CHECK(w.is_contiguous() && w.scalar_type() == at::kInt && w.size(-1) == 144, "w: [E, N/32, K/32, M, 144]");
++    TORCH_CHECK(scale.is_contiguous() && scale.scalar_type() == at::kFloat, "scale: [E, M] fp32");
++    TORCH_CHECK(out.is_contiguous() && out.scalar_type() == (epi == 0 ? at::kFloat : at::kBFloat16), "out dtype");
++    nvfp4_experts_split_cuda(epi, x, x_stride, slots, w, scale, kg, nb, s, items, counts, members, out, n, limit,
++                             max_units, partials, pairs);
++}
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("qmmf", &qmmf);
+     m.def("stage_fp4", &stage_fp4);
+     m.def("experts", &experts);
++    m.def("experts_split", &experts_split);
+ }
+diff --git a/src/tensorfold/families/kolibri1/cuda/attention.py b/src/tensorfold/families/kolibri1/cuda/attention.py
+index 4e0e05b..31436ca 100644
+--- a/src/tensorfold/families/kolibri1/cuda/attention.py
++++ b/src/tensorfold/families/kolibri1/cuda/attention.py
+@@ -77,10 +77,14 @@ def sliding(q: torch.Tensor, k_ring: torch.Tensor, v_ring: torch.Tensor, positio
+ 
+ def full_prompt(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, p0: int, *,
+                 scale: float) -> torch.Tensor:
+-    """Prompt rows at [p0, p0 + W) over every key before them (the caches hold the chunk's keys)."""
++    """Prompt rows at [p0, p0 + W) over every key before them (the caches hold the chunk's keys); FP8 caches are
++    read back as bf16 through the chunk's last key."""
+ 
+     from tensorfold.cuda.kernels import prefill_attention
+ 
++    if k_cache.dtype != torch.bfloat16:
++        end = p0 + q.shape[0]
++        k_cache, v_cache = k_cache[:end].to(torch.bfloat16), v_cache[:end].to(torch.bfloat16)
+     return prefill_attention.attention(q, k_cache, v_cache, p0, scale=scale)
+ 
+ 
+@@ -94,7 +98,7 @@ def full_rows(q: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor,
+     plan = tree.plan([[i - 1 for i in range(n)] for n, _ in groups], [c for _, c in groups],
+                      q.shape[1] // k_new.shape[1], q.device)
+     offs = torch.tensor(tree.offsets(caches, q.device), dtype=torch.int64, device=q.device).view(len(groups), 2)
+-    return tree.attention(q, k_new, v_new, offs, plan, scale=scale)
++    return tree.attention(q, k_new, v_new, offs, plan, scale=scale, kv_dtype=caches[0][0].dtype)
+ 
+ 
+ # Full layers' decode attention, planned once a forward. A cache slot's offset from ``tree.base`` is the layer's
+@@ -132,10 +136,10 @@ def rows_plan(model, chains):
+ 
+ 
+ def full_planned(q: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor, offs: torch.Tensor, plan, *,
+-                 scale: float) -> torch.Tensor:
++                 scale: float, kv_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+     from tensorfold.cuda.kernels import attention as tree
+ 
+-    return tree.attention(q, k_new, v_new, offs, plan, scale=scale)
++    return tree.attention(q, k_new, v_new, offs, plan, scale=scale, kv_dtype=kv_dtype)
+ 
+ 
+ def padded_host(widths, bucket: int, group: int) -> tuple[list[int], int, int]:
+diff --git a/src/tensorfold/families/kolibri1/cuda/decoder.py b/src/tensorfold/families/kolibri1/cuda/decoder.py
+index 23cbdfa..dbf7638 100644
+--- a/src/tensorfold/families/kolibri1/cuda/decoder.py
++++ b/src/tensorfold/families/kolibri1/cuda/decoder.py
+@@ -18,8 +18,8 @@ from .forward import PROMPT_CHUNK, Chain, Model
+ from .tp import DECODE, PROMPT
+ 
+ STEP = 1024              # prompt rows a round while other streams decode
+-MAX_ROWS = 32            # a copy window's rows: each wrong one reads its own experts
+-MIN_MATCH = 8            # context tokens a copy must repeat before it is proposed
++MAX_ROWS = int(os.environ.get("TF_KOLIBRI_DRAFT_ROWS", "32"))     # a copy window's rows: each wrong one reads its experts
++MIN_MATCH = int(os.environ.get("TF_KOLIBRI_DRAFT_MATCH", "8"))    # context tokens a copy must repeat before proposed
+ 
+ 
+ class Decoder:
+diff --git a/src/tensorfold/families/kolibri1/cuda/forward.py b/src/tensorfold/families/kolibri1/cuda/forward.py
+index 77b2fd2..4891aa9 100644
+--- a/src/tensorfold/families/kolibri1/cuda/forward.py
++++ b/src/tensorfold/families/kolibri1/cuda/forward.py
+@@ -16,6 +16,8 @@ from . import attention, glue, moe
+ from .weights import Weights
+ 
+ PROMPT_CHUNK = 8192            # prompt rows a forward: every chunk reads all experts once, so wider is cheaper
++# Full-attention layers' KV cache: bf16 as upstream, or e4m3 (TF_KOLIBRI_KV=fp8: half the long-context reads)
++KV_DTYPE = torch.float8_e4m3fn if __import__("os").environ.get("TF_KOLIBRI_KV", "bf16") == "fp8" else torch.bfloat16
+ 
+ 
+ @triton.jit
+@@ -65,8 +67,9 @@ class Model:
+         self.k, self.v = [], []
+         for full in cfg.full:
+             shape = (self.slots, self.context if full else self.ring, *kv)
+-            self.k.append(torch.zeros(shape, dtype=torch.bfloat16, device=device))
+-            self.v.append(torch.zeros(shape, dtype=torch.bfloat16, device=device))
++            dt = KV_DTYPE if full else torch.bfloat16              # sliding rings are small: they stay bf16
++            self.k.append(torch.zeros(shape, dtype=torch.bfloat16, device=device).to(dt))
++            self.v.append(torch.zeros(shape, dtype=torch.bfloat16, device=device).to(dt))
+         steps = torch.arange(0, cfg.head_dim, 2, dtype=torch.float64, device=device) / cfg.head_dim
+         ang = torch.arange(self.context, dtype=torch.float64, device=device)[:, None] / cfg.rope_theta ** steps
+         self.cos = torch.cat([ang.cos(), ang.cos()], -1).float()          # [context, D] (neox halves)
+@@ -78,9 +81,10 @@ class Model:
+     def slot_bytes(cfg, context: int) -> int:
+         """Cache bytes a stream takes at ``context`` positions."""
+ 
+-        row = 2 * cfg.kv_heads * cfg.head_dim * 2
++        row = 2 * cfg.kv_heads * cfg.head_dim
+         full = sum(cfg.full)
+-        return row * (full * context + (len(cfg.full) - full) * attention.ring_size(PROMPT_CHUNK, cfg.window))
++        return row * (full * context * KV_DTYPE.itemsize
++                      + (len(cfg.full) - full) * attention.ring_size(PROMPT_CHUNK, cfg.window) * 2)
+ 
+     def _sum(self, part: torch.Tensor) -> torch.Tensor:
+         """Under TP the ranks' partial rows summed in rank order (fp32; the same bits on both ranks)."""
+@@ -93,7 +97,7 @@ class Model:
+         return recv[0].float() + recv[1].float()
+ 
+     def _logits(self, x: torch.Tensor) -> torch.Tensor:
+-        part = shared.router(x, self.w.head)                  # this rank's vocabulary slice, fp32
++        part = self.w.head(x) if callable(self.w.head) else shared.router(x, self.w.head)   # rank's vocab slice, fp32
+         if self.comm is None:
+             return part
+         recv = torch.empty((2, *part.shape), dtype=part.dtype, device=part.device)
+@@ -147,7 +151,7 @@ class Model:
+                 c = chains[0]
+                 a = attention.full_prompt(q, self.k[i][c.slot], self.v[i][c.slot], c.p0, scale=self.scale)
+             else:
+-                a = attention.full_planned(q, k, v, offs[j], plan, scale=self.scale)
++                a = attention.full_planned(q, k, v, offs[j], plan, scale=self.scale, kv_dtype=KV_DTYPE)
+             j += cfg.full[i]
+             o = L.o.prefill(a.view(n, h * d)) if prompt else L.o(a.view(n, h * d))   # prompt: the shape rule's slices
+             x = glue.add_rms(self._sum(o), res, L.post_attn_norm, L.pre_moe_norm, eps)
+diff --git a/src/tensorfold/families/kolibri1/cuda/head.py b/src/tensorfold/families/kolibri1/cuda/head.py
+new file mode 100644
+index 0000000..b219119
+--- /dev/null
++++ b/src/tensorfold/families/kolibri1/cuda/head.py
+@@ -0,0 +1,57 @@
++"""Kolibri 1's LM head in FP8 (opt-in, quality-gated): e4m3 rows with an fp32 scale per (row, 128 inputs), fp32 logits.
++
++Half the head's bytes a token. A row's logits never depend on the other rows: K runs in BK steps in order."""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++from tensorfold.cuda.moe import _tile
++
++BK = 128
++
++
++@triton.jit
++def _head8(X, W, S, OUT, M, x_stride, D: tl.constexpr, NE: tl.constexpr, BM: tl.constexpr,
++           BLOCK_E: tl.constexpr, BK: tl.constexpr):
++    """OUT[m, e] = sum over K blocks of fp32 (x[m, blk] . bf16(w8[e, blk])) * s[e, blk]."""
++
++    rm = tl.program_id(0) * BM + tl.arange(0, BM)
++    re = tl.program_id(1) * BLOCK_E + tl.arange(0, BLOCK_E)
++    rk = tl.arange(0, BK)
++    m_ok = rm < M
++    e_ok = re < NE
++    acc = tl.zeros((BM, BLOCK_E), dtype=tl.float32)
++    for k0 in range(0, D, BK):
++        x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++        w = tl.load(W + re[:, None] * D + (k0 + rk)[None, :], mask=e_ok[:, None], other=0.0).to(tl.bfloat16)
++        s = tl.load(S + re * (D // BK) + k0 // BK, mask=e_ok, other=0.0)
++        acc += tl.dot(x, tl.trans(w)) * s[None, :]
++    tl.store(OUT + rm[:, None] * NE + re[None, :], acc, mask=m_ok[:, None] & e_ok[None, :])
++
++
++class Head8:
++    """[V, D] bf16 head -> e4m3 with per-(row, 128) fp32 scales (amax / 448)."""
++
++    def __init__(self, head: torch.Tensor) -> None:
++        v, d = head.shape
++        blocks = head.float().view(v, d // BK, BK)
++        self.scale = (blocks.abs().amax(-1) / 448.0).clamp_min(1e-30).contiguous()      # [V, D/BK]
++        self.w8 = (blocks / self.scale[..., None]).to(torch.float8_e4m3fn).view(v, d).contiguous()
++        self.v, self.d = v, d
++
++    def nbytes(self) -> int:
++        return self.w8.numel() + self.scale.numel() * 4
++
++    def __call__(self, x: torch.Tensor) -> torch.Tensor:
++        x = x if x.dtype == torch.bfloat16 and x.stride(-1) == 1 else x.to(torch.bfloat16).contiguous()
++        m = x.shape[0]
++        out = torch.empty((m, self.v), dtype=torch.float32, device=x.device)
++        bm = _tile(m)
++        be, stages = (64, 4) if bm == 16 else (64, 3)
++        grid = (triton.cdiv(m, bm), triton.cdiv(self.v, be))
++        _head8[grid](x, self.w8, self.scale, out, m, x.stride(0), D=self.d, NE=self.v, BM=bm, BLOCK_E=be, BK=BK,
++                     num_warps=4, num_stages=stages)
++        return out
+diff --git a/src/tensorfold/families/kolibri1/cuda/moe.py b/src/tensorfold/families/kolibri1/cuda/moe.py
+index 84ba47b..5fbd6a7 100644
+--- a/src/tensorfold/families/kolibri1/cuda/moe.py
++++ b/src/tensorfold/families/kolibri1/cuda/moe.py
+@@ -12,6 +12,8 @@ from tensorfold.cuda import moe as shared
+ from tensorfold.cuda.fp8 import experts as fp8x
+ from tensorfold.cuda.nvfp4 import experts as nvx
+ 
++from . import quant
++
+ 
+ @triton.jit
+ def _topk(L, BIAS, PICK, WTS, NE: tl.constexpr, TOPK: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.constexpr,
+@@ -52,6 +54,7 @@ class Buffers:
+ 
+ _scratch: dict[tuple, Buffers] = {}
+ _PROMPT_BF16 = __import__("os").environ.get("TF_KOLIBRI_PROMPT_PARTIAL", "bf16") == "bf16"
++_NVFP4_PROMPT_TILE = int(__import__("os").environ.get("TF_KOLIBRI_NVFP4_PROMPT_TILE", str(nvx.PREFILL_TILE)))
+ 
+ 
+ def run(x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: fp8x.Experts8 | nvx.Experts4, top_k: int, *,
+@@ -69,13 +72,24 @@ def run(x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: fp8x.Expe
+     if buf is None:
+         buf = _scratch[key] = Buffers(size, experts, top_k, ex.width, ex.dims, x.device, prefill=prefill)
+     x = x.contiguous()
++    if isinstance(ex, quant.Dual):
++        ex = ex.fp8 if prefill else ex.fp4
+     shared.router(x, router, buf.logits[:rows])
+     _topk[(rows,)](buf.logits, bias, buf.pick, buf.wts, NE=experts, TOPK=top_k, SLOTS=top_k + 1,
+                    BLOCK=triton.next_power_of_2(experts), SLOTP=triton.next_power_of_2(top_k + 1), num_warps=4)
+-    kx = nvx if isinstance(ex, nvx.Experts4) else fp8x
+-    grouped.route(buf.pick[:rows], buf.plan, (nvx.PREFILL_TILE if kx is nvx else fp8x.PROMPT_TILE) if prefill else 16)
+-    kx.gate_up(x, ex, buf.plan, buf.act[:rows * buf.slots], rows)
+-    kx.down(buf.act[:rows * buf.slots], ex, buf.plan, buf.y[:rows].view(-1, ex.dims), rows)
++    if isinstance(ex, quant.Mixed):
++        gu_mod, gu_ex, dn_mod, dn_ex = nvx, ex.up, fp8x, ex.down
++    elif isinstance(ex, nvx.Experts4):
++        gu_mod = dn_mod = nvx
++        gu_ex = dn_ex = ex
++    else:
++        gu_mod = dn_mod = fp8x
++        gu_ex = dn_ex = ex
++    # prompt items: the FP8 prompt kernel's 64 pairs whenever an FP8 matrix is in the layer, else NVFP4's own tile
++    tile = (_NVFP4_PROMPT_TILE if dn_mod is nvx else fp8x.PROMPT_TILE) if prefill else 16
++    grouped.route(buf.pick[:rows], buf.plan, tile)
++    gu_mod.gate_up(x, gu_ex, buf.plan, buf.act[:rows * buf.slots], rows)
++    dn_mod.down(buf.act[:rows * buf.slots], dn_ex, buf.plan, buf.y[:rows].view(-1, ex.dims), rows)
+     if partial:
+         out = (buf.y[:rows].float() * buf.wts[:rows, :, None]).sum(1)
+         # prompt rows cross the link in bf16 (their expert outputs are bf16 already): half the bytes
+diff --git a/src/tensorfold/families/kolibri1/cuda/quant.py b/src/tensorfold/families/kolibri1/cuda/quant.py
+index ec1962a..b5480fd 100644
+--- a/src/tensorfold/families/kolibri1/cuda/quant.py
++++ b/src/tensorfold/families/kolibri1/cuda/quant.py
+@@ -5,6 +5,8 @@ the checkpoint's own FP8 weights, so the 4-bit copy tracks the shipped numerics,
+ 
+ from __future__ import annotations
+ 
++from dataclasses import dataclass
++
+ import torch
+ 
+ from tensorfold.cuda.fp8 import experts as fp8x
+@@ -57,3 +59,83 @@ def make(gate: tuple, up: tuple, down: tuple) -> nvx.Experts4:
+     """The FP8 stacks ``fp8x.make`` takes -> grouped NVFP4 experts (the shared one last, as in the FP8 table)."""
+ 
+     return nvx.make(from_fp8(*gate), from_fp8(*up), from_fp8(*down))
++
++
++@dataclass
++class Mixed:
++    """gate/up in NVFP4 (two thirds of an expert's bytes), down kept in the checkpoint's FP8."""
++
++    up: nvx.Experts4
++    down: fp8x.Experts8       # its gate/up blocks dropped
++
++    @property
++    def width(self) -> int:
++        return self.up.width
++
++    @property
++    def dims(self) -> int:
++        return self.up.dims
++
++
++def make_mixed(gate: tuple, up: tuple, down: tuple) -> Mixed:
++    g4, u4 = from_fp8(*gate), from_fp8(*up)
++    dev = gate[0].device
++    none = torch.empty(0, dtype=torch.int32, device=dev)
++    width, dims = int(gate[0].shape[1]), int(gate[0].shape[2])
++    e4 = nvx.Experts4(torch.stack([nvx.pack(g4[0], g4[1]), nvx.pack(u4[0], u4[1])], dim=3), none,
++                      torch.stack([g4[2], u4[2]], dim=1).to(torch.float32).contiguous(), none.float(), width, dims)
++    e8 = fp8x.Experts8(none, fp8x.pack(down[0]).unsqueeze(3), none.float(),
++                       down[1].to(torch.float32).unsqueeze(1).contiguous(), width, dims)
++    return Mixed(e4, e8)
++
++
++@dataclass
++class Dual:
++    """Both copies: prompt chunks on the checkpoint's FP8 (its prompt kernel), decode rows on NVFP4 (half the bytes a
++    token). Costs the NVFP4 copy's memory on top of the FP8 one."""
++
++    fp8: fp8x.Experts8
++    fp4: nvx.Experts4
++
++    @property
++    def width(self) -> int:
++        return self.fp8.width
++
++    @property
++    def dims(self) -> int:
++        return self.fp8.dims
++
++
++def make_dual(gate: tuple, up: tuple, down: tuple) -> Dual:
++    return Dual(fp8x.make(gate, up, down), make(gate, up, down))
++
++
++class Cache:
++    """Re-quantised experts on disk (``TF_KOLIBRI_QUANT_CACHE``: a directory), one file a (layer, rank), keyed by the
++    checkpoint's index file, the rank's share and this module's recipe, so a restart skips the minutes of quantising."""
++
++    VERSION = "nvfp4-mse4-v1"
++
++    def __init__(self, model_dir, kind: str, rank: int, world: int) -> None:
++        import hashlib
++        import os
++        from pathlib import Path
++
++        root = os.environ.get("TF_KOLIBRI_QUANT_CACHE", "")
++        self.dir = None
++        if root and kind.startswith("nvfp4"):
++            index = (Path(model_dir) / "model.safetensors.index.json").read_bytes()
++            key = hashlib.sha256(index + f"{self.VERSION}/{kind}/{rank}/{world}".encode()).hexdigest()[:16]
++            self.dir = Path(root) / f"kolibri1-{kind}-r{rank}of{world}-{key}"
++            self.dir.mkdir(parents=True, exist_ok=True)
++
++    def get(self, layer: int, device):
++        if self.dir is None or not (self.dir / f"{layer}.pt").is_file():
++            return None
++        return torch.load(self.dir / f"{layer}.pt", map_location=device, weights_only=False)
++
++    def put(self, layer: int, ex) -> None:
++        if self.dir is not None:
++            tmp = self.dir / f"{layer}.pt.tmp"
++            torch.save(ex, tmp)
++            tmp.rename(self.dir / f"{layer}.pt")
+diff --git a/src/tensorfold/families/kolibri1/cuda/weights.py b/src/tensorfold/families/kolibri1/cuda/weights.py
+index bf6d48d..bdce6e7 100644
+--- a/src/tensorfold/families/kolibri1/cuda/weights.py
++++ b/src/tensorfold/families/kolibri1/cuda/weights.py
+@@ -16,7 +16,11 @@ from tensorfold.cuda.nvfp4.linear import Fp8BlockLinear
+ 
+ from . import quant
+ 
+-EXPERTS = os.environ.get("TF_KOLIBRI_EXPERTS", "fp8")      # fp8: as shipped; nvfp4: re-quantised at load
++EXPERTS = os.environ.get("TF_KOLIBRI_EXPERTS", "fp8")      # fp8: as shipped; nvfp4 / nvfp4-gu: re-quantised at load
++HEAD = os.environ.get("TF_KOLIBRI_HEAD", "bf16")           # bf16: as shipped; fp8: per-(row, 128) e4m3 at load
++if EXPERTS.startswith("nvfp4"):                            # decode K slices for the NVFP4 experts (measured on GB10)
++    os.environ.setdefault("TF_NVFP4_SPLITK_GATEUP", "8")
++    os.environ.setdefault("TF_NVFP4_SPLITK_DOWN", "2")
+ 
+ 
+ @dataclass(frozen=True)
+@@ -149,6 +153,7 @@ def load(model_dir: str | Path, device: str = "cuda", *, rank: int = 0, world: i
+ 
+     w = Weights(cfg, get("model.embed_tokens.weight").to(torch.bfloat16).contiguous(), rank=rank, world=world,
+                 full=full)
++    qcache = quant.Cache(model_dir, EXPERTS, rank, world)
+     for i in range(cfg.layers):
+         p = f"model.layers.{i}."
+         a = p + "self_attn."
+@@ -159,8 +164,18 @@ def load(model_dir: str | Path, device: str = "cuda", *, rank: int = 0, world: i
+             parts.append(cut(fp8(f"{p}mlp.shared_experts.{proj}"), rank * ni, (rank + 1) * ni))
+             mats[proj] = (torch.stack([x for x, _ in parts]), torch.stack([s for _, s in parts]))
+             del parts
+-        ex = quant.make(mats["gate_proj"], mats["up_proj"], mats["down_proj"]) if EXPERTS == "nvfp4" \
+-            else fp8x.make(mats["gate_proj"], mats["up_proj"], mats["down_proj"])
++        cached = qcache.get(i, device)
++        if EXPERTS == "nvfp4-decode":
++            fp4 = cached if cached is not None else quant.make(mats["gate_proj"], mats["up_proj"], mats["down_proj"])
++            ex = quant.Dual(fp8x.make(mats["gate_proj"], mats["up_proj"], mats["down_proj"]), fp4)
++            new = fp4
++        elif EXPERTS in ("nvfp4", "nvfp4-gu"):
++            maker = quant.make if EXPERTS == "nvfp4" else quant.make_mixed
++            ex = new = cached if cached is not None else maker(mats["gate_proj"], mats["up_proj"], mats["down_proj"])
++        else:
++            ex = new = fp8x.make(mats["gate_proj"], mats["up_proj"], mats["down_proj"])
++        if cached is None:
++            qcache.put(i, new)
+         del mats
+         w.layers.append(Layer(
+             input_norm=get(p + "input_layernorm.weight").float().contiguous(),
+@@ -183,5 +198,9 @@ def load(model_dir: str | Path, device: str = "cuda", *, rank: int = 0, world: i
+     v = full.vocab // world
+     w.head = head[rank * v:(rank + 1) * v].to(torch.bfloat16).contiguous()
+     del head
++    if HEAD == "fp8":
++        from .head import Head8
++
++        w.head = Head8(w.head)
+     f.close()
+     return w
+diff --git a/tests/cuda/test_kolibri1_quant.py b/tests/cuda/test_kolibri1_quant.py
+new file mode 100644
+index 0000000..8f866a8
+--- /dev/null
++++ b/tests/cuda/test_kolibri1_quant.py
+@@ -0,0 +1,81 @@
++"""Kolibri 1's opt-in lower-precision paths: NVFP4 experts (split K), the FP8 head and FP8 full-layer KV caches."""
++
++import os
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++
++D, E, NI = 2560, 16, 256
++
++
++def fp8_mats(n, k):
++    return ((torch.randn(E + 1, n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn),
++            torch.rand(E + 1, n // 128, k // 128, device="cuda") * 0.01 + 0.001)
++
++
++def run_moe(ex, x, router, bias, gate_up_parts, down_parts, monkeypatch):
++    from tensorfold.families.kolibri1.cuda import moe
++
++    monkeypatch.setenv("TF_NVFP4_SPLITK_GATEUP", str(gate_up_parts))
++    monkeypatch.setenv("TF_NVFP4_SPLITK_DOWN", str(down_parts))
++    return moe.run(x, router, bias, ex, 6, partial=True)
++
++
++def test_nvfp4_split_k_matches_unsplit_and_rows_stay_independent(monkeypatch):
++    from tensorfold.families.kolibri1.cuda import quant
++
++    torch.manual_seed(0)
++    ex = quant.make(fp8_mats(NI, D), fp8_mats(NI, D), fp8_mats(D, NI))
++    router = (torch.randn(E, D, device="cuda") * 0.02).to(torch.bfloat16)
++    bias = torch.zeros(E, device="cuda")
++    x = torch.randn(9, D, device="cuda").to(torch.bfloat16)
++    whole = run_moe(ex, x, router, bias, 1, 1, monkeypatch)
++    split = run_moe(ex, x, router, bias, 8, 2, monkeypatch)
++    assert ((split - whole).norm() / whole.norm()).item() < 1e-5            # a regrouped fp32 sum, no more
++    for r in (0, 4, 8):                                                     # a row's bits never depend on the batch
++        assert torch.equal(run_moe(ex, x[r:r + 1].contiguous(), router, bias, 8, 2, monkeypatch), split[r:r + 1])
++
++
++def test_nvfp4_requantisation_error_is_bounded():
++    from tensorfold.cuda.fp8 import experts as fp8x
++    from tensorfold.cuda.nvfp4 import experts as nvx
++    from tensorfold.families.kolibri1.cuda import quant
++
++    torch.manual_seed(1)
++    w, s = fp8_mats(NI, D)
++    ref = fp8x.dense(w[:2], s[:2])
++    q = quant.from_fp8(w[:2], s[:2])
++    ex = nvx.make(q, q, q)
++    got = torch.stack([nvx.dense(ex, i, "gate") for i in range(2)])
++    assert ((got - ref).norm() / ref.norm()).item() < 0.10                 # 4-bit on Gaussian weights: ~8.8%
++
++
++def test_fp8_head_is_close_and_row_independent():
++    from tensorfold.cuda import moe as shared
++    from tensorfold.families.kolibri1.cuda.head import Head8
++
++    torch.manual_seed(2)
++    w = (torch.randn(4096, D, device="cuda") * 0.02).to(torch.bfloat16)
++    h = Head8(w)
++    x = torch.randn(5, D, device="cuda").to(torch.bfloat16)
++    want, got = shared.router(x, w), h(x)
++    assert ((got - want).norm() / want.norm()).item() < 0.03
++    assert torch.equal(h(x[2:3].contiguous()), got[2:3])
++
++
++def test_fp8_kv_tree_attention_equals_bf16_on_the_same_values():
++    from tensorfold.families.kolibri1.cuda import attention
++
++    torch.manual_seed(3)
++    hk, h, d, ctx = 2, 24, 128, 700
++    k8 = (torch.randn(ctx, hk, d, device="cuda")).to(torch.float8_e4m3fn)
++    v8 = (torch.randn(ctx, hk, d, device="cuda")).to(torch.float8_e4m3fn)
++    kb, vb = k8.to(torch.bfloat16), v8.to(torch.bfloat16)
++    q = torch.randn(3, h, d, device="cuda").to(torch.bfloat16)
++    kn = torch.randn(3, hk, d, device="cuda").to(torch.bfloat16)
++    vn = torch.randn(3, hk, d, device="cuda").to(torch.bfloat16)
++    a8 = attention.full_rows(q, kn, vn, [(k8, v8)], [(3, 650)], scale=d ** -0.5)
++    ab = attention.full_rows(q, kn, vn, [(kb, vb)], [(3, 650)], scale=d ** -0.5)
++    assert torch.equal(a8, ab)
+diff --git a/tools/kolibri_kl.py b/tools/kolibri_kl.py
+index a4bf5f7..099bc8d 100644
+--- a/tools/kolibri_kl.py
++++ b/tools/kolibri_kl.py
+@@ -60,6 +60,10 @@ def ref(model_dir, out):
+ 
+ 
+ def engine(model_dir, ref_path, tp, rank, master):
++    if os.environ.get("KL_PREFILL_FP8"):                 # --prefill-fp8's numerics for the prompt projections
++        from tensorfold.cuda import prompt_precision
++
++        prompt_precision.set_fp8(True)
+     from tensorfold.families.kolibri1.cuda.forward import Chain, Model
+     from tensorfold.families.kolibri1.cuda.weights import load
+ 
+diff --git a/tools/kolibri_kv_stats.py b/tools/kolibri_kv_stats.py
+new file mode 100644
+index 0000000..eb7ece9
+--- /dev/null
++++ b/tools/kolibri_kv_stats.py
+@@ -0,0 +1,29 @@
++"""Full-attention layers' cached K and V magnitudes on real text: what an e4m3 cache (scale 1) would keep."""
++
++import sys
++
++import torch
++
++sys.path.insert(0, "tools")
++from kolibri_nll import corpus  # noqa: E402
++
++from tensorfold.families.kolibri1.cuda.forward import Chain, Model  # noqa: E402
++from tensorfold.families.kolibri1.cuda.weights import load  # noqa: E402
++
++model_dir, folder = sys.argv[1:3]
++torch.cuda.set_device(0)
++m = Model(load(model_dir), 4200, slots=1)
++docs = dict(corpus(model_dir, folder))
++for name in ("agent_gpt2-codegolf", "de_Photosynthese"):
++    ids = docs[name][:2048]
++    m.forward([Chain(0, 0, ids)], prompt=True)
++    print(name)
++    for i, full in enumerate(m.cfg.full):
++        if not full:
++            continue
++        for kind, t in (("k", m.k[i][0, :len(ids)]), ("v", m.k[i][0, :len(ids)] if False else m.v[i][0, :len(ids)])):
++            a = t.float().abs()
++            q = (t.to(torch.float8_e4m3fn).float() - t.float()).norm() / t.float().norm()
++            print(f"  layer {i:2d} {kind}: amax {a.max():8.3f}  median {a.median():.4f}  "
++                  f"<2^-6 {(a < 2 ** -6).float().mean():.3f}  e4m3 rel err {q:.4f}  per-head amax "
++                  f"{[round(x, 2) for x in a.amax(dim=(0, 2)).tolist()]}")
+diff --git a/tools/kolibri_moe_fp4_bench.py b/tools/kolibri_moe_fp4_bench.py
+new file mode 100644
+index 0000000..2bf677e
+--- /dev/null
++++ b/tools/kolibri_moe_fp4_bench.py
+@@ -0,0 +1,70 @@
++"""moe.run, FP8 vs NVFP4 (all three matrices) vs mixed (NVFP4 gate/up, FP8 down): decode rows and prompt chunks.
++
++  NI=512 (one Spark) or NI=256 (a TP=2 rank's share) python3 tools/kolibri_moe_fp4_bench.py
++Graph-replayed decode over 16 rotated layers so weights miss L2; prompt chunks timed eagerly.
++"""
++
++import os
++
++import torch
++
++from tensorfold.cuda.fp8 import experts as fp8x
++from tensorfold.families.kolibri1.cuda import moe, quant
++
++torch.manual_seed(0)
++D, E, COPIES, REPS = 2560, 384, 16, 100
++NI = int(os.environ.get("NI", "512"))
++PART = NI < 512
++
++
++def mats(n, k):
++    return ((torch.randn(E + 1, n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn),
++            torch.rand(E + 1, n // 128, k // 128, device="cuda") * 0.01 + 0.001)
++
++
++kinds = {"fp8": [], "nvfp4": [], "mixed": []}
++for _ in range(COPIES):
++    g, u, d = mats(NI, D), mats(NI, D), mats(D, NI)
++    kinds["fp8"].append(fp8x.make(g, u, d))
++    kinds["nvfp4"].append(quant.make(g, u, d))
++    kinds["mixed"].append(quant.make_mixed(g, u, d))
++routers = [(torch.randn(E, D, device="cuda") * 0.02).to(torch.bfloat16) for _ in range(COPIES)]
++bias = torch.zeros(E, device="cuda")
++
++
++def timed(fn):
++    fn(0)
++    torch.cuda.synchronize()
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        for i in range(REPS):
++            fn(i % COPIES)
++    g.replay()
++    torch.cuda.synchronize()
++    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++    a.record()
++    for _ in range(5):
++        g.replay()
++    b.record()
++    torch.cuda.synchronize()
++    return a.elapsed_time(b) * 1000 / (5 * REPS)
++
++
++for rows in (1, 4, 16):
++    x = torch.randn(rows, D, device="cuda").to(torch.bfloat16)
++    t = {k: timed(lambda i, v=v: moe.run(x, routers[i], bias, v[i], 6, partial=PART)) for k, v in kinds.items()}
++    print(f"NI {NI} decode rows {rows:>2}: " + "  ".join(f"{k} {us:6.1f} us" for k, us in t.items()), flush=True)
++for rows in (2048, 8192):
++    x = torch.randn(rows, D, device="cuda").to(torch.bfloat16)
++    res = []
++    for k, v in kinds.items():
++        moe.run(x, routers[0], bias, v[0], 6, prefill=True, partial=PART)
++        torch.cuda.synchronize()
++        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++        a.record()
++        for _ in range(3):
++            moe.run(x, routers[0], bias, v[0], 6, prefill=True, partial=PART)
++        b.record()
++        torch.cuda.synchronize()
++        res.append(f"{k} {a.elapsed_time(b) / 3:6.2f} ms")
++    print(f"NI {NI} prompt {rows}: " + "  ".join(res), flush=True)
+diff --git a/tools/kolibri_nll.py b/tools/kolibri_nll.py
+new file mode 100644
+index 0000000..c5f806a
+--- /dev/null
++++ b/tools/kolibri_nll.py
+@@ -0,0 +1,104 @@
++"""Bigger quality gate: teacher-forced NLL and top-32 KL against the as-shipped engine, on a corpus of real text.
++
++  ref:  python3 tools/kolibri_nll.py ref  MODEL CORPUS_DIR OUT.pt      (as shipped: default env)
++  eval: python3 tools/kolibri_nll.py eval MODEL CORPUS_DIR REF.pt      (any TF_KOLIBRI_* config, one rank)
++
++Each *.txt in CORPUS_DIR is tokenized and cut to TOKENS tokens, then run as a prompt in CHUNK-row chunks with every
++row's logits kept. The reference keeps each row's top-K log-probabilities; eval reports perplexity per file group
++(the file name's prefix before '_'), the change in mean NLL, top-1 agreement and KL(ref || eval) over the reference's
++top-K tokens plus one bucket for the rest of the mass.
++"""
++
++import os
++import sys
++from collections import defaultdict
++from pathlib import Path
++
++import torch
++
++TOKENS, CHUNK, K = 4096, 2048, 32
++
++
++def corpus(model_dir, folder):
++    from transformers import AutoTokenizer
++
++    tok = AutoTokenizer.from_pretrained(model_dir)
++    out = []
++    for f in sorted(Path(folder).glob("*.txt")):
++        ids = tok(f.read_text(), add_special_tokens=False)["input_ids"][:TOKENS]
++        out.append((f.stem, ids))
++    return out
++
++
++def run(model_dir, docs):
++    from tensorfold.families.kolibri1.cuda.forward import Chain, Model
++    from tensorfold.families.kolibri1.cuda.weights import load
++
++    torch.cuda.set_device(0)
++    if os.environ.get("KL_PREFILL_FP8"):                 # --prefill-fp8's numerics for the prompt projections
++        from tensorfold.cuda import prompt_precision
++
++        prompt_precision.set_fp8(True)
++    m = Model(load(model_dir), TOKENS + 64, slots=1)
++    decode = os.environ.get("NLL_PATH") == "decode"         # teacher-forced 32-row decode windows (draft-style)
++    step = 32 if decode else CHUNK
++    for name, ids in docs:
++        rows = []
++        for a in range(0, len(ids), step):
++            part = ids[a:a + step]
++            logits = m.forward([Chain(0, a, part)], prompt=not decode, rows=range(len(part)))
++            rows.append(torch.log_softmax(logits.float(), -1))
++        yield name, ids, torch.cat(rows)
++
++
++def ref(model_dir, folder, out):
++    docs = corpus(model_dir, folder)
++    saved = {}
++    for name, ids, lp in run(model_dir, docs):
++        tgt = torch.tensor(ids[1:], device=lp.device)
++        top = lp[:-1].topk(K, -1)
++        saved[name] = {"ids": ids, "nll": -lp[:-1].gather(1, tgt[:, None])[:, 0].cpu(),
++                       "top_lp": top.values.cpu(), "top_ix": top.indices.int().cpu()}
++        print(f"{name}: {len(ids)} tokens, ppl {saved[name]['nll'].mean().exp():.3f}", flush=True)
++    torch.save(saved, out)
++
++
++def evaluate(model_dir, folder, ref_path):
++    want = torch.load(ref_path)
++    docs = [(n, want[n]["ids"]) for n in sorted(want)]
++    group = defaultdict(lambda: {"n0": [], "n1": [], "kl": [], "top": []})
++    for name, ids, lp in run(model_dir, docs):
++        r = want[name]
++        tgt = torch.tensor(ids[1:], device=lp.device)
++        nll = -lp[:-1].gather(1, tgt[:, None])[:, 0].cpu()
++        p_lp, ix = r["top_lp"].to(lp.device), r["top_ix"].to(lp.device).long()
++        q_lp = lp[:-1].gather(1, ix)
++        p_rest = (1 - p_lp.exp().sum(-1)).clamp_min(1e-12)
++        q_rest = (1 - q_lp.exp().sum(-1)).clamp_min(1e-12)
++        kl = (p_lp.exp() * (p_lp - q_lp)).sum(-1) + p_rest * (p_rest.log() - q_rest.log())
++        g = group[name.split("_")[0]]
++        if os.environ.get("NLL_DUMP"):
++            big = (kl > 1.0).nonzero()[:, 0].tolist()
++            print(f"{name}: {len(big)} rows KL>1, first at {big[:12]}, chunk-2 share "
++                  f"{sum(b >= CHUNK for b in big) / max(1, len(big)):.2f}", flush=True)
++        g["n0"].append(r["nll"])
++        g["n1"].append(nll)
++        g["kl"].append(kl.cpu())
++        g["top"].append((lp[:-1].argmax(-1) == ix[:, 0]).float().cpu())
++    tot = {k: [] for k in ("n0", "n1", "kl", "top")}
++    for name, g in sorted(group.items()) + [("ALL", tot)]:
++        if name != "ALL":
++            for k in tot:
++                tot[k] += g[k]
++        n0, n1, kl, top = (torch.cat(g[k]) for k in ("n0", "n1", "kl", "top"))
++        print(f"{name:<6} tokens {len(n0):6d}  ppl {n0.mean().exp():7.3f} -> {n1.mean().exp():7.3f} "
++              f"({(n1.mean() - n0.mean()).exp() * 100 - 100:+.2f}%)  KL mean {kl.mean():.4f} p99 {kl.quantile(0.99):.3f}"
++              f"  top1 {top.mean():.4f}", flush=True)
++
++
++if __name__ == "__main__":
++    mode, model, folder, path = sys.argv[1:5]
++    if mode == "ref":
++        ref(model, folder, path)
++    else:
++        evaluate(model, folder, path)
+-- 
+2.53.0
+

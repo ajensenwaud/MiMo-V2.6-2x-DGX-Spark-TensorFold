@@ -1,0 +1,36 @@
+From a6406750204715778b5ba00067c56bf8205ba908 Mon Sep 17 00:00:00 2001
+From: aj <aj@local>
+Date: Tue, 6 Oct 2026 14:14:14 +1100
+Subject: [PATCH 17/23] tools(kolibri_kl): texts of 64+ tokens
+
+---
+ tools/kolibri_kl.py | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/tools/kolibri_kl.py b/tools/kolibri_kl.py
+index b1fd425..23c24c1 100644
+--- a/tools/kolibri_kl.py
++++ b/tools/kolibri_kl.py
+@@ -16,7 +16,8 @@ import torch
+ TEXTS = [
+     "Die Hauptstadt von Frankreich ist Paris. Sie liegt an der Seine und ist seit dem Mittelalter das politische und "
+     "kulturelle Zentrum des Landes. Zu den bekanntesten Sehenswürdigkeiten gehören der Eiffelturm, der Louvre und "
+-    "die Kathedrale Notre-Dame, die nach dem Brand im Jahr 2019 aufwendig restauriert wurde.",
++    "die Kathedrale Notre-Dame, die nach dem Brand im Jahr 2019 aufwendig restauriert wurde. Jedes Jahr besuchen "
++    "Millionen Touristen aus aller Welt die Stadt, um ihre Museen, Cafés und Parks zu erleben.",
+     "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number iteratively.\"\"\"\n    a, b = 0, 1\n    for _ in range(n):\n"
+     "        a, b = b, a + b\n    return a\n\n\nif __name__ == \"__main__\":\n    for i in range(10):\n        print(i, fibonacci(i))\n",
+     "The mitochondrion is a double-membrane-bound organelle found in most eukaryotic organisms. Mitochondria generate "
+@@ -24,7 +25,8 @@ TEXTS = [
+     "first discovered by Albert von Kölliker in 1857 in the voluntary muscles of insects.",
+     "Sehr geehrte Damen und Herren,\n\nhiermit kündige ich meinen Vertrag mit der Kundennummer 4711 fristgerecht zum "
+     "nächstmöglichen Zeitpunkt. Bitte senden Sie mir eine schriftliche Bestätigung der Kündigung unter Angabe des "
+-    "Beendigungszeitpunktes zu.\n\nMit freundlichen Grüßen",
++    "Beendigungszeitpunktes zu. Eine eventuell erteilte Einzugsermächtigung widerrufe ich hiermit ebenfalls zum "
++    "Vertragsende. Für Rückfragen erreichen Sie mich telefonisch oder per E-Mail.\n\nMit freundlichen Grüßen",
+ ]
+ PROMPT, DECODE = 40, 24
+ 
+-- 
+2.53.0
+
