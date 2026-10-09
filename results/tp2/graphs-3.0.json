@@ -1,0 +1,40 @@
+{
+ "prompt": 9000,
+ "cases": {
+  "1 row": {
+   "runs": 32,
+   "equal": 32,
+   "max_abs_diff": 0.0
+  },
+  "8-row window": {
+   "runs": 1,
+   "equal": 1,
+   "max_abs_diff": 0.0
+  },
+  "16-row window": {
+   "runs": 1,
+   "equal": 1,
+   "max_abs_diff": 0.0
+  },
+  "2 streams x 1 row": {
+   "runs": 1,
+   "equal": 1,
+   "max_abs_diff": 0.0
+  },
+  "2 streams x 4 rows": {
+   "runs": 1,
+   "equal": 1,
+   "max_abs_diff": 0.0
+  }
+ },
+ "mismatches": 0,
+ "eager_decode_tok_s": 40.35,
+ "graphs_decode_tok_s": 46.27,
+ "captures": 5,
+ "replays": 164,
+ "eager_fallbacks": 0,
+ "gib_allocated": 60.82,
+ "tp": 2,
+ "context": 32768,
+ "decode_position": 9016
+}
