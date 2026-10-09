@@ -1,0 +1,175 @@
+{
+ "tp": 2,
+ "tokens": 192,
+ "prompts": {
+  "coding": {
+   "prompt_tokens": 62,
+   "serial_tok_s": 34.3,
+   "accepted_mean": 5.06,
+   "accepted_hist": [
+    5,
+    11,
+    19,
+    16,
+    19,
+    13,
+    14,
+    87
+   ],
+   "draft_ms": 8.79,
+   "spec_w3": {
+    "tok_s": 57.0,
+    "tokens_per_step": 2.851,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w4": {
+    "tok_s": 61.33,
+    "tokens_per_step": 3.673,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w6": {
+    "tok_s": 73.6,
+    "tokens_per_step": 4.897,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w8": {
+    "tok_s": 71.15,
+    "tokens_per_step": 5.457,
+    "exact": true,
+    "first_divergence": null
+   },
+   "text": "```python\nimport re\nfrom datetime import timedelta\n\n\ndef parse_iso8601_duration(duration: str) -> timedelta:\n    \"\"\"Parse an ISO-8601 duration string into a datetime.timedelta.\n\n    Supports weeks, days, hours, minutes, and seconds. Raises ValueError\n    if the string contains"
+  },
+  "prose": {
+   "prompt_tokens": 42,
+   "serial_tok_s": 40.27,
+   "accepted_mean": 1.207,
+   "accepted_hist": [
+    66,
+    58,
+    32,
+    17,
+    7,
+    3,
+    1,
+    0
+   ],
+   "draft_ms": 7.05,
+   "spec_w3": {
+    "tok_s": 41.56,
+    "tokens_per_step": 1.929,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w4": {
+    "tok_s": 38.95,
+    "tokens_per_step": 2.054,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w6": {
+    "tok_s": 30.75,
+    "tokens_per_step": 2.146,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w8": {
+    "tok_s": 30.59,
+    "tokens_per_step": 2.146,
+    "exact": true,
+    "first_divergence": null
+   },
+   "text": "The salt spray tasted of iron and old regrets. Elara wiped her hands on her trousers, the familiar grit of the lighthouse stone catching under her fingernails. She was checking the base of the tower when she saw it: a dark green bottle wedged between the rocks, bobbing rhythmically with the tide"
+  },
+  "reasoning": {
+   "prompt_tokens": 82,
+   "serial_tok_s": 40.24,
+   "accepted_mean": 3.342,
+   "accepted_hist": [
+    22,
+    28,
+    25,
+    26,
+    22,
+    20,
+    16,
+    25
+   ],
+   "draft_ms": 7.03,
+   "spec_w3": {
+    "tok_s": 52.77,
+    "tokens_per_step": 2.481,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w4": {
+    "tok_s": 56.85,
+    "tokens_per_step": 3.032,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w6": {
+    "tok_s": 57.04,
+    "tokens_per_step": 3.673,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w8": {
+    "tok_s": 52.29,
+    "tokens_per_step": 3.898,
+    "exact": true,
+    "first_divergence": null
+   },
+   "text": "Here is the step-by-step reasoning to solve the problem:\n\n**Step 1: Calculate the distance covered by the first train before the second train departs.**\nThe first train (Train A) leaves at 9:00, but the second train (Train B) does not leave until 10:"
+  },
+  "code_edit": {
+   "prompt_tokens": 152,
+   "serial_tok_s": 40.23,
+   "accepted_mean": 4.913,
+   "accepted_hist": [
+    17,
+    17,
+    14,
+    14,
+    6,
+    7,
+    5,
+    104
+   ],
+   "draft_ms": 7.03,
+   "spec_w3": {
+    "tok_s": 55.76,
+    "tokens_per_step": 2.653,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w4": {
+    "tok_s": 61.16,
+    "tokens_per_step": 3.293,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w6": {
+    "tok_s": 66.69,
+    "tokens_per_step": 4.341,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w8": {
+    "tok_s": 65.95,
+    "tokens_per_step": 4.897,
+    "exact": true,
+    "first_divergence": null
+   },
+   "text": "```python\ndef tally(words):\n    \"\"\"Return a dictionary mapping each word to its frequency.\"\"\"\n    count = {}\n    for w in words:\n        count[w] = count.get(w, 0) + 1\n    return count\n\n\ndef top(words, n):\n    \"\"\"Return the n most frequent words as"
+  }
+ },
+ "graphs": {
+  "captures": 5,
+  "replays": 2517,
+  "eager": 0
+ }
+}
