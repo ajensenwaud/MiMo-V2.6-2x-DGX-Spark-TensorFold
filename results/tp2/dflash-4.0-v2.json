@@ -1,0 +1,199 @@
+{
+ "tp": 2,
+ "tokens": 192,
+ "prompts": {
+  "coding": {
+   "prompt_tokens": 62,
+   "serial_tok_s": 40.53,
+   "accepted_mean": 5.06,
+   "accepted_hist": [
+    5,
+    11,
+    19,
+    16,
+    19,
+    13,
+    14,
+    87
+   ],
+   "draft_ms": 6.05,
+   "spec_w3": {
+    "tok_s": 61.4,
+    "tokens_per_step": 2.851,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w4": {
+    "tok_s": 69.45,
+    "tokens_per_step": 3.673,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w5": {
+    "tok_s": 75.63,
+    "tokens_per_step": 4.442,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w6": {
+    "tok_s": 77.81,
+    "tokens_per_step": 4.897,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w8": {
+    "tok_s": 74.45,
+    "tokens_per_step": 5.457,
+    "exact": true,
+    "first_divergence": null
+   },
+   "text": "```python\nimport re\nfrom datetime import timedelta\n\n\ndef parse_iso8601_duration(duration: str) -> timedelta:\n    \"\"\"Parse an ISO-8601 duration string into a datetime.timedelta.\n\n    Supports weeks, days, hours, minutes, and seconds. Raises ValueError\n    if the string contains"
+  },
+  "prose": {
+   "prompt_tokens": 42,
+   "serial_tok_s": 40.58,
+   "accepted_mean": 1.207,
+   "accepted_hist": [
+    66,
+    58,
+    32,
+    17,
+    7,
+    3,
+    1,
+    0
+   ],
+   "draft_ms": 6.42,
+   "spec_w3": {
+    "tok_s": 42.32,
+    "tokens_per_step": 1.929,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w4": {
+    "tok_s": 37.54,
+    "tokens_per_step": 2.054,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w5": {
+    "tok_s": 36.7,
+    "tokens_per_step": 2.122,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w6": {
+    "tok_s": 34.68,
+    "tokens_per_step": 2.146,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w8": {
+    "tok_s": 31.06,
+    "tokens_per_step": 2.146,
+    "exact": true,
+    "first_divergence": null
+   },
+   "text": "The salt spray tasted of iron and old regrets. Elara wiped her hands on her trousers, the familiar grit of the lighthouse stone catching under her fingernails. She was checking the base of the tower when she saw it: a dark green bottle wedged between the rocks, bobbing rhythmically with the tide"
+  },
+  "reasoning": {
+   "prompt_tokens": 82,
+   "serial_tok_s": 40.29,
+   "accepted_mean": 3.342,
+   "accepted_hist": [
+    22,
+    28,
+    25,
+    26,
+    22,
+    20,
+    16,
+    25
+   ],
+   "draft_ms": 6.07,
+   "spec_w3": {
+    "tok_s": 53.98,
+    "tokens_per_step": 2.481,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w4": {
+    "tok_s": 58.18,
+    "tokens_per_step": 3.032,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w5": {
+    "tok_s": 59.67,
+    "tokens_per_step": 3.473,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w6": {
+    "tok_s": 57.64,
+    "tokens_per_step": 3.673,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w8": {
+    "tok_s": 53.02,
+    "tokens_per_step": 3.898,
+    "exact": true,
+    "first_divergence": null
+   },
+   "text": "Here is the step-by-step reasoning to solve the problem:\n\n**Step 1: Calculate the distance covered by the first train before the second train departs.**\nThe first train (Train A) leaves at 9:00, but the second train (Train B) does not leave until 10:"
+  },
+  "code_edit": {
+   "prompt_tokens": 152,
+   "serial_tok_s": 40.14,
+   "accepted_mean": 4.913,
+   "accepted_hist": [
+    17,
+    17,
+    14,
+    14,
+    6,
+    7,
+    5,
+    104
+   ],
+   "draft_ms": 6.05,
+   "spec_w3": {
+    "tok_s": 56.7,
+    "tokens_per_step": 2.653,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w4": {
+    "tok_s": 62.42,
+    "tokens_per_step": 3.293,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w5": {
+    "tok_s": 61.72,
+    "tokens_per_step": 3.604,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w6": {
+    "tok_s": 67.82,
+    "tokens_per_step": 4.341,
+    "exact": true,
+    "first_divergence": null
+   },
+   "spec_w8": {
+    "tok_s": 66.97,
+    "tokens_per_step": 4.897,
+    "exact": true,
+    "first_divergence": null
+   },
+   "text": "```python\ndef tally(words):\n    \"\"\"Return a dictionary mapping each word to its frequency.\"\"\"\n    count = {}\n    for w in words:\n        count[w] = count.get(w, 0) + 1\n    return count\n\n\ndef top(words, n):\n    \"\"\"Return the n most frequent words as"
+  }
+ },
+ "graphs": {
+  "captures": 6,
+  "replays": 2770,
+  "eager": 0
+ }
+}

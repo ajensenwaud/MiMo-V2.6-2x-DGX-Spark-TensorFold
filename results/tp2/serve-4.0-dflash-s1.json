@@ -1,0 +1,71 @@
+{
+ "streams": 1,
+ "tasks": {
+  "coding": {
+   "decode_tps_median": 71.8,
+   "aggregate_tps_median": 68.6,
+   "completion_tokens": 433,
+   "replies_identical": true,
+   "server": {
+    "rounds": 92,
+    "drafts": true,
+    "cached": 61,
+    "min_rows": 3,
+    "drafted": 473,
+    "accepted": 340,
+    "token_sha": "3bbdb384d2cf"
+   }
+  },
+  "prose": {
+   "decode_tps_median": 40.1,
+   "aggregate_tps_median": 39.1,
+   "completion_tokens": 340,
+   "replies_identical": true,
+   "server": {
+    "rounds": 270,
+    "drafts": true,
+    "cached": 41,
+    "min_rows": 1,
+    "drafted": 157,
+    "accepted": 69,
+    "token_sha": "8fc4855867e5"
+   }
+  },
+  "reasoning": {
+   "decode_tps_median": 63.2,
+   "aggregate_tps_median": 62.6,
+   "completion_tokens": 512,
+   "replies_identical": true,
+   "server": {
+    "rounds": 151,
+    "drafts": true,
+    "cached": 81,
+    "min_rows": 1,
+    "drafted": 529,
+    "accepted": 360,
+    "token_sha": "db1a3bb174f9"
+   }
+  },
+  "code_edit": {
+   "decode_tps_median": 71.0,
+   "aggregate_tps_median": 64.3,
+   "completion_tokens": 167,
+   "replies_identical": true,
+   "server": {
+    "rounds": 36,
+    "drafts": true,
+    "cached": 151,
+    "min_rows": 3,
+    "drafted": 173,
+    "accepted": 130,
+    "token_sha": "a886181ed814"
+   }
+  }
+ },
+ "texts": {
+  "coding": "```python\nimport re\nfrom datetime import timedelta\n\n\ndef parse_iso8601_duration(duration: str) -> timedelta:\n    \"\"\"Parse an ISO-8601 duration string into a datetime.timedelta.\n\n    Supports weeks, days, hours, minutes, and seconds. Raises ValueError\n    if the string contains years or months, or if it is malformed.\n    \"\"\"\n    pattern = re.compile(\n        r\"^P(?:(?P<weeks>\\d+)W)?\"\n        r\"(?:(?P<days>\\d+)D)?\"\n        r\"(?:T(?:(?P<hours>\\d+)H)?\"\n        r\"(?:(?P<minutes>\\d+)M)?\"\n        r\"(?:(?P<seconds>\\d+)S)?)?$\"\n    )\n    match = pattern.match(duration)\n    if not match:\n        raise ValueError(f\"Invalid ISO-8601 duration: {duration!r}\")\n\n    # Reject years and months explicitly\n    if re.search(r\"\\d+[YM]\", duration):\n        raise ValueError(\n            f\"Years and months are not supported: {duration!r}\"\n        )\n\n    parts = {k: int(v) for k, v in match.groupdict().items() if v is not None}\n    return timedelta(**parts)\n```\n\n```python\n# test_parse_iso8601_duration.py\nimport pytest\nfrom datetime import timedelta\nfrom parse_iso8601_duration import parse_iso8601_duration\n\n\ndef test_basic_duration():\n    assert parse_iso8601_duration(\"P3DT4H5M\") == timedelta(\n        days=3, hours=4, minutes=5\n    )\n\n\ndef test_weeks_and_seconds():\n    assert parse_iso8601_duration(\"P2W1DT6H30S\") == timedelta(\n        weeks=2, days=1, hours=6, seconds=30\n    )\n\n\ndef test_years_and_months_raise():\n    with pytest.raises(ValueError):\n        parse_iso8601_duration(\"P1Y2M3D\")\n```",
+  "prose": "The salt spray tasted of iron and old regrets. Elara wiped her hands on her trousers, the familiar grit of the lighthouse stone catching under her fingernails. She was checking the base of the tower when she saw it: a dark green bottle wedged between the rocks, bobbing rhythmically with the tide.\n\nShe pried it free. The cork was rotted, but the paper inside was miraculously dry, rolled tight and sealed with wax. Elara unrolled it on the flat surface of the lantern room table.\n\nThe ink was faded, but the script was sharp. It was a list of coordinates and a date\u2014tomorrow\u2019s date.\n\nElara frowned. The handwriting was elegant, slanted to the right, with a distinctive loop on the letter \u2018g\u2019. It was her own.\n\nShe read the words aloud, her voice trembling. *\u201cDon\u2019t light the lamp tonight. The ship you see is a ghost. It will crash if you guide it in.\u201d*\n\nA chill deeper than the Atlantic wind crawled up her spine. She looked out the glass. A heavy fog was rolling in, thick and suffocating. In the distance, the low, mournful horn of a freighter echoed.\n\nElara looked back at the paper. The ink seemed to bleed, the letters rearranging themselves. She realized then that the message wasn't from a past version of herself, but a future one. She was the ghost, trapped in the loop of the lighthouse, trying to save the ship that had killed her years ago.\n\nShe reached for the switch to the lamp, her hand hovering over the cold metal. The choice was hers, again.",
+  "reasoning": "Here is the step-by-step reasoning to solve the problem:\n\n**Step 1: Calculate the distance covered by the first train before the second train departs.**\nThe first train (Train A) leaves at 9:00, but the second train (Train B) does not leave until 10:00. We need to find out how far Train A travels during this one-hour gap.\n*   Speed of Train A: $80 \\text{ km/h}$\n*   Time elapsed: $1 \\text{ hour}$\n*   Distance covered: $80 \\text{ km/h} \\times 1 \\text{ h} = 80 \\text{ km}$\n\n**Step 2: Determine the remaining distance between the trains at 10:00.**\nAt 10:00, Train A has traveled 80 km from City A. The total distance between the cities is 360 km.\n*   Remaining distance: $360 \\text{ km} - 80 \\text{ km} = 280 \\text{ km}$\n\n**Step 3: Calculate the combined speed of the two trains.**\nFrom 10:00 onwards, both trains are moving towards each other. To find how fast they are closing the gap, we add their speeds together.\n*   Speed of Train A: $80 \\text{ km/h}$\n*   Speed of Train B: $100 \\text{ km/h}$\n*   Combined speed: $80 + 100 = 180 \\text{ km/h}$\n\n**Step 4: Calculate the time it takes for them to meet after 10:00.**\nWe use the formula: $\\text{Time} = \\frac{\\text{Distance}}{\\text{Speed}}$.\n*   Distance to cover: $280 \\text{ km}$\n*   Combined speed: $180 \\text{ km/h}$\n*   Time: $\\frac{280}{180} \\text{ hours} = \\frac{14}{9} \\text{ hours}$\n\nTo convert $\\frac{14}{9}$ hours into hours and minutes:\n*   $14 \\div 9 = 1$ with a remainder of $5$.\n*   So, it is $1 \\text{ hour}$ and $\\frac{5",
+  "code_edit": "```python\ndef tally(words):\n    \"\"\"Return a dictionary mapping each word to its frequency.\"\"\"\n    count = {}\n    for w in words:\n        count[w] = count.get(w, 0) + 1\n    return count\n\n\ndef top(words, n):\n    \"\"\"Return the n most frequent words as (word, frequency) pairs, sorted by frequency descending then alphabetically.\"\"\"\n    count = tally(words)\n    items = sorted(count.items(), key=lambda kv: (-kv[1], kv[0]))\n    return items[:n]\n\n\ndef merge(a, b):\n    \"\"\"Merge two frequency dictionaries by summing counts for shared keys.\"\"\"\n    count = dict(a)\n    for k, v in b.items():\n        count[k] = count.get(k, 0) + v\n    return count\n```"
+ }
+}

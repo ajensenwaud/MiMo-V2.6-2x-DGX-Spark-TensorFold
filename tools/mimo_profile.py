@@ -48,6 +48,8 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--json")
     ap.add_argument("--widths", default="", help="timing only: comma-separated window widths (e.g. 1,2,4,8,16)")
+    ap.add_argument("--grid", default="", help="timing only: STREAMS:WIDTHS, e.g. 1,2,4:1,2,3,4,6,8 (a different text "
+                                               "a stream)")
     a = ap.parse_args()
 
     from safetensors import safe_open
@@ -68,7 +70,7 @@ def main() -> None:
             from tensorfold.cuda.roce import RoceComm
 
             comm = RoceComm(comm, a.rank, 2)
-    model = Model(load(a.model, rank=a.rank, world=a.tp), 32768, 1, comm=comm)
+    model = Model(load(a.model, rank=a.rank, world=a.tp), 32768, 4 if a.grid else 1, comm=comm)
     if comm is not None:
         comm.barrier()
         if hasattr(comm, "settle"):
@@ -76,6 +78,33 @@ def main() -> None:
     ref = safe_open(a.ref, framework="pt")
     pool = [t for k in sorted(ref.keys()) if k.endswith(".ids") for t in ref.get_tensor(k).tolist()]
     prompt = (pool * (a.prompt // len(pool) + 1))[:a.prompt]
+    if a.grid:                                             # cost of S streams x w rows, each stream its own text
+        texts = [ref.get_tensor(k).tolist() for k in sorted(ref.keys()) if k.endswith(".ids")]
+        texts = [(t * (a.prompt // len(t) + 1))[:a.prompt] for t in texts]
+        for s, t in enumerate(texts[:4]):
+            model.prefill(t, slot=s)
+        graphs = Graphs(model)
+        ss, ws = a.grid.split(":")
+        grid, p = {}, a.prompt
+        for S in [int(x) for x in ss.split(",")]:
+            for w in [int(x) for x in ws.split(",")]:
+                chains = [Chain(s, p, texts[s][300 + 37 * s:300 + 37 * s + w]) for s in range(S)]
+                for _ in range(3):
+                    graphs.forward(chains)
+                torch.cuda.synchronize()
+                t = time.perf_counter()
+                for _ in range(a.steps):
+                    graphs.forward(chains)
+                torch.cuda.synchronize()
+                grid[f"{S}x{w}"] = round((time.perf_counter() - t) / a.steps * 1e3, 3)
+        base = grid.get("1x1")
+        report = {"tp": a.tp, "position": p, "grid_ms": grid,
+                  "grid_cost_vs_1": {k: round(v / base, 3) for k, v in grid.items()} if base else None}
+        say(f"[profile] {json.dumps(report)}")
+        if a.json and a.rank == 0:
+            with open(a.json, "w") as f:
+                json.dump(report, f, indent=1)
+        return
     model.prefill(prompt)
     graphs = Graphs(model)
     p = len(prompt)
