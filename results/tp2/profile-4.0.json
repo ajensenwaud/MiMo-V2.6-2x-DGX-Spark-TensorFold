@@ -1,0 +1,70 @@
+{
+ "tp": 2,
+ "position": 9000,
+ "1_rows": {
+  "wall_ms": 24.488,
+  "kernel_ms": 25.43,
+  "idle_ms": -0.942,
+  "kernels_per_step": 1207,
+  "by_category_ms": {
+   "other": 10.769,
+   "experts": 10.609,
+   "comm": 2.0,
+   "attention": 0.919,
+   "router/topk": 0.7,
+   "norm/add/act": 0.247,
+   "copies/misc": 0.106,
+   "qkv/rope": 0.081
+  },
+  "top_kernels_ms": {
+   "void tf_exl3x::grouped_kernel<2, 8, 4, 1, 8, 8>(__half const*, __half const*, long const*,": 10.609,
+   "void (anonymous namespace)::linear_kernel<12, 2, 4>(__half const*, unsigned int const*, lo": 8.309,
+   "(anonymous namespace)::gather_kernel(uint4 const*, uint4*, int, unsigned int, int, char*, ": 2.0,
+   "void (anonymous namespace)::linear_kernel<16, 2, 8>(__half const*, unsigned int const*, lo": 1.259,
+   "_rows": 0.744,
+   "_router": 0.529,
+   "(anonymous namespace)::rot_in_kernel(void const*, int, __half const*, __half*, int)": 0.275,
+   "_add_rms": 0.244,
+   "void (anonymous namespace)::linear_kernel<10, 2, 8>(__half const*, unsigned int const*, lo": 0.223,
+   "(anonymous namespace)::gateup_epilogue_kernel(float const*, int const*, __half const*, __h": 0.183,
+   "_merge": 0.175,
+   "_topk": 0.171,
+   "(anonymous namespace)::group_kernel(int const*, int*, int*, int*, int, int, int, int)": 0.166,
+   "(anonymous namespace)::down_combine_kernel(float const*, int const*, __half const*, float*": 0.142,
+   "void (anonymous namespace)::rot_in_kernel<__half>(__half const*, int, int const*, __half c": 0.111
+  }
+ },
+ "8_rows": {
+  "wall_ms": 65.117,
+  "kernel_ms": 64.338,
+  "idle_ms": 0.779,
+  "kernels_per_step": 1208,
+  "by_category_ms": {
+   "experts": 46.241,
+   "other": 13.4,
+   "comm": 1.977,
+   "attention": 1.317,
+   "router/topk": 0.842,
+   "norm/add/act": 0.28,
+   "qkv/rope": 0.167,
+   "copies/misc": 0.116
+  },
+  "top_kernels_ms": {
+   "void tf_exl3x::grouped_kernel<2, 8, 4, 1, 8, 8>(__half const*, __half const*, long const*,": 46.241,
+   "void (anonymous namespace)::linear_kernel<12, 2, 4>(__half const*, unsigned int const*, lo": 9.239,
+   "(anonymous namespace)::gather_kernel(uint4 const*, uint4*, int, unsigned int, int, char*, ": 1.81,
+   "void (anonymous namespace)::linear_kernel<16, 2, 8>(__half const*, unsigned int const*, lo": 1.308,
+   "_rows": 1.09,
+   "(anonymous namespace)::group_kernel(int const*, int*, int*, int*, int, int, int, int)": 0.797,
+   "_router": 0.664,
+   "(anonymous namespace)::gateup_epilogue_kernel(float const*, int const*, __half const*, __h": 0.549,
+   "void (anonymous namespace)::rot_in_kernel<__half>(__half const*, int, int const*, __half c": 0.447,
+   "(anonymous namespace)::down_combine_kernel(float const*, int const*, __half const*, float*": 0.428,
+   "_add_rms": 0.276,
+   "(anonymous namespace)::rot_in_kernel(void const*, int, __half const*, __half*, int)": 0.275,
+   "void (anonymous namespace)::linear_kernel<10, 2, 8>(__half const*, unsigned int const*, lo": 0.251,
+   "_merge": 0.226,
+   "_topk": 0.177
+  }
+ }
+}
