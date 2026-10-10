@@ -1,0 +1,3 @@
+{"context": 7327, "completion": 86, "decode_tps_median": 51.8, "prefill_tps_median": 1017.6}
+{"context": 29213, "completion": 220, "decode_tps_median": 48.1, "prefill_tps_median": 1230.8}
+{"context": 58384, "completion": 182, "decode_tps_median": 48.8, "prefill_tps_median": 1173.8}
