@@ -14,7 +14,7 @@ BASELINE_REPO="benthecarman/MiMo-V2.6-Flash-RL-exl3"
 BASELINE_REV="5ae87b830eb950c705967aea6130601a8e1f74a5"
 MODELS_ROOT="${MODELS_ROOT:-$HOME/models/mimo-v2.6}"
 SRC_DIR="${SRC_DIR:-$MODELS_ROOT/MiMo-V2.6-Flash-RL}"
-PACK="${PACK:-2.27}"                         # 2.27 (benthecarman), 3.0 or 4.0 (ours)
+PACK="${PACK:-3.0}"                          # 3.0 (ours, the default: 4.0's measured quality, 14% faster), 4.0, 2.27
 MODEL_DIR="${MODEL_DIR:-$MODELS_ROOT/MiMo-V2.6-Flash-RL-exl3-${PACK}bpw}"   # the same path on both nodes
 SERVED_NAME="${SERVED_NAME:-MiMo-V2.6-Flash}"
 
@@ -38,7 +38,7 @@ PARALLEL="${PARALLEL:-4}"
 TP="${TP:-2}"                                # 1: one Spark (rank 0 only)
 CONTEXT="${CONTEXT:-}"                       # empty: sized from free memory
 MAX_TOKENS="${MAX_TOKENS:-32768}"            # reply cap when a client sends none (thinking needs room)
-DRAFTER="${DRAFTER:-0}"                      # 1: the pack's dflash/ drafter (Gate 6)
+DRAFTER="${DRAFTER:-1}"                      # 1: the pack's DFlash drafter (exact; 1.5-1.8x on code and reasoning)
 
 # --- fabric (both CX7 rails, as the GLM and Kolibri recipes) -----------------------------------------------------
 NCCL_IFNAME="${NCCL_IFNAME:-enp1s0f0np0}"
