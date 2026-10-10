@@ -46,6 +46,8 @@ def parse(task: str, text: str) -> str | None:
     m = re.findall(r"Answer:\s*\(?([A-J])\)?", text)
     if not m:
         m = re.findall(r"\b(?:answer is|answer:)\s*\(?([A-J])\)?", text, re.I)
+    if not m:                                              # e.g. "This corresponds to option **F**."
+        m = re.findall(r"\boption\s*\**\(?([A-J])\)?\**", text, re.I)
     return m[-1].upper() if m else None
 
 
@@ -92,6 +94,9 @@ def main() -> None:
             for line in raw.read_text().splitlines():
                 r = json.loads(line)
                 if "error" not in r:
+                    r["got"] = parse(task, r["text"])         # scores always use the current parser
+                    r["correct"] = r["got"] is not None and (
+                        float(r["got"]) == float(r["gold"]) if task == "gsm8k" else r["got"] == r["gold"])
                     done[r["id"]] = r
         todo = [it for it in items if it["id"] not in done]
         t0 = time.time()
