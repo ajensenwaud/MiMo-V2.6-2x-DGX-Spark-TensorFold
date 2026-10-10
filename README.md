@@ -116,3 +116,13 @@ drafting from the context (no gain on this model).
 `scripts/` serve, quantise, sync, benchmark and evaluate; `tools/` engine-level checks (parity, layers, graphs,
 DFlash, profiles, perplexity); `patches/` the TensorFold changes; `results/` every number above as raw JSON;
 `docs/RECON.md`, `docs/PLAN.md` the facts and plan the work followed.
+
+## Credits and licence
+
+Thanks to Xiaomi MiMo for the model and its DFlash drafter; Ash Hart ([@ashxhart](https://x.com/ashxhart)) for
+[TensorFold](https://github.com/ashhart/TensorFold), the engine this recipe patches; Jürgen Schmied
+([@jschmied](https://github.com/jschmied)) for the Kolibri-1 work the two-rank base builds on; turboderp for
+[exllamav3](https://github.com/turboderp-org/exllamav3); benthecarman for the 2.27 bpw pack, the conversion settings and
+the repaired DFlash drafter; and Mia's AI Lab for the recipe format and base image. Full credits, including the
+evaluation datasets, in [CREDITS.md](CREDITS.md). Apache-2.0, as TensorFold; the model and packs are MIT, as Xiaomi's
+release.

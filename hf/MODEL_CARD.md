@@ -63,6 +63,14 @@ With the recipe (two Sparks): `PACK=3.0 ./start.sh` after `scripts/fetch_pack.sh
 v1.6.0 conversion of the `mimo_v2` architecture; it was evaluated only with the recipe's engine, not with exllamav3
 itself (at 113 GB it does not fit one GB10 with room to run).
 
+## Acknowledgements
+
+Xiaomi MiMo for the model and the DFlash drafter; turboderp for exllamav3, which made these packs; benthecarman for the
+2.27 bpw pack, the conversion settings reused here and the repaired drafter; Ash Hart for TensorFold, the engine the
+packs were evaluated on; Mia's AI Lab for the two-Spark recipe format. Evaluation data: GSM8K (Cobbe et al., MIT),
+MMLU-Pro (TIGER-Lab, MIT), WikiText-2 (Merity et al., CC BY-SA 3.0). Full list in the recipe's
+[CREDITS.md](https://github.com/ajensenwaud/MiMo-V2.6-2x-DGX-Spark-TensorFold/blob/main/CREDITS.md).
+
 ## Licence
 
 MIT, as the source model. The `dflash/` drafter is Xiaomi's, taken unchanged from benthecarman's MIT-licensed pack.
