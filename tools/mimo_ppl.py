@@ -73,7 +73,8 @@ def main() -> None:
     secs = time.perf_counter() - t0
     out = {"model": a.model, "tp": a.tp, "rows": len(rows), "len": a.len,
            "ppl": math.exp(sum(nll_rows) / len(nll_rows)), "nll_rows": nll_rows,
-           "prefill_tok_s": round(len(rows) * a.len / secs, 1)}
+           "prefill_tok_s": round(len(rows) * a.len / secs, 1),
+           "fp16_fallbacks": getattr(model, "fp16_fallbacks", None)}
     say(f"[ppl] {json.dumps({k: v for k, v in out.items() if k != 'nll_rows'})}")
     if a.json and a.rank == 0:
         with open(a.json, "w") as f:
