@@ -27,11 +27,14 @@ the worker (gx11, rank 1). Ports: 8891 (API), 29571 (rendezvous).
 
 ```bash
 scripts/prepare.sh                 # TensorFold python-0.6 @ ed78d6f + patches/, the image built on the head and loaded on the worker
-scripts/quantise.sh 3.0            # on the worker: our 3.0 bpw pack from the RL source (~17 h on one GB10); 4.0 likewise
-PACK=3.0 scripts/sync_pack.sh      # the pack to the head over CX7, sha256-checked
+scripts/fetch_pack.sh              # the 3.0 pack from Hugging Face (pinned revision) on the head, copied to the worker, both verified
 ./start.sh                         # rank 1 on the worker, rank 0 here; OpenAI API on :8891, model id MiMo-V2.6-Flash
 ./stop.sh
 ```
+
+The pack: [ajensenwaud/MiMo-V2.6-Flash-RL-exl3-3.0bpw](https://huggingface.co/ajensenwaud/MiMo-V2.6-Flash-RL-exl3-3.0bpw).
+To make it (or 4.0) yourself instead: `scripts/quantise.sh 3.0` on the worker (it holds the RL source; ~17 h on one
+GB10), then `PACK=3.0 scripts/sync_pack.sh`.
 
 Settings in `scripts/config.sh` (override in `scripts/local.sh`): `PACK=3.0|4.0|2.27`, `DRAFTER=1|0`, `PARALLEL=4`
 streams, `TP=2`. A request can send `"draft": false` for plain decode. Pins: source `XiaomiMiMo/MiMo-V2.6-Flash-RL`
