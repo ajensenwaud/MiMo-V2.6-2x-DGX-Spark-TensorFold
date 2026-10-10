@@ -1,0 +1,34 @@
+{
+ "tp": 2,
+ "rows": 8192,
+ "wall_ms": 8122.6,
+ "tok_s": 1008.5,
+ "kernel_ms": 7881.6,
+ "by_category_ms": {
+  "exl3 gemv/gemm": 3239.5,
+  "other": 2207.7,
+  "comm": 1334.2,
+  "copies/misc": 403.5,
+  "attention": 330.0,
+  "norm/add/act": 247.7,
+  "router/topk": 60.3,
+  "qkv/rope": 58.7
+ },
+ "top_kernels_ms": {
+  "_gemm": 3239.5,
+  "void (anonymous namespace)::unpack_kernel<8, 2>(unsigned int const*, __half*, int, long, long)": 1639.2,
+  "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)": 685.1,
+  "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, long, long": 648.3,
+  "(anonymous namespace)::rot_in_kernel(void const*, int, __half const*, __half*, int)": 532.0,
+  "void at::native::reduce_kernel<128, 4, at::native::ReduceOp<float, at::native::func_wrapper_t<float,": 235.0,
+  "_add_rms": 196.9,
+  "_rows": 187.4,
+  "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<float>, std::array<cha": 163.5,
+  "_prompt": 81.6,
+  "_merge": 60.9,
+  "_qkv": 58.7,
+  "_router": 53.1,
+  "_silu_mul_scale": 48.1,
+  "void (anonymous namespace)::unpack_kernel<12, 2>(unsigned int const*, __half*, int, long, long)": 30.4
+ }
+}

@@ -50,6 +50,7 @@ def main() -> None:
     ap.add_argument("--widths", default="", help="timing only: comma-separated window widths (e.g. 1,2,4,8,16)")
     ap.add_argument("--grid", default="", help="timing only: STREAMS:WIDTHS, e.g. 1,2,4:1,2,3,4,6,8 (a different text "
                                                "a stream)")
+    ap.add_argument("--prefill", type=int, default=0, help="profile one prompt forward of this many rows instead")
     a = ap.parse_args()
 
     from safetensors import safe_open
@@ -78,6 +79,33 @@ def main() -> None:
     ref = safe_open(a.ref, framework="pt")
     pool = [t for k in sorted(ref.keys()) if k.endswith(".ids") for t in ref.get_tensor(k).tolist()]
     prompt = (pool * (a.prompt // len(pool) + 1))[:a.prompt]
+    if a.prefill:                                          # one prompt chunk of a.prefill rows, profiled
+        rows = (pool * (a.prefill // len(pool) + 1))[:a.prefill]
+        for _ in range(2):                                 # compile, warm
+            model.forward([Chain(0, 0, rows)], prompt=True)
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        model.forward([Chain(0, 0, rows)], prompt=True)
+        torch.cuda.synchronize()
+        wall = (time.perf_counter() - t) * 1e3
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            model.forward([Chain(0, 0, rows)], prompt=True)
+            torch.cuda.synchronize()
+        by, top = defaultdict(float), defaultdict(float)
+        for e in prof.events():
+            if e.device_type == torch.autograd.DeviceType.CUDA:
+                us = e.device_time if hasattr(e, "device_time") else e.cuda_time
+                by[cat(e.name)] += us
+                top[e.name] += us
+        report = {"tp": a.tp, "rows": a.prefill, "wall_ms": round(wall, 1), "tok_s": round(a.prefill / wall * 1e3, 1),
+                  "kernel_ms": round(sum(by.values()) / 1e3, 1),
+                  "by_category_ms": {k: round(v / 1e3, 1) for k, v in sorted(by.items(), key=lambda x: -x[1])},
+                  "top_kernels_ms": {k[:100]: round(v / 1e3, 1) for k, v in sorted(top.items(), key=lambda x: -x[1])[:15]}}
+        say(f"[profile] {json.dumps(report)}")
+        if a.json and a.rank == 0:
+            with open(a.json, "w") as f:
+                json.dump(report, f, indent=1)
+        return
     if a.grid:                                             # cost of S streams x w rows, each stream its own text
         texts = [ref.get_tensor(k).tolist() for k in sorted(ref.keys()) if k.endswith(".ids")]
         texts = [(t * (a.prompt // len(t) + 1))[:a.prompt] for t in texts]

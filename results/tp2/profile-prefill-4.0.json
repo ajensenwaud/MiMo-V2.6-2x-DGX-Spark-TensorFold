@@ -1,0 +1,35 @@
+{
+ "tp": 2,
+ "rows": 8192,
+ "wall_ms": 13838.6,
+ "tok_s": 592.0,
+ "kernel_ms": 14106.1,
+ "by_category_ms": {
+  "experts": 9931.3,
+  "other": 2143.3,
+  "comm": 684.1,
+  "exl3 gemv/gemm": 540.3,
+  "attention": 325.6,
+  "norm/add/act": 198.7,
+  "copies/misc": 164.2,
+  "router/topk": 60.9,
+  "qkv/rope": 57.7
+ },
+ "top_kernels_ms": {
+  "void tf_exl3x::grouped_kernel<2, 8, 4, 1, 8, 8>(__half const*, __half const*, long const*, long cons": 9931.3,
+  "(anonymous namespace)::group_kernel(int const*, int*, int*, int*, int, int, int, int)": 740.0,
+  "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)": 683.6,
+  "_gemm": 540.3,
+  "(anonymous namespace)::down_combine_kernel(float const*, int const*, __half const*, float*, float co": 498.4,
+  "(anonymous namespace)::gateup_epilogue_kernel(float const*, int const*, __half const*, __half const*": 473.8,
+  "void (anonymous namespace)::rot_in_kernel<__half>(__half const*, int, int const*, __half const*, __h": 297.1,
+  "_add_rms": 196.0,
+  "_rows": 184.7,
+  "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<float>, std::array<cha": 163.3,
+  "(anonymous namespace)::rot_in_kernel(void const*, int, __half const*, __half*, int)": 103.9,
+  "_prompt": 81.7,
+  "_merge": 59.2,
+  "_qkv": 57.7,
+  "_router": 53.8
+ }
+}
