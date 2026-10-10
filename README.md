@@ -8,8 +8,9 @@ Status: measured, text only (no vision, no audio). Default: the 3.0 bpw pack wit
 
 ## What this recipe adds to TensorFold
 
-TensorFold had no MiMo family. Everything below is new, in `src/tensorfold/families/mimo_v2/` (patches 0024-0030; 0001-0023
-are the Kolibri-1 recipe's base: two-rank serving, RoCE all-gathers, graphs, the KL tooling).
+TensorFold had no MiMo family. Everything below is new, in `src/tensorfold/families/mimo_v2/` (patches 0024-0030).
+Patches 0001-0023 are carried over from earlier TensorFold work; MiMo uses only their shared engine changes (the RoCE
+exchange between the two Sparks and a server fix), none of their model code.
 
 | Change | Where | Effect on bits |
 |---|---|---|
@@ -121,7 +122,7 @@ DFlash, profiles, perplexity); `patches/` the TensorFold changes; `results/` eve
 
 Thanks to Xiaomi MiMo for the model and its DFlash drafter; Ash Hart ([@ashxhart](https://x.com/ashxhart)) for
 [TensorFold](https://github.com/ashhart/TensorFold), the engine this recipe patches; Jürgen Schmied
-([@jschmied](https://github.com/jschmied)) for the Kolibri-1 work the two-rank base builds on; turboderp for
+([@jschmied](https://github.com/jschmied)), author of patches 0001-0006, including the server fix this recipe relies on; turboderp for
 [exllamav3](https://github.com/turboderp-org/exllamav3); benthecarman for the 2.27 bpw pack, the conversion settings and
 the repaired DFlash drafter; and Mia's AI Lab for the recipe format and base image. Full credits, including the
 evaluation datasets, in [CREDITS.md](CREDITS.md). Apache-2.0, as TensorFold; the model and packs are MIT, as Xiaomi's

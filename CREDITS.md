@@ -7,9 +7,9 @@ This recipe stands on other people's work. Thank you to:
 - **TensorFold** ([ashhart/TensorFold](https://github.com/ashhart/TensorFold), Apache-2.0) by Ash Hart
   ([@ashxhart](https://x.com/ashxhart)). The engine, its two-rank serving, kernels and tooling are TensorFold's; this
   recipe is a set of patches on top of it (`patches/`).
-- **Jürgen Schmied** ([@jschmied](https://github.com/jschmied)) for TensorFold pull request
-  [#328](https://github.com/ashhart/TensorFold/pull/328), the Kolibri-1 support that patches 0001-0023 (inherited from
-  [Kolibri-1-2x-DGX-Spark-TensorFold](https://github.com/ajensenwaud/Kolibri-1-2x-DGX-Spark-TensorFold)) build on.
+- **Jürgen Schmied** ([@jschmied](https://github.com/jschmied)), author of patches 0001-0006 (from TensorFold pull
+  request [#328](https://github.com/ashhart/TensorFold/pull/328)), including the server fix in 0001 that this recipe
+  relies on.
 - **turboderp** for [exllamav3](https://github.com/turboderp-org/exllamav3) (MIT): the EXL3 format and quantiser used to
   build the 3.0 and 4.0 bpw packs, its upstream MiMo-V2 support, and the reference forward and perplexity method this
   recipe's engine is checked against.
