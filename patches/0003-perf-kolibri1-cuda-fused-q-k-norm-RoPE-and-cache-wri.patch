@@ -1,7 +1,7 @@
 From bc08cfc628547c8e7866e746274cd6e438ac3fda Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=BCrgen=20Schmied?= <juergenschmied70@gmail.com>
 Date: Sat, 3 Oct 2026 23:55:25 +0200
-Subject: [PATCH 03/23] perf(kolibri1 cuda): fused q/k norm, RoPE and cache
+Subject: [PATCH 03/30] perf(kolibri1 cuda): fused q/k norm, RoPE and cache
  writes; residual adds fused with the next norm; prompt experts staged a
  64-pair item a CTA; 8,192-row prompt chunks
 

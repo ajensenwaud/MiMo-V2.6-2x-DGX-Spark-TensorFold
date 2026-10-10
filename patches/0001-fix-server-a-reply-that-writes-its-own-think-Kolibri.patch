@@ -1,7 +1,7 @@
 From 809eeb5d26aa0c8c8ccf627eef40c33b7f08c217 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=BCrgen=20Schmied?= <juergenschmied70@gmail.com>
 Date: Sat, 3 Oct 2026 23:21:01 +0200
-Subject: [PATCH 01/23] fix(server): a reply that writes its own <think>
+Subject: [PATCH 01/30] fix(server): a reply that writes its own <think>
  (Kolibri 1's template leaves it to the reply) keeps the tag out of
  reasoning_content
 

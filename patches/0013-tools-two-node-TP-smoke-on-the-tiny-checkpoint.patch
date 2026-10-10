@@ -1,7 +1,7 @@
 From 05251a52f0710bf394cc4823e30f0ca891b51417 Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Tue, 6 Oct 2026 13:21:37 +1100
-Subject: [PATCH 13/23] tools: two-node TP smoke on the tiny checkpoint
+Subject: [PATCH 13/30] tools: two-node TP smoke on the tiny checkpoint
 
 ---
  tools/kolibri_tp_smoke.py | 83 +++++++++++++++++++++++++++++++++++++++

@@ -1,7 +1,7 @@
 From 1d18fb0fbafc49ddb7e0a55fced75e8161df220e Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=BCrgen=20Schmied?= <juergenschmied70@gmail.com>
 Date: Sun, 4 Oct 2026 00:04:33 +0200
-Subject: [PATCH 04/23] feat(kolibri1 cuda): windows copy what followed the
+Subject: [PATCH 04/30] feat(kolibri1 cuda): windows copy what followed the
  context's last 8 tokens, verified in one forward (drafted equals serial)
 
 ---

@@ -1,7 +1,7 @@
 From a1d78cdecc7f7c8cae650a413d86344d0d009de7 Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Tue, 6 Oct 2026 15:37:19 +1100
-Subject: [PATCH 19/23] perf(kolibri1 tp): prompt-row MoE partials cross the
+Subject: [PATCH 19/30] perf(kolibri1 tp): prompt-row MoE partials cross the
  link in bf16 (half the bytes); big-message link bench
 
 ---

@@ -1,0 +1,255 @@
+From 0cf0d1668c444a01d9b587f2ae13e968ac87aad9 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sat, 10 Oct 2026 08:58:19 +1100
+Subject: [PATCH 27/30] feat(mimo_v2): DFlash drafter (taps fed from every
+ target forward on both ranks; block-8 draft through the target head); exact
+ under verification
+
+---
+ .../families/mimo_v2/cuda/dflash.py           | 183 ++++++++++++++++++
+ .../families/mimo_v2/cuda/forward.py          |  18 ++
+ 2 files changed, 201 insertions(+)
+ create mode 100644 src/tensorfold/families/mimo_v2/cuda/dflash.py
+
+diff --git a/src/tensorfold/families/mimo_v2/cuda/dflash.py b/src/tensorfold/families/mimo_v2/cuda/dflash.py
+new file mode 100644
+index 0000000..e704af7
+--- /dev/null
++++ b/src/tensorfold/families/mimo_v2/cuda/dflash.py
+@@ -0,0 +1,183 @@
++"""MiMo-V2.6's DFlash drafter (Xiaomi's, shipped in the pack's dflash/): a 5-layer dense transformer that drafts a
++block of 8 tokens in one pass from the target's hidden states.
++
++Semantics follow exllamav3's DFlashModel (architecture/dflash.py, the reference this drafter was quantised with):
++
++* Context: after a target forward, the residual stream after target layers ``target_layer_ids`` (+ ``tap_shift``)
++  of each row, concatenated [n, 5 x 4096], through ``fc`` and ``hidden_norm``; each drafter layer's k_proj (then
++  k_norm and RoPE at the row's position) and v_proj of that are its keys and values for those positions.
++* Draft: the pending token and ``block - 1`` mask positions (the target's embedding for the token, the drafter's
++  ``mask_embedding`` for the masks) at positions p .. p + block - 1 run the 5 layers: q/k norms per head, NEOX RoPE
++  on the first half of each 128-wide head, sink logits, a 1024-key window behind each query, bidirectional within the
++  block, keys only through the block's end; then ``norm`` and the target's head. The mask positions' argmaxes are the
++  drafts for positions p + 1 .. p + block - 1.
++
++Every rank runs the drafter whole (it reads 0.7 GB) on the same inputs, so drafts are bit-equal across ranks; only the
++target head is split, gathered as in the target's own logits. Rows of a verify window are all fed to the context:
++rejected rows lie at positions the next draft block overwrites before any query reads them.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import torch
++
++from tensorfold.cuda.exl3.linear import Exl3Linear
++
++from . import attention, ops
++
++TOKENS_PER_UPDATE = 1024      # context rows a prompt chunk feeds (older rows fall outside every later query's window)
++
++
++def _head_rms(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
++    xf = x.float()
++    return xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w
++
++
++def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rot: int) -> torch.Tensor:
++    """NEOX rotation of the first ``rot`` dims of each head; x [n, H, D] fp32, cos/sin [n, rot / 2]."""
++
++    half = rot // 2
++    a, b = x[..., :half], x[..., half:rot]
++    c, s = cos[:, None, :], sin[:, None, :]
++    return torch.cat((a * c - b * s, b * c + a * s, x[..., rot:]), -1)
++
++
++class Drafter:
++    def __init__(self, model, drafter_dir: str | Path, device: str = "cuda") -> None:
++        from tensorfold.cuda.direct_read import SafeTensors
++
++        d = Path(drafter_dir)
++        c = json.loads((d / "config.json").read_text())
++        dc = c.get("dflash_config") or {}
++        if c.get("architectures") != ["DFlashDraftModel"]:
++            raise ValueError(f"{d}: not a DFlash drafter")
++        self.model = model
++        self.hidden, self.heads, self.kv = int(c["hidden_size"]), int(c["num_attention_heads"]), \
++            int(c["num_key_value_heads"])
++        self.dim = int(c.get("head_dim") or self.hidden // self.heads)
++        self.rot = int(self.dim * float(c.get("partial_rotary_factor", 1.0)))
++        self.block = int(dc.get("block_size", c.get("block_size")))
++        self.window = int(c.get("sliding_window", 2048))
++        self.eps = float(c.get("rms_norm_eps", 1e-6))
++        self.mask_id = int(dc.get("mask_token_id", c.get("mask_token_id")))
++        shift = int(dc.get("tap_shift", c.get("tap_shift", 1)))
++        self.taps = sorted(int(i) + shift for i in dc["target_layer_ids"])
++        if list(self.taps) != [int(i) + shift for i in dc["target_layer_ids"]]:
++            raise ValueError("DFlash: target_layer_ids out of order are not wired")
++        if any(t >= len(model.cfg.full) for t in self.taps) or c.get("is_causal", False):
++            raise ValueError("DFlash: taps past the target's last layer or a causal drafter are not wired")
++        if int(c["hidden_size"]) != model.cfg.hidden:
++            raise ValueError("DFlash: drafter and target hidden sizes differ")
++        f = SafeTensors([d / "model.safetensors"])
++
++        def lin(p: str) -> Exl3Linear:
++            if p + ".mul1" not in f:
++                raise ValueError(f"DFlash {p}: only mul1 EXL3 drafters are wired")
++            return Exl3Linear.from_tensors(f.get(p + ".trellis", device), f.get(p + ".suh", device),
++                                           f.get(p + ".svh", device), codebook="mul1", device=device)
++
++        def norm(p: str) -> torch.Tensor:
++            return f.get(p, device).float().contiguous()
++
++        self.fc, self.fc_norm = lin("fc"), norm("hidden_norm.weight")
++        self.layers = []
++        for i in range(int(c["num_hidden_layers"])):
++            p = f"layers.{i}."
++            a = p + "self_attn."
++            self.layers.append(dict(
++                in_norm=norm(p + "input_layernorm.weight"), post_norm=norm(p + "post_attention_layernorm.weight"),
++                q=lin(a + "q_proj"), k=lin(a + "k_proj"), v=lin(a + "v_proj"), o=lin(a + "o_proj"),
++                q_norm=norm(a + "q_norm.weight"), k_norm=norm(a + "k_norm.weight"),
++                sinks=f.get(a + "attention_sink_bias", device).float().contiguous() if a + "attention_sink_bias" in f
++                else None,
++                gate=lin(p + "mlp.gate_proj"), up=lin(p + "mlp.up_proj"), down=lin(p + "mlp.down_proj")))
++        self.norm = norm("norm.weight")
++        self.mask_emb = f.get("mask_embedding", device).float().contiguous() if "mask_embedding" in f else None
++        f.close()
++        self.ring = model.ring                     # the target's sliding ring: resumes keep both caches aligned
++        if self.ring < self.window + 2 * self.block:
++            raise ValueError("DFlash: the target's ring is shorter than the drafter's window")
++        shape = (model.slots, self.ring, self.kv, self.dim)
++        self.k = [torch.zeros(shape, dtype=ops.ACT, device=device) for _ in self.layers]
++        self.v = [torch.zeros(shape, dtype=ops.ACT, device=device) for _ in self.layers]
++        self.cos, self.sin = attention.rope_tables(model.context + self.block,
++                                                   float(c.get("rope_theta", 10000.0)), self.rot, device)
++        self.scale = self.dim ** -0.5
++
++    # ---- context: the target's rows into the drafter's keys and values ----------------------------------------
++    def update(self, taps: torch.Tensor, pos32: torch.Tensor, slot32: torch.Tensor, prompt: bool) -> None:
++        """``taps`` [n, len(taps) * hidden] (the target's residual rows, concatenated in tap order)."""
++
++        proj = self.model.proj
++        many = prompt and taps.shape[0] > ops.DECODE_ROWS
++        ctx = ops.rms(proj(self.fc, taps.to(ops.ACT).contiguous(), prompt=many, out_dtype=torch.float32),
++                      self.fc_norm, self.eps)
++        n = ctx.shape[0]
++        pos = pos32.long()
++        at = (slot32.long(), pos % self.ring)
++        cos, sin = self.cos[pos], self.sin[pos]
++        for i, L in enumerate(self.layers):
++            k = proj(L["k"], ctx, prompt=many).view(n, self.kv, self.dim)
++            k = _rope(_head_rms(k, L["k_norm"], self.eps), cos, sin, self.rot)
++            v = proj(L["v"], ctx, prompt=many).view(n, self.kv, self.dim)
++            self.k[i].index_put_(at, k.to(ops.ACT))
++            self.v[i].index_put_(at, v.to(ops.ACT))
++
++    # ---- draft: a block from the pending token ---------------------------------------------------------------
++    @torch.no_grad()
++    def draft(self, tokens: torch.Tensor, pos0: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
++        """tokens/pos0/slots [S] (device): each stream's pending token and its position -> drafts [S, block - 1]."""
++
++        B, S = self.block, tokens.shape[0]
++        dev = tokens.device
++        offs = torch.arange(B, device=dev)
++        pos = (pos0.long()[:, None] + offs[None, :]).reshape(-1)                      # [S*B]
++        slot = slots.long()[:, None].expand(S, B).reshape(-1)
++        x = self.model.w.embed[tokens.long()].float()[:, None, :].expand(S, B, self.hidden).clone()
++        if self.mask_emb is not None:
++            x[:, 1:] = self.mask_emb
++        else:
++            x[:, 1:] = self.model.w.embed[self.mask_id].float()
++        x = x.reshape(S * B, self.hidden).contiguous()
++        cos, sin = self.cos[pos], self.sin[pos]
++        # keys a stream's block reads: window - 1 behind its first row through its last
++        span = self.window - 1 + B
++        kpos = pos0.long()[:, None] - (self.window - 1) + torch.arange(span, device=dev)[None, :]   # [S, span]
++        kvalid = kpos >= 0
++        kidx = (slots.long()[:, None], kpos.clamp_min(0) % self.ring)
++        qpos = pos.view(S, B)
++        # a query at q sees keys q - window < k (and k <= the block's end, which every gathered key is)
++        vis = kvalid[:, None, :] & (kpos[:, None, :] > qpos[:, :, None] - self.window)               # [S, B, span]
++        g = self.heads // self.kv
++        proj = self.model.proj
++        n = S * B
++        for i, L in enumerate(self.layers):
++            h = ops.rms(x, L["in_norm"], self.eps)
++            q = _rope(_head_rms(proj(L["q"], h, prompt=False).view(n, self.heads, self.dim), L["q_norm"], self.eps),
++                      cos, sin, self.rot)
++            k = _rope(_head_rms(proj(L["k"], h, prompt=False).view(n, self.kv, self.dim), L["k_norm"], self.eps),
++                      cos, sin, self.rot)
++            v = proj(L["v"], h, prompt=False).view(n, self.kv, self.dim)
++            self.k[i].index_put_((slot, pos % self.ring), k.to(ops.ACT))
++            self.v[i].index_put_((slot, pos % self.ring), v.to(ops.ACT))
++            K = self.k[i][kidx].float()                                       # [S, span, kv, D]
++            V = self.v[i][kidx].float()
++            qh = q.view(S, B, self.kv, g, self.dim)
++            s = torch.einsum("sbkgd,stkd->skgbt", qh, K) * self.scale            # [S, kv, g, B, span]
++            s = s.masked_fill(~vis[:, None, None, :, :], float("-inf"))
++            if L["sinks"] is not None:
++                sink = L["sinks"].view(self.kv, g)[None, :, :, None, None].expand(S, self.kv, g, B, 1)
++                p = torch.softmax(torch.cat((s, sink), -1), -1)[..., :-1]
++            else:
++                p = torch.softmax(s, -1)
++            a = torch.einsum("skgbt,stkd->sbkgd", p, V).reshape(n, self.heads * self.dim)
++            x = x + proj(L["o"], a.to(ops.ACT), prompt=False, out_dtype=torch.float32)
++            h = ops.rms(x, L["post_norm"], self.eps)
++            m = ops.silu_mul(proj(L["gate"], h, prompt=False), proj(L["up"], h, prompt=False))
++            x = x + proj(L["down"], m, prompt=False, out_dtype=torch.float32)
++        h = ops.rms(x, self.norm, self.eps).view(S, B, self.hidden)[:, 1:].reshape(S * (B - 1), self.hidden)
++        logits = self.model._head(h.contiguous())[:, :self.model.cfg.vocab]
++        return logits.argmax(-1).view(S, B - 1)
+diff --git a/src/tensorfold/families/mimo_v2/cuda/forward.py b/src/tensorfold/families/mimo_v2/cuda/forward.py
+index 10754eb..5102026 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/forward.py
++++ b/src/tensorfold/families/mimo_v2/cuda/forward.py
+@@ -11,6 +11,7 @@ import torch
+ 
+ from . import attention, ops
+ from .moe import MoE
++from .dflash import TOKENS_PER_UPDATE
+ from .weights import Weights
+ 
+ PROMPT_CHUNK = 8192            # prompt rows a forward
+@@ -50,6 +51,15 @@ class Model:
+         self.partials = attention.Partials()
+         first = next(L.experts for L in w.layers if L.experts is not None)
+         self.moe = MoE(first, cfg.top_k, device)
++        self.drafter = None
++
++    def attach_drafter(self, drafter_dir, device: str = "cuda"):
++        """Load the pack's DFlash drafter; every forward then feeds it the target's rows (both ranks alike)."""
++
++        from .dflash import Drafter
++
++        self.drafter = Drafter(self, drafter_dir, device)
++        return self.drafter
+ 
+     @staticmethod
+     def slot_bytes(cfg, context: int) -> int:
+@@ -114,6 +124,10 @@ class Model:
+             chunks = max(pos_l) // attention.CK + 1
+         res = w.embed[ids].float()
+         h, eps = cfg.heads, cfg.eps
++        dr = self.drafter if capture is None and teacher is None else None
++        tap_at = {t: j for j, t in enumerate(dr.taps)} if dr is not None else {}
++        keep = n if (dr is None or not prompt) else min(n, TOKENS_PER_UPDATE)
++        taps = [None] * len(tap_at)
+         x = ops.rms(res, w.layers[0].input_norm, eps)
+         for i, L in enumerate(w.layers):
+             if teacher is not None and i > 0:
+@@ -149,6 +163,10 @@ class Model:
+             x = ops.add_rms(self._sum(m), res, after, eps)
+             if capture is not None:
+                 capture[f"{i}"] = res.detach().clone()
++            if i in tap_at:
++                taps[tap_at[i]] = res[n - keep:].clone()
++        if dr is not None:
++            dr.update(torch.cat(taps, -1), pos32[n - keep:], slot32[n - keep:], prompt)
+         if staged is not None:
+             return x if features else self._head(x)
+         if rows is None:
+-- 
+2.53.0
+

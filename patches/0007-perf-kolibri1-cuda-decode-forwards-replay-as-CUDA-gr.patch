@@ -1,7 +1,7 @@
 From d4257562496ee6bd7733fda1c59efb5a5beb5547 Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Tue, 6 Oct 2026 12:56:37 +1100
-Subject: [PATCH 07/23] perf(kolibri1 cuda): decode forwards replay as CUDA
+Subject: [PATCH 07/30] perf(kolibri1 cuda): decode forwards replay as CUDA
  graphs; one attention plan a forward
 
 ---

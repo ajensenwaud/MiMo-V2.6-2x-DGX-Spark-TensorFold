@@ -1,0 +1,401 @@
+From 4c613f0fd3d352d6d694130c50378983ad05d93e Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sat, 10 Oct 2026 10:04:22 +1100
+Subject: [PATCH 28/30] feat(mimo_v2): serve with DFlash: graphed draft pass,
+ DRAFT mirror kind, windows chosen jointly across streams from the measured
+ streams x rows cost grid; decode graphs keyed by row count (any stream split
+ replays the same graph)
+
+---
+ src/tensorfold/families/mimo_v2/__init__.py   |   6 +-
+ .../families/mimo_v2/cuda/decoder.py          | 107 +++++++++++++++++-
+ .../families/mimo_v2/cuda/dflash.py           |  47 ++++++++
+ .../families/mimo_v2/cuda/engine.py           |  12 +-
+ .../families/mimo_v2/cuda/forward.py          |   4 +
+ .../families/mimo_v2/cuda/graphs.py           |  13 ++-
+ src/tensorfold/families/mimo_v2/cuda/tp.py    |   4 +-
+ 7 files changed, 173 insertions(+), 20 deletions(-)
+
+diff --git a/src/tensorfold/families/mimo_v2/__init__.py b/src/tensorfold/families/mimo_v2/__init__.py
+index f88d5ec..5ad9479 100644
+--- a/src/tensorfold/families/mimo_v2/__init__.py
++++ b/src/tensorfold/families/mimo_v2/__init__.py
+@@ -26,8 +26,8 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+                 context: int | None = None, **options: Any):
+     """One GPU or two ranks (--tp 2); ``--parallel`` requests decoded together; the context sized from memory."""
+ 
+-    if drafter:
+-        raise ValueError(f"{TITLE}: the DFlash drafter is not wired on CUDA yet: drop --drafter")
++    if drafter and no_drafts:
++        raise ValueError(f"{TITLE}: --drafter and --no-drafts contradict each other")
+     if int(tp) not in (1, 2):
+         raise ValueError(f"{TITLE} runs on one GPU or two ranks (--tp 2)")
+     from .cuda.engine import MiMoEngine
+@@ -35,4 +35,4 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+     return MiMoEngine(Path(model_dir), context=int(context) if context else None,
+                       explicit=bool(options.get("context_explicit")),
+                       streams=max(1, int(options.get("parallel") or 1)),
+-                      tp=int(tp), rank=int(rank), master=master, port=int(master_port))
++                      tp=int(tp), rank=int(rank), master=master, port=int(master_port), drafter=drafter or "")
+diff --git a/src/tensorfold/families/mimo_v2/cuda/decoder.py b/src/tensorfold/families/mimo_v2/cuda/decoder.py
+index d3c2e20..6a25a78 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/decoder.py
++++ b/src/tensorfold/families/mimo_v2/cuda/decoder.py
+@@ -1,5 +1,7 @@
+ """The ``Scheduler``'s decoder for MiMo-V2: a prompt chunk a round, then every decoding stream's window together."""
+-# Windows copy what followed the context's last 8 tokens before; rows are row-invariant, so drafted equals serial.
++# Windows: DFlash drafts when the pack's drafter is loaded (its width chosen a stream a round from the stream's
++# acceptance and the measured cost of verifying w rows), else copies of what followed the context's last 8 tokens.
++# Rows are row-invariant, so drafted equals serial.
+ # A free slot keeps its prompt rows (prompt kernels' bits); a prompt extending them resumes there, equal to fresh.
+ 
+ from __future__ import annotations
+@@ -16,11 +18,62 @@ from tensorfold.families.qwen3_5.cuda.decode import CopyIndex, next_copy_rows
+ 
+ from .forward import PROMPT_CHUNK, Chain, Model
+ from .ops import DECODE_ROWS
+-from .tp import DECODE, PROMPT
++from .tp import DECODE, DRAFT, PROMPT
+ 
+ STEP = 1024              # prompt rows a round while other streams decode
+ MAX_ROWS = int(os.environ.get("TF_MIMO_DRAFT_ROWS", "32"))     # a copy window's rows: each wrong one reads its experts
+ MIN_MATCH = int(os.environ.get("TF_MIMO_DRAFT_MATCH", "8"))    # context tokens a copy must repeat before proposed
++# Cost of a forward against one row, measured with a different text a stream (4.0 pack, TP=2,
++# results/tp2/grid-cost-4.0.json): GRID[streams][rows a stream - 1]. Rows from different streams route to fewer
++# shared experts than one stream's consecutive rows, so the stream count matters, not just the rows. Uneven windows
++# use the mean; past 4 streams, the 3 -> 4 step repeats. DRAFT_COST: the batched draft pass against one row
++# (graphed). PROBE: rounds between re-checks of a lone stream that stopped drafting.
++GRID = {1: [1.00, 1.26, 1.50, 1.75, 2.01, 2.25, 2.46, 2.67],
++        2: [1.41, 1.92, 2.43, 2.88, 3.23, 3.61, 3.92, 4.23],
++        3: [1.77, 2.57, 3.24, 3.79, 4.29, 4.99, 5.40, 5.81],
++        4: [2.12, 3.13, 3.94, 4.66, 5.42, 6.00, 6.52, 7.03]}
++DRAFT_COST = float(os.environ.get("TF_MIMO_DRAFT_COST", "0.25"))   # measured: 6.05 ms graphed vs 24.7 ms a row (4.0)
++PROBE = 8
++
++
++def cost(streams: int, rows: int) -> float:
++    """The measured cost of a forward of ``rows`` rows over ``streams`` streams, against one row."""
++
++    def at(s: int, mean: float) -> float:
++        row = GRID[s]
++        if mean >= len(row):
++            return row[-1] + (mean - len(row)) * (row[-1] - row[-2])
++        lo = int(mean)
++        return row[lo - 1] + (mean - lo) * (row[lo] - row[lo - 1]) if lo < len(row) else row[-1]
++
++    mean = max(1.0, rows / streams)
++    if streams <= 4:
++        return at(streams, mean)
++    return at(4, mean) + (streams - 4) * (at(4, mean) - at(3, mean))
++
++
++def joint_widths(alphas: list[float], mosts: list[int], budget: int, others: int = 0) -> list[int]:
++    """Every drafting stream's window (1 .. its most rows), chosen together for the whole forward (``others``
++    streams ride along at one row): draft rows are added one at a time where the expected gain is largest (alpha **
++    the stream's current width: the chance all its earlier drafts hold), and the prefix of additions with the most
++    expected tokens per unit of the forward's measured cost wins. No additions means no draft pass, so its cost is
++    not charged."""
++
++    w = [1] * len(alphas)
++    streams = len(w) + others
++    tokens, rows = float(streams), streams
++    best, best_rate = list(w), tokens / cost(streams, rows)
++    while rows < budget:
++        gains = [(a ** w[i], i) for i, a in enumerate(alphas) if w[i] < mosts[i]]
++        if not gains:
++            break
++        g, i = max(gains)
++        w[i] += 1
++        tokens, rows = tokens + g, rows + 1
++        rate = tokens / (cost(streams, rows) + DRAFT_COST)
++        if rate > best_rate:
++            best, best_rate = list(w), rate
++    return best
+ 
+ 
+ class Decoder:
+@@ -43,6 +96,10 @@ class Decoder:
+             from .graphs import Graphs
+ 
+             self.graphs = Graphs(model)
++        self.runner = getattr(model, "draft_runner", None)       # DFlash, when the drafter is loaded
++        self.alpha: dict[int, float] = {}                         # a stream's draft acceptance (moving average)
++        self.rounds: dict[int, int] = {}
++        self.stats = {"rounds": 0, "drafted": 0, "accepted": 0}
+ 
+     def live(self) -> int:
+         return len(self.streams) + len(self.filling)
+@@ -71,7 +128,8 @@ class Decoder:
+ 
+         best, start = None, 0
+         prompt = np.asarray(s.prompt, dtype=np.int64)
+-        guard = self.model.ring - self.model.cfg.window          # rows written past a resume point that keep its window
++        reach = max(self.model.cfg.window, self.model.drafter.window if self.model.drafter is not None else 0)
++        guard = self.model.ring - reach          # rows written past a resume point that keep its windows
+         for slot in self.free if s.draft else ():               # "draft": false is the serial reference: never resumed
+             if slot not in self.kept:
+                 continue
+@@ -126,11 +184,40 @@ class Decoder:
+             return done
+         chains, starts = [], []
+         share = max(1, DECODE_ROWS // len(live))           # a decode forward takes at most DECODE_ROWS rows
++        widths, dflash = {}, {}
++        if self.runner is not None:
++            block = self.model.drafter.block
++            cand, mosts = [], []
++            for s in live:
++                p = len(s.prompt) + len(s.out) - 1
++                room = min(s.count - len(s.out), self.model.context - p) - 1
++                if s.draft and room >= 1:
++                    cand.append(s)
++                    mosts.append(min(block, room + 1, share))
++            if cand:
++                ws = joint_widths([self.alpha.setdefault(s.sid, 0.6) for s in cand], mosts,
++                                  DECODE_ROWS - (len(live) - len(cand)), others=len(live) - len(cand))
++                for s, w, most in zip(cand, ws, mosts):
++                    n = self.rounds[s.sid] = self.rounds.get(s.sid, 0) + 1
++                    if w == 1 and n % PROBE == 0 and len(live) == 1:
++                        w = min(2, most)                # a lone stream that stopped drafting re-checks now and then
++                    if w > 1:
++                        widths[s.sid] = w
++            asks = [s for s in live if s.sid in widths]
++            if asks:
++                c = [Chain(self.slot[s.sid], len(s.prompt) + len(s.out) - 1, [s.out[-1]]) for s in asks]
++                if self.mirror is not None:
++                    self.mirror.send(DRAFT, c)
++                got = self.runner([x.tokens[0] for x in c], [x.p0 for x in c], [x.slot for x in c])
++                for s, d in zip(asks, got):
++                    dflash[s.sid] = d[:widths[s.sid] - 1]
+         for s in live:
+             p = len(s.prompt) + len(s.out) - 1             # the pending token's position
+             room = min(s.count - len(s.out), self.model.context - p) - 1
+             drafts = []
+-            if s.draft and room > 0:
++            if self.runner is not None:
++                drafts = dflash.get(s.sid, [])
++            elif s.draft and room > 0:
+                 most = min(room, self.width[s.sid] - 1, share - 1)
+                 drafts = self.copies[s.sid].propose(self.context[s.sid], most)[:most]
+             starts.append(sum(len(c.tokens) for c in chains))
+@@ -149,7 +236,13 @@ class Decoder:
+             path, last = accept(win, list(range(-1, len(win) - 1)), sampled, s.count - len(s.out), self._ends(s))
+             new = [win[r] for r in path[1:]] + [last]
+             s.counted(len(win))
+-            if len(win) > 1:
++            if len(win) > 1 and self.runner is not None:
++                got = len(path) - 1                                # drafts accepted
++                tried = got + (1 if got < len(win) - 1 else 0)     # ... and the one that missed
++                self.alpha[s.sid] = 0.7 * self.alpha.get(s.sid, 0.6) + 0.3 * (got / tried)
++                self.stats["drafted"] += len(win) - 1
++                self.stats["accepted"] += got
++            elif len(win) > 1:
+                 self.width[s.sid] = next_copy_rows(len(win), len(path) == len(win), 1, MAX_ROWS)
+             s.take(new, self._ends(s))
+             self.context[s.sid].extend(new)
+@@ -168,7 +261,7 @@ class Decoder:
+                 self.kept[slot] = (ids, self.written.pop(s.sid, rows), self.tick)
+                 self.free.append(slot)
+                 self.free.sort()
+-            for d in (self.copies, self.context, self.width):
++            for d in (self.copies, self.context, self.width, self.alpha, self.rounds):
+                 d.pop(s.sid, None)
+ 
+     def drop(self) -> list[Stream]:
+@@ -182,4 +275,6 @@ class Decoder:
+         self.copies.clear()
+         self.context.clear()
+         self.width.clear()
++        self.alpha.clear()
++        self.rounds.clear()
+         return gone
+diff --git a/src/tensorfold/families/mimo_v2/cuda/dflash.py b/src/tensorfold/families/mimo_v2/cuda/dflash.py
+index e704af7..682fc66 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/dflash.py
++++ b/src/tensorfold/families/mimo_v2/cuda/dflash.py
+@@ -181,3 +181,50 @@ class Drafter:
+         h = ops.rms(x, self.norm, self.eps).view(S, B, self.hidden)[:, 1:].reshape(S * (B - 1), self.hidden)
+         logits = self.model._head(h.contiguous())[:, :self.model.cfg.vocab]
+         return logits.argmax(-1).view(S, B - 1)
++
++
++class DraftRunner:
++    """The draft pass replayed as a CUDA graph per stream count, inputs staged into fixed buffers (both ranks run the
++    same replays: the head's gather inside them pairs up). ``TF_MIMO_DRAFT_GRAPHS=0`` runs it eagerly."""
++
++    def __init__(self, drafter: Drafter) -> None:
++        import os
++
++        self.dr = drafter
++        self.use_graphs = os.environ.get("TF_MIMO_DRAFT_GRAPHS", "1") != "0"
++        self.entries: dict[int, tuple] = {}
++        self.pool = torch.cuda.graph_pool_handle() if self.use_graphs else None
++
++    def __call__(self, tokens: list[int], positions: list[int], slots: list[int]) -> list[list[int]]:
++        import gc
++
++        s = len(tokens)
++        dev = self.dr.model.w.embed.device
++        host = torch.tensor([*tokens, *positions, *slots], dtype=torch.int64)
++        if not self.use_graphs:
++            buf = host.to(dev)
++            out = self.dr.draft(buf[:s], buf[s:2 * s], buf[2 * s:])
++            return out.tolist()
++        entry = self.entries.get(s)
++        if entry is None:
++            pinned = torch.zeros(3 * s, dtype=torch.int64).pin_memory()
++            buf = torch.zeros(3 * s, dtype=torch.int64, device=dev)
++            pinned.copy_(host)
++            buf.copy_(pinned, non_blocking=True)
++            self.dr.draft(buf[:s], buf[s:2 * s], buf[2 * s:])           # warm-up: grows scratch, compiles kernels
++            torch.cuda.synchronize()
++            g = torch.cuda.CUDAGraph()
++            enabled = gc.isenabled()
++            gc.disable()
++            try:
++                with torch.cuda.graph(g, pool=self.pool):
++                    out = self.dr.draft(buf[:s], buf[s:2 * s], buf[2 * s:])
++            finally:
++                if enabled:
++                    gc.enable()
++            entry = self.entries[s] = (g, pinned, buf, out)
++        g, pinned, buf, out = entry
++        pinned.copy_(host)
++        buf.copy_(pinned, non_blocking=True)
++        g.replay()
++        return out.tolist()
+diff --git a/src/tensorfold/families/mimo_v2/cuda/engine.py b/src/tensorfold/families/mimo_v2/cuda/engine.py
+index a0b1bdd..bc3bdb9 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/engine.py
++++ b/src/tensorfold/families/mimo_v2/cuda/engine.py
+@@ -9,13 +9,15 @@ from pathlib import Path
+ from typing import Any, Callable
+ 
+ WORKSPACE = 3 << 30      # activations, prompt chunks and the MoE's scratch beside the caches
++DRAFTER_BYTES = 200 << 20    # the DFlash drafter's keys and values a stream (its weights: the 1 GiB beside)
+ 
+ 
+ class MiMoEngine:
+     """``eos``, ``generate``, ``context_window`` and ``concurrent`` for ``tensorfold.cuda.server``."""
+ 
+     def __init__(self, model_dir: Path, *, context: int | None = None, explicit: bool = False,
+-                 streams: int = 1, tp: int = 1, rank: int = 0, master: str = "", port: int = 29571) -> None:
++                 streams: int = 1, tp: int = 1, rank: int = 0, master: str = "", port: int = 29571,
++                 drafter: str = "") -> None:
+         import os
+ 
+         import torch
+@@ -45,7 +47,7 @@ class MiMoEngine:
+         self.w = load(model_dir, rank=rank, world=tp)
+         torch.cuda.empty_cache()
+         cfg = self.w.config
+-        budget = available_bytes(torch) - WORKSPACE
++        budget = available_bytes(torch) - WORKSPACE - (DRAFTER_BYTES * streams + (1 << 30) if drafter else 0)
+         if self.comm is not None:                  # both ranks size their caches alike: the smaller budget
+             mine = torch.tensor([budget], dtype=torch.int64, device="cuda")
+             both = torch.empty(2, dtype=torch.int64, device="cuda")
+@@ -67,9 +69,11 @@ class MiMoEngine:
+             raise ValueError(f"{streams} stream(s) leave room for {most} tokens each; free memory or lower --parallel")
+         self.context_window = window
+         self.model = Model(self.w, window, streams, comm=self.comm)
++        if drafter:
++            self.model.attach_drafter(drafter)
+         self.eos = tuple(cfg.eos)
+         self.concurrent = streams > 1
+-        self.drafts = True                     # copies from the context (the MTP and DFlash drafters come later)
++        self.drafts = True                     # DFlash with --drafter, else copies from the context
+         self.scheduler = None
+         if self.comm is not None:
+             self.comm.barrier()
+@@ -78,7 +82,7 @@ class MiMoEngine:
+         where = f" rank {rank} of {tp}," if tp > 1 else ""
+         print(f"[tensorfold] mimo_v2:{where} {streams} stream(s) of {window} tokens "
+               f"({streams * Model.slot_bytes(cfg, window) / 2**30:.1f} GiB of caches; sliding layers keep a "
+-              f"{self.model.ring}-key ring), ready in {time.perf_counter() - started:.0f}s", flush=True)
++              f"{self.model.ring}-key ring{'; DFlash drafter' if drafter else ''}), ready in {time.perf_counter() - started:.0f}s", flush=True)
+         if rank == 0:
+             self.decoder = Decoder(self.model, self.eos, mirror=self.mirror)
+             self.scheduler = Scheduler(self.decoder, max_streams=streams)
+diff --git a/src/tensorfold/families/mimo_v2/cuda/forward.py b/src/tensorfold/families/mimo_v2/cuda/forward.py
+index 5102026..7ee18a9 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/forward.py
++++ b/src/tensorfold/families/mimo_v2/cuda/forward.py
+@@ -52,13 +52,17 @@ class Model:
+         first = next(L.experts for L in w.layers if L.experts is not None)
+         self.moe = MoE(first, cfg.top_k, device)
+         self.drafter = None
++        self.draft_runner = None
+ 
+     def attach_drafter(self, drafter_dir, device: str = "cuda"):
+         """Load the pack's DFlash drafter; every forward then feeds it the target's rows (both ranks alike)."""
+ 
+         from .dflash import Drafter
+ 
++        from .dflash import DraftRunner
++
+         self.drafter = Drafter(self, drafter_dir, device)
++        self.draft_runner = DraftRunner(self.drafter)
+         return self.drafter
+ 
+     @staticmethod
+diff --git a/src/tensorfold/families/mimo_v2/cuda/graphs.py b/src/tensorfold/families/mimo_v2/cuda/graphs.py
+index 4f7f8b4..2568995 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/graphs.py
++++ b/src/tensorfold/families/mimo_v2/cuda/graphs.py
+@@ -18,16 +18,17 @@ from . import attention, ops
+ from .forward import Chain, Model
+ 
+ BUCKET = 8192            # smallest key span a graph covers; longer contexts take the next power of two
+-KEEP = int(os.environ.get("TF_MIMO_GRAPHS_KEEP", "48"))      # graphs held (least recently replayed dropped)
++KEEP = int(os.environ.get("TF_MIMO_GRAPHS_KEEP", "160"))     # graphs held (least recently replayed dropped)
+ MAX_ROWS = 32            # widest window graphed
+ 
+ 
+ class Staged:
+-    """A key's fixed device inputs and the pinned host mirror refreshed before each replay."""
++    """A key's fixed device inputs and the pinned host mirror refreshed before each replay. A graph serves any chains
++    with its row count: positions and slots are per-row inputs, so how rows split into streams is not baked in."""
+ 
+-    def __init__(self, model: Model, widths: tuple[int, ...], bucket: int) -> None:
++    def __init__(self, model: Model, rows: int, bucket: int) -> None:
+         dev = model.w.embed.device
+-        self.widths, self.width, self.streams = widths, sum(widths), len(widths)
++        self.width = rows
+         self.chunks = bucket // attention.CK
+         w = self.width
+         self.host32 = torch.zeros(2 * w, dtype=torch.int32).pin_memory()      # positions, slots
+@@ -74,8 +75,8 @@ class Graphs:
+             self.eager += 1
+             return m.forward(chains, prompt=False, rows=range(sum(len(c.tokens) for c in chains)))
+         m.check(chains)
+-        widths = tuple(len(c.tokens) for c in chains)
+-        key = (widths, self._bucket(max(c.p0 + len(c.tokens) for c in chains)))
++        rows = sum(len(c.tokens) for c in chains)
++        key = (rows, self._bucket(max(c.p0 + len(c.tokens) for c in chains)))   # row count, not the streams' split
+         entry = self.entries.get(key)
+         if entry is None:
+             entry = self._capture(key, chains)
+diff --git a/src/tensorfold/families/mimo_v2/cuda/tp.py b/src/tensorfold/families/mimo_v2/cuda/tp.py
+index a00a0e5..c265091 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/tp.py
++++ b/src/tensorfold/families/mimo_v2/cuda/tp.py
+@@ -12,7 +12,7 @@ import torch
+ from .forward import Chain
+ 
+ HEADER = 256            # int32 words a description carries in one gather; longer ones send the rest in a second
+-STOP, PROMPT, DECODE = 0, 1, 2
++STOP, PROMPT, DECODE, DRAFT = 0, 1, 2, 3
+ 
+ 
+ def _nccl(comm):
+@@ -72,6 +72,8 @@ def follow(model, graphs, mirror: Mirror) -> None:
+         try:
+             if kind == PROMPT:
+                 model.forward(chains, prompt=True)
++            elif kind == DRAFT:
++                model.draft_runner([c.tokens[0] for c in chains], [c.p0 for c in chains], [c.slot for c in chains])
+             elif graphs is not None:
+                 graphs.forward(chains)
+             else:
+-- 
+2.53.0
+

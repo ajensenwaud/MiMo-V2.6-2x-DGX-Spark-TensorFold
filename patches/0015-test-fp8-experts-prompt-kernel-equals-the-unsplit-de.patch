@@ -1,7 +1,7 @@
 From bd251229477ba3720bc8bcaea436dccf0b628da9 Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Tue, 6 Oct 2026 13:38:01 +1100
-Subject: [PATCH 15/23] test(fp8 experts): prompt kernel equals the unsplit
+Subject: [PATCH 15/30] test(fp8 experts): prompt kernel equals the unsplit
  decode kernel; split K is the regrouped sum, row-independent
 
 ---

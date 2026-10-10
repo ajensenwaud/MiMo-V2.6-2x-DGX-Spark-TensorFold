@@ -1,0 +1,311 @@
+From cb81c452efe1a9debb31c0903c8218f355a06c68 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sat, 10 Oct 2026 11:01:57 +1100
+Subject: [PATCH 29/30] perf(mimo_v2): prompt rows' experts on the EXL3 prompt
+ GEMM (each expert decoded once a chunk, expert-sorted contiguous slices,
+ fused silu*up*weight, slot-order sum); 16K prompt chunks; round profiler
+ (TF_MIMO_PROFILE_ROUNDS). Served prefill 650 -> 1200 tok/s on 4.0 TP=2, ppl
+ unchanged (4.9803 vs 4.9794)
+
+---
+ .../families/mimo_v2/cuda/decoder.py          | 59 ++++++++++++
+ .../families/mimo_v2/cuda/engine.py           |  2 +-
+ .../families/mimo_v2/cuda/forward.py          |  4 +-
+ src/tensorfold/families/mimo_v2/cuda/moe.py   | 91 ++++++++++++++++++-
+ 4 files changed, 149 insertions(+), 7 deletions(-)
+
+diff --git a/src/tensorfold/families/mimo_v2/cuda/decoder.py b/src/tensorfold/families/mimo_v2/cuda/decoder.py
+index 6a25a78..a4732fc 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/decoder.py
++++ b/src/tensorfold/families/mimo_v2/cuda/decoder.py
+@@ -76,6 +76,44 @@ def joint_widths(alphas: list[float], mosts: list[int], budget: int, others: int
+     return best
+ 
+ 
++class RoundProfile:
++    """Debug (TF_MIMO_PROFILE_ROUNDS=1): a decode round's wall time split into phases, the GPU synchronised at each
++    boundary so device time lands in the phase that launched it; averages printed every 200 rounds, by stream count."""
++
++    EVERY = 200
++
++    def __init__(self) -> None:
++        self.acc: dict[int, dict] = {}
++
++    def start(self) -> None:
++        import torch
++
++        torch.cuda.synchronize()
++        self.t0 = self.t = time.perf_counter()
++        self.cur: dict[str, float] = {}
++
++    def mark(self, phase: str) -> None:
++        import torch
++
++        torch.cuda.synchronize()
++        now = time.perf_counter()
++        self.cur[phase] = self.cur.get(phase, 0.0) + now - self.t
++        self.t = now
++
++    def end(self, streams: int, rows: int) -> None:
++        a = self.acc.setdefault(streams, {"n": 0, "rows": 0, "wall": 0.0, "phases": {}})
++        a["n"] += 1
++        a["rows"] += rows
++        a["wall"] += self.t - self.t0
++        for k, v in self.cur.items():
++            a["phases"][k] = a["phases"].get(k, 0.0) + v
++        if a["n"] % self.EVERY == 0:
++            n = a["n"]
++            ph = " ".join(f"{k} {v / n * 1e3:.2f}" for k, v in a["phases"].items())
++            print(f"[tensorfold] mimo_v2 rounds, {streams} stream(s): {n} rounds, {a['rows'] / n:.1f} rows, "
++                  f"{a['wall'] / n * 1e3:.2f} ms a round | {ph} (ms)", flush=True)
++
++
+ class Decoder:
+     def __init__(self, model: Model, eos: tuple[int, ...], mirror=None) -> None:
+         self.model, self.eos, self.mirror = model, tuple(eos), mirror
+@@ -100,6 +138,7 @@ class Decoder:
+         self.alpha: dict[int, float] = {}                         # a stream's draft acceptance (moving average)
+         self.rounds: dict[int, int] = {}
+         self.stats = {"rounds": 0, "drafted": 0, "accepted": 0}
++        self.prof = RoundProfile() if os.environ.get("TF_MIMO_PROFILE_ROUNDS") == "1" else None
+ 
+     def live(self) -> int:
+         return len(self.streams) + len(self.filling)
+@@ -178,10 +217,15 @@ class Decoder:
+     def round(self) -> list[Stream]:
+         """A prompt chunk for the next queued prompt, then a row of each decoding stream; returns the finished."""
+ 
++        prof = self.prof
++        if prof is not None:
++            prof.start()
+         done = self._fill() if self.filling else []
+         live = [s for s in self.streams.values() if not s.done]
+         if not live:
+             return done
++        if prof is not None:
++            prof.mark("fill")
+         chains, starts = [], []
+         share = max(1, DECODE_ROWS // len(live))           # a decode forward takes at most DECODE_ROWS rows
+         widths, dflash = {}, {}
+@@ -204,13 +248,19 @@ class Decoder:
+                     if w > 1:
+                         widths[s.sid] = w
+             asks = [s for s in live if s.sid in widths]
++            if prof is not None:
++                prof.mark("plan")
+             if asks:
+                 c = [Chain(self.slot[s.sid], len(s.prompt) + len(s.out) - 1, [s.out[-1]]) for s in asks]
+                 if self.mirror is not None:
+                     self.mirror.send(DRAFT, c)
++                if prof is not None:
++                    prof.mark("send draft")
+                 got = self.runner([x.tokens[0] for x in c], [x.p0 for x in c], [x.slot for x in c])
+                 for s, d in zip(asks, got):
+                     dflash[s.sid] = d[:widths[s.sid] - 1]
++                if prof is not None:
++                    prof.mark("draft")
+         for s in live:
+             p = len(s.prompt) + len(s.out) - 1             # the pending token's position
+             room = min(s.count - len(s.out), self.model.context - p) - 1
+@@ -224,12 +274,18 @@ class Decoder:
+             chains.append(Chain(self.slot[s.sid], p, [s.out[-1], *drafts]))
+             self.written[s.sid] = max(self.written[s.sid], p + 1 + len(drafts))
+         total = sum(len(c.tokens) for c in chains)
++        if prof is not None:
++            prof.mark("chains")
+         if self.mirror is not None:
+             self.mirror.send(DECODE, chains)
++        if prof is not None:
++            prof.mark("send decode")
+         if self.graphs is not None:
+             logits = self.graphs.forward(chains)
+         else:
+             logits = self.model.forward(chains, prompt=False, rows=range(total))
++        if prof is not None:
++            prof.mark("forward")
+         for s, c, a in zip(live, chains, starts):
+             win = list(c.tokens)
+             sampled = sample_rows(logits[a:a + len(win)], [c.p0 + 1 + i for i in range(len(win))], s.sampling)
+@@ -246,6 +302,9 @@ class Decoder:
+                 self.width[s.sid] = next_copy_rows(len(win), len(path) == len(win), 1, MAX_ROWS)
+             s.take(new, self._ends(s))
+             self.context[s.sid].extend(new)
++        if prof is not None:
++            prof.mark("sample+accept")
++            prof.end(len(live), total)
+         return done + [s for s in live if s.done]
+ 
+     def finish(self, done: list[Stream]) -> None:
+diff --git a/src/tensorfold/families/mimo_v2/cuda/engine.py b/src/tensorfold/families/mimo_v2/cuda/engine.py
+index bc3bdb9..33dc61f 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/engine.py
++++ b/src/tensorfold/families/mimo_v2/cuda/engine.py
+@@ -8,7 +8,7 @@ import time
+ from pathlib import Path
+ from typing import Any, Callable
+ 
+-WORKSPACE = 3 << 30      # activations, prompt chunks and the MoE's scratch beside the caches
++WORKSPACE = 10 << 30     # activations, 16K-row prompt chunks (expert-sorted copies: ~7 GiB) and scratch beside the caches
+ DRAFTER_BYTES = 200 << 20    # the DFlash drafter's keys and values a stream (its weights: the 1 GiB beside)
+ 
+ 
+diff --git a/src/tensorfold/families/mimo_v2/cuda/forward.py b/src/tensorfold/families/mimo_v2/cuda/forward.py
+index 7ee18a9..163743c 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/forward.py
++++ b/src/tensorfold/families/mimo_v2/cuda/forward.py
+@@ -14,7 +14,7 @@ from .moe import MoE
+ from .dflash import TOKENS_PER_UPDATE
+ from .weights import Weights
+ 
+-PROMPT_CHUNK = 8192            # prompt rows a forward
++PROMPT_CHUNK = int(__import__("os").environ.get("TF_MIMO_PROMPT_CHUNK", "16384"))   # prompt rows a forward (16K: 1254 vs 1008 tok/s at 8K, 4.0 TP=2)
+ _NO_SINKS = __import__("os").environ.get("TF_MIMO_DEBUG_NO_SINKS") == "1"    # debug A/B only: drop sink logits
+ 
+ 
+@@ -158,7 +158,7 @@ class Model:
+             if capture is not None:
+                 capture[f"{i}.attn"] = res.detach().clone()
+             if L.experts is not None:
+-                m = self.moe(x, L.router, L.bias, L.experts, L.route_scale)
++                m = self.moe(x, L.router, L.bias, L.experts, L.route_scale, prompt=prompt)
+             else:
+                 g = self.proj(L.gate, x, prompt=prompt)
+                 u = self.proj(L.up, x, prompt=prompt)
+diff --git a/src/tensorfold/families/mimo_v2/cuda/moe.py b/src/tensorfold/families/mimo_v2/cuda/moe.py
+index 8ab40d8..dcb238a 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/moe.py
++++ b/src/tensorfold/families/mimo_v2/cuda/moe.py
+@@ -1,17 +1,29 @@
+ """MiMo-V2's MoE: fp32 router logits, top 8 by sigmoid score plus the correction bias (ties to the lower id), each
+-weighted by its sigmoid score normalised over the 8 (times layer 47's interm_div), on the grouped EXL3 kernel."""
++weighted by its sigmoid score normalised over the 8 (times layer 47's interm_div).
++
++Decode rows run the grouped EXL3 kernel (row-invariant: a row's bits do not depend on its neighbours). Prompt rows
++of a big chunk run per expert on the prompt GEMM instead: the grouped kernel re-decodes each expert's trellis for
++every small group of rows (measured: 72% of an 8192-row chunk), while the prompt GEMM decodes each matrix once and
++runs a tiled GEMM over all of that expert's rows. Sums go in expert order, so the result is deterministic and the
++ranks' partials stay bit-equal."""
+ 
+ from __future__ import annotations
+ 
++import os
++
+ import torch
+ import triton
+ import triton.language as tl
+ 
+ from tensorfold.cuda import moe as shared
+ from tensorfold.cuda.exl3 import experts as x3experts
++from tensorfold.cuda.exl3 import prefill as x3prefill
++from tensorfold.cuda.exl3.linear import Exl3Linear
+ 
+ WINDOW = 1024            # rows a routed call (its grouping keeps every pick in shared memory)
+-_EXL3_ROUTER = __import__("os").environ.get("TF_MIMO_DEBUG_EXL3_ROUTER") == "1"
++PROMPT_EXPERTS_MIN = int(os.environ.get("TF_MIMO_PROMPT_EXPERTS_MIN", "256"))   # prompt rows from which experts run
++                                                                                 # per expert on the prompt GEMM
++_EXL3_ROUTER = os.environ.get("TF_MIMO_DEBUG_EXL3_ROUTER") == "1"
+ 
+ 
+ @triton.jit
+@@ -35,16 +47,36 @@ def _topk(L, BIAS, PICK, WTS, SCALE, NE: tl.constexpr, TOPK: tl.constexpr, BLOCK
+     tl.store(WTS + r * TOPK + ak, w, mask=ak < TOPK)
+ 
+ 
++def _linears(ex: x3experts.Exl3RoutedExperts) -> list:
++    """Each expert's (gate, up, down) as Exl3Linear views of the layer's trellises (no copies), built once."""
++
++    lins = getattr(ex, "_mimo_linears", None)
++    if lins is None:
++        E, keep = ex.count, ex.keep
++        if len(keep) != 3 * E:
++            raise ValueError("expected the layer's gate, up and down trellises in prepare()'s order")
++
++        def lin(t, suh, svh):
++            return Exl3Linear.from_tensors(t, suh, svh, "mul1", device=t.device, layout="stored")
++
++        lins = [(lin(keep[e], ex.suh_g[e], ex.svh_g[e]), lin(keep[E + e], ex.suh_u[e], ex.svh_u[e]),
++                 lin(keep[2 * E + e], ex.suh_d[e], ex.svh_d[e])) for e in range(E)]
++        ex._mimo_linears = lins
++    return lins
++
++
+ class MoE:
+     """Scratch shared by every MoE layer (they have one shape)."""
+ 
+     def __init__(self, ex: x3experts.Exl3RoutedExperts, top_k: int, device) -> None:
+         self.top_k = top_k
+         self.scratch = x3experts.Scratch(ex, WINDOW, top_k, device=device)
++        self.ws = x3prefill.Workspace()
+ 
+     def __call__(self, x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: x3experts.Exl3RoutedExperts,
+-                 scale: float) -> torch.Tensor:
+-        """x [R, D] bf16 -> [R, D] fp32: the weighted sum of its experts (a rank's share of their width under TP)."""
++                 scale: float, prompt: bool = False) -> torch.Tensor:
++        """x [R, D] (activation dtype) -> [R, D] fp32: the weighted sum of its experts (a rank's share of their width
++        under TP)."""
+ 
+         rows, experts, k = x.shape[0], router.shape[0], self.top_k
+         x = x.contiguous()
+@@ -56,8 +88,59 @@ class MoE:
+         wts = torch.empty((rows, k), dtype=torch.float32, device=x.device)
+         _topk[(rows,)](logits, bias, pick, wts, float(scale), NE=experts, TOPK=k,
+                        BLOCK=triton.next_power_of_2(experts), KP=triton.next_power_of_2(k), num_warps=4)
++        if prompt and rows >= PROMPT_EXPERTS_MIN:
++            return self._prompt(x, pick, wts, ex, float(scale))
+         out = torch.empty((rows, ex.dims), dtype=torch.float32, device=x.device)
+         for r0 in range(0, rows, WINDOW):
+             n = min(WINDOW, rows - r0)
+             x3experts.routed(x[r0:r0 + n], pick[r0:r0 + n], wts[r0:r0 + n], ex, self.scratch, out[r0:r0 + n], n)
+         return out
++
++    def _prompt(self, x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor,
++                ex: x3experts.Exl3RoutedExperts, scale: float) -> torch.Tensor:
++        """Per expert on the prompt GEMM. The routed copies of the rows are gathered once in expert order, so each
++        expert reads and writes a contiguous slice; the normalised routing weight (<= 1) is folded into the down
++        projection's input (exact: down is linear), the layer's scale (layer 47's interm_div compensation, x128)
++        applied once to the fp32 sum so the 16-bit activations cannot overflow; the 8 results a row are summed in
++        slot order (deterministic)."""
++
++        rows, k = pick.shape
++        lins = _linears(ex)
++        flat = pick.reshape(-1).long()
++        order = torch.argsort(flat, stable=True)                           # (row, slot) pairs grouped by expert
++        counts = torch.bincount(flat, minlength=ex.count).tolist()         # one host sync a layer
++        xs = x.index_select(0, order // k)                                 # [rows*k, D], expert order
++        ws = (wts.reshape(-1).index_select(0, order) / scale).contiguous()
++        g = torch.empty((rows * k, ex.width), dtype=x.dtype, device=x.device)
++        u = torch.empty_like(g)
++        h = torch.empty_like(g)
++        d = torch.empty((rows * k, ex.dims), dtype=torch.float32, device=x.device)
++        at = 0
++        for e, c in enumerate(counts):
++            if c == 0:
++                continue
++            gate, up, down = lins[e]
++            s = slice(at, at + c)
++            x3prefill.matmul(gate, xs[s], g[s], self.ws)
++            x3prefill.matmul(up, xs[s], u[s], self.ws)
++            _silu_mul_scale[(c,)](g[s], u[s], ws[s], h[s], N=ex.width, BLOCK=triton.next_power_of_2(ex.width),
++                                  num_warps=4)
++            x3prefill.matmul(down, h[s], d[s], self.ws)
++            at += c
++        inv = torch.empty_like(order)
++        inv[order] = torch.arange(order.numel(), device=order.device)
++        out = d.index_select(0, inv).view(rows, k, ex.dims).sum(1)
++        return out if scale == 1.0 else out * scale
++
++
++@triton.jit
++def _silu_mul_scale(G, U, W, OUT, N: tl.constexpr, BLOCK: tl.constexpr):
++    """A row: silu(g) * u * w (fp32 math), to the activation dtype."""
++
++    r = tl.program_id(0).to(tl.int64)
++    c = tl.arange(0, BLOCK)
++    ok = c < N
++    g = tl.load(G + r * N + c, mask=ok, other=0.0).to(tl.float32)
++    u = tl.load(U + r * N + c, mask=ok, other=0.0).to(tl.float32)
++    w = tl.load(W + r)
++    tl.store(OUT + r * N + c, (g / (1.0 + tl.exp(-g)) * u * w).to(OUT.dtype.element_ty), mask=ok)
+-- 
+2.53.0
+

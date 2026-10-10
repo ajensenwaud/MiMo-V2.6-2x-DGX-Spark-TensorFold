@@ -1,7 +1,7 @@
 From a6406750204715778b5ba00067c56bf8205ba908 Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Tue, 6 Oct 2026 14:14:14 +1100
-Subject: [PATCH 17/23] tools(kolibri_kl): texts of 64+ tokens
+Subject: [PATCH 17/30] tools(kolibri_kl): texts of 64+ tokens
 
 ---
  tools/kolibri_kl.py | 6 ++++--

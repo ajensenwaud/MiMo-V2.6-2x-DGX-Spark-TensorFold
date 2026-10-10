@@ -1,7 +1,7 @@
 From 72e7bf26b8fa6cc45c3f2f186878d9db9cc7d47c Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Tue, 6 Oct 2026 13:10:01 +1100
-Subject: [PATCH 10/23] test(kolibri1 tp): simulated ranks compute one at a
+Subject: [PATCH 10/30] test(kolibri1 tp): simulated ranks compute one at a
  time; diagnostics
 
 ---

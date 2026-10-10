@@ -1,7 +1,7 @@
 From b032df5fbc3152593d932b666bd28f0f44176374 Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Wed, 7 Oct 2026 01:50:16 +1100
-Subject: [PATCH 23/23] feat(kolibri1): declare CUDA_PREFILL_FP8 so
+Subject: [PATCH 23/30] feat(kolibri1): declare CUDA_PREFILL_FP8 so
  --prefill-fp8 is accepted
 
 ---

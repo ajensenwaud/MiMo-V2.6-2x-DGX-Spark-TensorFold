@@ -1,7 +1,7 @@
 From a80ed87fbd37adbfddab2fb330b0a6392fd9e625 Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Tue, 6 Oct 2026 13:35:48 +1100
-Subject: [PATCH 14/23] perf(fp8 experts): split-K decode kernel (parts fixed
+Subject: [PATCH 14/30] perf(fp8 experts): split-K decode kernel (parts fixed
  by shape, partials summed in part order); moe breakdown and bits tools
 
 ---

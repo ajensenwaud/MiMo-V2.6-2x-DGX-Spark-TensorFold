@@ -1,0 +1,886 @@
+From 6b444b9c1f6c8acb0909e46646207057439fedbc Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Fri, 9 Oct 2026 10:42:18 +1100
+Subject: [PATCH 25/30] feat(mimo_v2): serving path (engine, decoder, TP
+ mirror, CUDA graphs over staged decode inputs); fp16 activations; V read at
+ the pack's 192-wide padding; debug hooks
+
+---
+ .../families/mimo_v2/cuda/attention.py        |  17 +-
+ .../families/mimo_v2/cuda/decoder.py          | 185 ++++++++++++++++++
+ .../families/mimo_v2/cuda/engine.py           | 118 +++++++++++
+ .../families/mimo_v2/cuda/forward.py          |  61 ++++--
+ .../families/mimo_v2/cuda/graphs.py           | 114 +++++++++++
+ src/tensorfold/families/mimo_v2/cuda/moe.py   |   4 +
+ src/tensorfold/families/mimo_v2/cuda/ops.py   |  21 +-
+ src/tensorfold/families/mimo_v2/cuda/tp.py    |  80 ++++++++
+ .../families/mimo_v2/cuda/weights.py          |   9 +-
+ 9 files changed, 573 insertions(+), 36 deletions(-)
+ create mode 100644 src/tensorfold/families/mimo_v2/cuda/decoder.py
+ create mode 100644 src/tensorfold/families/mimo_v2/cuda/engine.py
+ create mode 100644 src/tensorfold/families/mimo_v2/cuda/graphs.py
+ create mode 100644 src/tensorfold/families/mimo_v2/cuda/tp.py
+
+diff --git a/src/tensorfold/families/mimo_v2/cuda/attention.py b/src/tensorfold/families/mimo_v2/cuda/attention.py
+index 43b70df..5825754 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/attention.py
++++ b/src/tensorfold/families/mimo_v2/cuda/attention.py
+@@ -46,7 +46,7 @@ def _qkv(Q, K, V, COS, SIN, POS, SLOT, QO, KC, VC, LEN, H: tl.constexpr, HK: tl.
+         j = d64 % half
+         cos = tl.load(COS + pos.to(tl.int64) * half + j)
+         sin = tl.load(SIN + pos.to(tl.int64) * half + j)
+-        y = (x * cos + tl.where(d64 < half, -xp, xp) * sin).to(tl.bfloat16)
++        y = (x * cos + tl.where(d64 < half, -xp, xp) * sin).to(QO.dtype.element_ty)
+         rest = tl.load(src + 64 + d128)                     # dims [64, 192) pass through
+         if is_q:
+             dst = QO + (r * H + hd) * 192
+@@ -69,7 +69,7 @@ def qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cos: torch.Tensor, si
+     if rope_dim != 64 or q.shape[1] != heads * 192 or k.shape[1] != kv_heads * 192 or v.shape[1] != kv_heads * 192:
+         raise ValueError(f"MiMo-V2 attention: q/k/v heads of 192 (64 rotated, V padded), got q {tuple(q.shape)}, "
+                          f"k {tuple(k.shape)}, v {tuple(v.shape)} for {heads}/{kv_heads} heads")
+-    qo = torch.empty((n, heads, 192), dtype=torch.bfloat16, device=q.device)
++    qo = torch.empty((n, heads, 192), dtype=k_cache.dtype, device=q.device)
+     _qkv[(n, heads + 2 * kv_heads)](q.contiguous(), k.contiguous(), v.contiguous(), cos, sin, pos, slots, qo,
+                                     k_cache, v_cache, k_cache.shape[1], H=heads, HK=kv_heads, RD=rope_dim,
+                                     num_warps=1)
+@@ -98,7 +98,7 @@ def _online(s, v, m, l, o):
+     next_m = tl.where(active, tl.maximum(m, tile_m), m)
+     alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
+     p = tl.where(active[:, None], tl.exp(s - next_m[:, None]), 0.0)
+-    o = o * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
++    o = o * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+     l = l * alpha + tl.sum(p, 1)
+     return next_m, l, o
+ 
+@@ -171,7 +171,7 @@ def _merge(PO, PM, PL, SINKS, OUT, NCH, H: tl.constexpr, HAS_SINK: tl.constexpr)
+         o += tl.load(PO + at * 128 + d) * f
+     if HAS_SINK:
+         l += tl.exp(sink - m)
+-    tl.store(OUT + (r * H + h) * 128 + d, (o / l).to(tl.bfloat16))
++    tl.store(OUT + (r * H + h) * 128 + d, (o / l).to(OUT.dtype.element_ty))
+ 
+ 
+ class Partials:
+@@ -179,9 +179,12 @@ class Partials:
+ 
+     def __init__(self) -> None:
+         self.o = self.m = self.l = None
++        self.retired = []          # outgrown buffers stay allocated: graphs captured on them still read them
+ 
+     def get(self, n: int, h: int, device):
+         if self.m is None or self.m.numel() < n * h:
++            if self.m is not None:
++                self.retired.append((self.o, self.m, self.l))
+             self.o = torch.empty((n * h * 128,), dtype=torch.float32, device=device)
+             self.m = torch.empty((n * h,), dtype=torch.float32, device=device)
+             self.l = torch.empty((n * h,), dtype=torch.float32, device=device)
+@@ -202,7 +205,7 @@ def rows(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, pos: tor
+     po, pm, pl = scratch.get(w * nch, h, q.device)
+     _rows[(w, hk, nch)](q, k_cache, v_cache, pos, slots, po, pm, pl, ln, nch, H=h, HK=hk, G=g, WIN=int(window),
+                         SCALE=float(scale), CK=CK, BN=BN, GP=GP, num_warps=4, num_stages=2)
+-    out = torch.empty((w, h, 128), dtype=torch.bfloat16, device=q.device)
++    out = torch.empty((w, h, 128), dtype=q.dtype, device=q.device)
+     _merge[(w, h)](po, pm, pl, sinks if sinks is not None else pm, out, nch, H=h, HAS_SINK=sinks is not None,
+                    num_warps=1)
+     return out
+@@ -242,7 +245,7 @@ def _prompt(Q, KC, VC, OUT, P0, W, H: tl.constexpr, HK: tl.constexpr, G: tl.cons
+         s = tl.where((keys[None, :] <= pos[:, None]) & ok[:, None], s, float("-inf"))
+         m, l, o = _online(s, v, m, l, o)
+     out = o / tl.where(l > 0, l, 1.0)[:, None]
+-    tl.store(OUT + ((row.to(tl.int64) * H + head) * 128)[:, None] + da[None, :], out.to(tl.bfloat16),
++    tl.store(OUT + ((row.to(tl.int64) * H + head) * 128)[:, None] + da[None, :], out.to(OUT.dtype.element_ty),
+              mask=ok[:, None])
+ 
+ 
+@@ -255,7 +258,7 @@ def prompt(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, p0: in
+     g = h // hk
+     if g != 16:
+         raise ValueError("full-attention prompt kernel: 16 query heads a key head")
+-    out = torch.empty((w, h, 128), dtype=torch.bfloat16, device=q.device)
++    out = torch.empty((w, h, 128), dtype=q.dtype, device=q.device)
+     _prompt[(triton.cdiv(w, BM), hk)](q, k_cache, v_cache, out, int(p0), w, H=h, HK=hk, G=g, SCALE=float(scale),
+                                       BM=BM, BN=BN, num_warps=8, num_stages=2)
+     return out
+diff --git a/src/tensorfold/families/mimo_v2/cuda/decoder.py b/src/tensorfold/families/mimo_v2/cuda/decoder.py
+new file mode 100644
+index 0000000..d3c2e20
+--- /dev/null
++++ b/src/tensorfold/families/mimo_v2/cuda/decoder.py
+@@ -0,0 +1,185 @@
++"""The ``Scheduler``'s decoder for MiMo-V2: a prompt chunk a round, then every decoding stream's window together."""
++# Windows copy what followed the context's last 8 tokens before; rows are row-invariant, so drafted equals serial.
++# A free slot keeps its prompt rows (prompt kernels' bits); a prompt extending them resumes there, equal to fresh.
++
++from __future__ import annotations
++
++import os
++import time
++
++import numpy as np
++
++from tensorfold.cuda.memory_gate import NoRoom
++from tensorfold.cuda.sampling import sample_rows
++from tensorfold.cuda.streams import Stream, accept, next_fill
++from tensorfold.families.qwen3_5.cuda.decode import CopyIndex, next_copy_rows
++
++from .forward import PROMPT_CHUNK, Chain, Model
++from .ops import DECODE_ROWS
++from .tp import DECODE, PROMPT
++
++STEP = 1024              # prompt rows a round while other streams decode
++MAX_ROWS = int(os.environ.get("TF_MIMO_DRAFT_ROWS", "32"))     # a copy window's rows: each wrong one reads its experts
++MIN_MATCH = int(os.environ.get("TF_MIMO_DRAFT_MATCH", "8"))    # context tokens a copy must repeat before proposed
++
++
++class Decoder:
++    def __init__(self, model: Model, eos: tuple[int, ...], mirror=None) -> None:
++        self.model, self.eos, self.mirror = model, tuple(eos), mirror
++        self.free = list(range(model.slots))
++        self.streams: dict[int, Stream] = {}      # decoding
++        self.filling: list[Stream] = []           # admitted, prompts still prefilling (oldest first)
++        self.slot: dict[int, int] = {}
++        self.done_at: dict[int, int] = {}         # prompt rows prefilled
++        self.copies: dict[int, CopyIndex] = {}
++        self.context: dict[int, list[int]] = {}   # prompt and reply, for the copy index
++        self.width: dict[int, int] = {}
++        self.written: dict[int, int] = {}         # positions a stream has written its slot through
++        self.kept: dict[int, tuple[np.ndarray, int, int]] = {}   # free slot -> (prompt rows, written, last use)
++        self.tick = 0
++        self.next_id = 0
++        self.graphs = None
++        if os.environ.get("TF_MIMO_GRAPHS", "1") != "0":
++            from .graphs import Graphs
++
++            self.graphs = Graphs(model)
++
++    def live(self) -> int:
++        return len(self.streams) + len(self.filling)
++
++    def admit(self, s: Stream) -> None:
++        if s.constraint is not None:
++            raise ValueError("MiMo-V2 on CUDA does not take response_format grammars yet")
++        room = self.model.context - len(s.prompt)
++        if len(s.prompt) < 1 or room < 1:
++            raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.model.context}-token "
++                             "context (--context)")
++        if not self.free:
++            raise NoRoom("every stream slot is busy")
++        s.count = min(s.count, room)
++        s.sid = self.next_id
++        self.next_id += 1
++        slot, start = self._resume(s)
++        self.free.remove(slot)
++        self.kept.pop(slot, None)
++        self.slot[s.sid] = slot
++        self.done_at[s.sid] = self.written[s.sid] = s.cached = start
++        self.filling.append(s)
++
++    def _resume(self, s: Stream) -> tuple[int, int]:
++        """The free slot whose kept prompt rows the prompt extends furthest (within its ring), else the oldest."""
++
++        best, start = None, 0
++        prompt = np.asarray(s.prompt, dtype=np.int64)
++        guard = self.model.ring - self.model.cfg.window          # rows written past a resume point that keep its window
++        for slot in self.free if s.draft else ():               # "draft": false is the serial reference: never resumed
++            if slot not in self.kept:
++                continue
++            ids, written, _ = self.kept[slot]
++            n = min(len(ids), len(prompt) - 1)                   # a resumed prompt still prefills its last row
++            miss = np.flatnonzero(ids[:n] != prompt[:n])
++            lcp = int(miss[0]) if len(miss) else n
++            if lcp > start and written - lcp <= guard:
++                best, start = slot, lcp
++        if best is None:
++            best = min(self.free, key=lambda x: self.kept[x][2] if x in self.kept else -1)
++        return best, start
++
++    def _ends(self, s: Stream) -> tuple[int, ...]:
++        return self.eos if s.stop_eos else ()
++
++    def _fill(self) -> list[Stream]:
++        s = next_fill(self.filling)
++        a = self.done_at[s.sid]
++        b = min(len(s.prompt), a + (STEP if self.streams else PROMPT_CHUNK))
++        t0 = time.perf_counter()
++        try:
++            if self.mirror is not None:
++                self.mirror.send(PROMPT, [Chain(self.slot[s.sid], a, s.prompt[a:b])])
++            logits = self.model.forward([Chain(self.slot[s.sid], a, s.prompt[a:b])], prompt=True)
++            first = sample_rows(logits, [len(s.prompt)], s.sampling)[0] if b == len(s.prompt) else None
++        except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
++            self.filling.remove(s)
++            s.error, s.done = exc, True
++            return [s]
++        self.done_at[s.sid] = b
++        self.written[s.sid] = max(self.written[s.sid], b)
++        s.prefill_s += time.perf_counter() - t0
++        if first is None:
++            return []
++        self.filling.remove(s)
++        self.streams[s.sid] = s
++        s.started = time.perf_counter()
++        self.context[s.sid] = list(s.prompt)
++        self.copies[s.sid] = CopyIndex(MIN_MATCH)
++        self.width[s.sid] = 16                       # a copy window's rows, doubled after a whole copy
++        s.take([first], self._ends(s))
++        self.context[s.sid].append(first)
++        return [s] if s.done else []
++
++    def round(self) -> list[Stream]:
++        """A prompt chunk for the next queued prompt, then a row of each decoding stream; returns the finished."""
++
++        done = self._fill() if self.filling else []
++        live = [s for s in self.streams.values() if not s.done]
++        if not live:
++            return done
++        chains, starts = [], []
++        share = max(1, DECODE_ROWS // len(live))           # a decode forward takes at most DECODE_ROWS rows
++        for s in live:
++            p = len(s.prompt) + len(s.out) - 1             # the pending token's position
++            room = min(s.count - len(s.out), self.model.context - p) - 1
++            drafts = []
++            if s.draft and room > 0:
++                most = min(room, self.width[s.sid] - 1, share - 1)
++                drafts = self.copies[s.sid].propose(self.context[s.sid], most)[:most]
++            starts.append(sum(len(c.tokens) for c in chains))
++            chains.append(Chain(self.slot[s.sid], p, [s.out[-1], *drafts]))
++            self.written[s.sid] = max(self.written[s.sid], p + 1 + len(drafts))
++        total = sum(len(c.tokens) for c in chains)
++        if self.mirror is not None:
++            self.mirror.send(DECODE, chains)
++        if self.graphs is not None:
++            logits = self.graphs.forward(chains)
++        else:
++            logits = self.model.forward(chains, prompt=False, rows=range(total))
++        for s, c, a in zip(live, chains, starts):
++            win = list(c.tokens)
++            sampled = sample_rows(logits[a:a + len(win)], [c.p0 + 1 + i for i in range(len(win))], s.sampling)
++            path, last = accept(win, list(range(-1, len(win) - 1)), sampled, s.count - len(s.out), self._ends(s))
++            new = [win[r] for r in path[1:]] + [last]
++            s.counted(len(win))
++            if len(win) > 1:
++                self.width[s.sid] = next_copy_rows(len(win), len(path) == len(win), 1, MAX_ROWS)
++            s.take(new, self._ends(s))
++            self.context[s.sid].extend(new)
++        return done + [s for s in live if s.done]
++
++    def finish(self, done: list[Stream]) -> None:
++        for s in done:
++            self.streams.pop(s.sid, None)
++            if s in self.filling:
++                self.filling.remove(s)
++            slot = self.slot.pop(s.sid, None)
++            rows = self.done_at.pop(s.sid, 0)
++            if slot is not None:
++                self.tick += 1
++                ids = np.asarray(s.prompt[:rows], dtype=np.int64)
++                self.kept[slot] = (ids, self.written.pop(s.sid, rows), self.tick)
++                self.free.append(slot)
++                self.free.sort()
++            for d in (self.copies, self.context, self.width):
++                d.pop(s.sid, None)
++
++    def drop(self) -> list[Stream]:
++        gone = [s for s in self.streams.values() if not s.done] + list(self.filling)
++        self.streams, self.filling = {}, []
++        self.free = list(range(self.model.slots))
++        self.slot.clear()
++        self.done_at.clear()
++        self.written.clear()
++        self.kept.clear()
++        self.copies.clear()
++        self.context.clear()
++        self.width.clear()
++        return gone
+diff --git a/src/tensorfold/families/mimo_v2/cuda/engine.py b/src/tensorfold/families/mimo_v2/cuda/engine.py
+new file mode 100644
+index 0000000..a0b1bdd
+--- /dev/null
++++ b/src/tensorfold/families/mimo_v2/cuda/engine.py
+@@ -0,0 +1,118 @@
++"""MiMo-V2.6-Flash's CUDA engine on one GPU or two ranks: ``streams`` requests decoded together, the context sized
++from free memory."""
++
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++from typing import Any, Callable
++
++WORKSPACE = 3 << 30      # activations, prompt chunks and the MoE's scratch beside the caches
++
++
++class MiMoEngine:
++    """``eos``, ``generate``, ``context_window`` and ``concurrent`` for ``tensorfold.cuda.server``."""
++
++    def __init__(self, model_dir: Path, *, context: int | None = None, explicit: bool = False,
++                 streams: int = 1, tp: int = 1, rank: int = 0, master: str = "", port: int = 29571) -> None:
++        import os
++
++        import torch
++
++        from tensorfold.cuda.capacity import available_bytes
++        from tensorfold.cuda.scheduler import Scheduler
++
++        from .decoder import Decoder
++        from .forward import Model
++        from .weights import load
++
++        torch.cuda.set_device(0)
++        started = time.perf_counter()
++        native = int(json.loads((Path(model_dir) / "config.json").read_text()).get("max_position_embeddings", 262144))
++        self.rank, self.tp, self.comm, self.mirror = rank, tp, None, None
++        if tp == 2:
++            from tensorfold.cuda.comm import open_comm
++
++            from .tp import Mirror
++
++            self.comm = open_comm(rank, 2, master, port)
++            if os.environ.get("TF_MIMO_COMM", "roce") == "roce":
++                from tensorfold.cuda.roce import RoceComm
++
++                self.comm = RoceComm(self.comm, rank, 2)
++            self.mirror = Mirror(self.comm, rank)
++        self.w = load(model_dir, rank=rank, world=tp)
++        torch.cuda.empty_cache()
++        cfg = self.w.config
++        budget = available_bytes(torch) - WORKSPACE
++        if self.comm is not None:                  # both ranks size their caches alike: the smaller budget
++            mine = torch.tensor([budget], dtype=torch.int64, device="cuda")
++            both = torch.empty(2, dtype=torch.int64, device="cuda")
++            getattr(self.comm, "nccl", self.comm).all_gather(mine, both)
++            budget = int(both.min())
++        fits = max(0, budget // streams)
++        per = Model.slot_bytes(cfg, 1024) - Model.slot_bytes(cfg, 0)
++        base = Model.slot_bytes(cfg, 0)
++        most = (fits - base) // per * 1024 if fits > base else 0
++        if explicit and context:
++            if context > most:
++                raise ValueError(f"--context {context} with {streams} stream(s) needs "
++                                 f"{streams * Model.slot_bytes(cfg, context) / 2**30:.1f} GiB of caches; "
++                                 f"{max(0, budget) / 2**30:.1f} GiB is free after the weights, which fits {most}")
++            window = int(context)
++        else:
++            window = min(int(context) if context else native, most)
++        if window < 4096:
++            raise ValueError(f"{streams} stream(s) leave room for {most} tokens each; free memory or lower --parallel")
++        self.context_window = window
++        self.model = Model(self.w, window, streams, comm=self.comm)
++        self.eos = tuple(cfg.eos)
++        self.concurrent = streams > 1
++        self.drafts = True                     # copies from the context (the MTP and DFlash drafters come later)
++        self.scheduler = None
++        if self.comm is not None:
++            self.comm.barrier()
++            if hasattr(self.comm, "settle"):
++                self.comm.settle()
++        where = f" rank {rank} of {tp}," if tp > 1 else ""
++        print(f"[tensorfold] mimo_v2:{where} {streams} stream(s) of {window} tokens "
++              f"({streams * Model.slot_bytes(cfg, window) / 2**30:.1f} GiB of caches; sliding layers keep a "
++              f"{self.model.ring}-key ring), ready in {time.perf_counter() - started:.0f}s", flush=True)
++        if rank == 0:
++            self.decoder = Decoder(self.model, self.eos, mirror=self.mirror)
++            self.scheduler = Scheduler(self.decoder, max_streams=streams)
++
++    def follow(self) -> None:
++        """Rank 1: run the forwards rank 0 describes, until it stops."""
++
++        import os
++
++        from .tp import follow
++
++        graphs = None
++        if os.environ.get("TF_MIMO_GRAPHS", "1") != "0":
++            from .graphs import Graphs
++
++            graphs = Graphs(self.model)
++        follow(self.model, graphs, self.mirror)
++
++    def close(self) -> None:
++        if self.scheduler is not None:
++            self.scheduler.close()
++            self.scheduler = None
++            if self.mirror is not None:
++                from .tp import STOP
++
++                self.mirror.send(STOP)
++
++    def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens: Callable[[list[int]], bool | None],
++                 draft: bool = True, stop_eos: bool = True, constraint=None,
++                 background: bool = False) -> dict[str, Any]:
++        if len(prompt) >= self.context_window:
++            raise ValueError(f"prompt of {len(prompt)} tokens exceeds the {self.context_window}-token context; "
++                             "shorten it or start with a larger --context")
++        max_tokens = max(1, min(int(max_tokens), self.context_window - len(prompt)))
++        extra = {"constraint": constraint} if constraint is not None else {}
++        return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, stop_eos=stop_eos,
++                                     background=background, **extra)
+diff --git a/src/tensorfold/families/mimo_v2/cuda/forward.py b/src/tensorfold/families/mimo_v2/cuda/forward.py
+index a8a2f7f..10754eb 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/forward.py
++++ b/src/tensorfold/families/mimo_v2/cuda/forward.py
+@@ -14,6 +14,7 @@ from .moe import MoE
+ from .weights import Weights
+ 
+ PROMPT_CHUNK = 8192            # prompt rows a forward
++_NO_SINKS = __import__("os").environ.get("TF_MIMO_DEBUG_NO_SINKS") == "1"    # debug A/B only: drop sink logits
+ 
+ 
+ @dataclass
+@@ -39,8 +40,8 @@ class Model:
+         for i, full in enumerate(cfg.full):
+             n = self.context if full else self.ring
+             hk = cfg.kv_heads(i)
+-            self.k.append(torch.zeros((self.slots, n, hk, cfg.qk_dim), dtype=torch.bfloat16, device=device))
+-            self.v.append(torch.zeros((self.slots, n, hk, cfg.v_dim), dtype=torch.bfloat16, device=device))
++            self.k.append(torch.zeros((self.slots, n, hk, cfg.qk_dim), dtype=ops.ACT, device=device))
++            self.v.append(torch.zeros((self.slots, n, hk, cfg.v_dim), dtype=ops.ACT, device=device))
+         self.rope = {}
+         for theta in {cfg.theta_full, cfg.theta_swa}:
+             self.rope[theta] = attention.rope_tables(self.context, theta, cfg.rope_dim, device)
+@@ -52,7 +53,7 @@ class Model:
+ 
+     @staticmethod
+     def slot_bytes(cfg, context: int) -> int:
+-        """Cache bytes a stream takes at ``context`` positions (bf16 keys and values)."""
++        """Cache bytes a stream takes at ``context`` positions (16-bit keys and values)."""
+ 
+         ring = attention.ring_size(PROMPT_CHUNK, cfg.window)
+         n = 0
+@@ -86,25 +87,38 @@ class Model:
+                 raise ValueError(f"positions through {c.p0 + len(c.tokens)} exceed the {self.context}-token cache")
+ 
+     @torch.no_grad()
+-    def forward(self, chains: Sequence[Chain], *, prompt: bool, rows: Sequence[int] | None = None,
+-                features: bool = False) -> torch.Tensor:
+-        """fp32 logits of ``rows`` (default: each chain's last), or with ``features`` every row's normed state."""
++    def forward(self, chains: Sequence[Chain] | None, *, prompt: bool, rows: Sequence[int] | None = None,
++                features: bool = False, capture: dict | None = None,
++                teacher: dict | None = None, staged=None) -> torch.Tensor:
++        """fp32 logits of ``rows`` (default: each chain's last), or with ``features`` every row's normed state.
++        ``capture`` (debug): filled with the residual stream after each layer's attention and MLP. ``teacher``
++        (debug): layer i starts from teacher[str(i - 1)], a reference residual, so errors stay local. ``staged``
++        (decode only): device inputs from fixed buffers (graphs.Staged), no host work, logits of every row."""
+ 
+         cfg, w = self.cfg, self.w
+         dev = w.embed.device
+-        if prompt and len(chains) != 1:
+-            raise ValueError("a prompt forward takes one stream's chunk")
+-        self.check(chains)
+-        ids = torch.tensor([t for c in chains for t in c.tokens], dtype=torch.int64).to(dev, non_blocking=True)
+-        pos_l = [c.p0 + i for c in chains for i in range(len(c.tokens))]
+-        n = len(pos_l)
+-        pos32 = torch.tensor(pos_l, dtype=torch.int32).to(dev, non_blocking=True)
+-        slot32 = torch.tensor([c.slot for c in chains for _ in c.tokens], dtype=torch.int32).to(dev, non_blocking=True)
+-        chunks = max(pos_l) // attention.CK + 1
++        if staged is not None:
++            if prompt:
++                raise ValueError("staged forwards are decode forwards")
++            ids, pos32, slot32, n, chunks = staged.ids, staged.pos32, staged.slot32, staged.width, staged.chunks
++        else:
++            if prompt and len(chains) != 1:
++                raise ValueError("a prompt forward takes one stream's chunk")
++            self.check(chains)
++            ids = torch.tensor([t for c in chains for t in c.tokens], dtype=torch.int64).to(dev, non_blocking=True)
++            pos_l = [c.p0 + i for c in chains for i in range(len(c.tokens))]
++            n = len(pos_l)
++            pos32 = torch.tensor(pos_l, dtype=torch.int32).to(dev, non_blocking=True)
++            slot32 = torch.tensor([c.slot for c in chains for _ in c.tokens], dtype=torch.int32).to(dev,
++                                                                                                   non_blocking=True)
++            chunks = max(pos_l) // attention.CK + 1
+         res = w.embed[ids].float()
+         h, eps = cfg.heads, cfg.eps
+         x = ops.rms(res, w.layers[0].input_norm, eps)
+         for i, L in enumerate(w.layers):
++            if teacher is not None and i > 0:
++                res = teacher[str(i - 1)].to(dev, torch.float32).contiguous()
++                x = ops.rms(res, L.input_norm, eps)
+             hk = cfg.kv_heads(i)
+             q = self.proj(L.q, x, prompt=prompt)
+             k = self.proj(L.k, x, prompt=prompt)
+@@ -113,8 +127,8 @@ class Model:
+             qr = attention.qkv(q, k, v, cos, sin, pos32, slot32, self.k[i], self.v[i], heads=h, kv_heads=hk,
+                                rope_dim=cfg.rope_dim)
+             if not cfg.full[i]:
+-                a = attention.rows(qr, self.k[i], self.v[i], pos32, slot32, L.sinks, self.partials,
+-                                   window=cfg.window, chunks=0, scale=self.scale)
++                a = attention.rows(qr, self.k[i], self.v[i], pos32, slot32, None if _NO_SINKS else L.sinks,
++                                   self.partials, window=cfg.window, chunks=0, scale=self.scale)
+             elif prompt:
+                 c = chains[0]
+                 a = attention.prompt(qr, self.k[i][c.slot], self.v[i][c.slot], c.p0, scale=self.scale)
+@@ -123,6 +137,8 @@ class Model:
+                                    chunks=chunks, scale=self.scale)
+             o = self.proj(L.o, a.view(n, h * cfg.v_dim), prompt=prompt, out_dtype=torch.float32)
+             x = ops.add_rms(self._sum(o), res, L.post_norm, eps)
++            if capture is not None:
++                capture[f"{i}.attn"] = res.detach().clone()
+             if L.experts is not None:
+                 m = self.moe(x, L.router, L.bias, L.experts, L.route_scale)
+             else:
+@@ -131,6 +147,10 @@ class Model:
+                 m = self.proj(L.down, ops.silu_mul(g, u), prompt=prompt, out_dtype=torch.float32)
+             after = w.layers[i + 1].input_norm if i + 1 < len(w.layers) else w.norm
+             x = ops.add_rms(self._sum(m), res, after, eps)
++            if capture is not None:
++                capture[f"{i}"] = res.detach().clone()
++        if staged is not None:
++            return x if features else self._head(x)
+         if rows is None:
+             ends, at = [], 0
+             for c in chains:
+@@ -139,7 +159,12 @@ class Model:
+             rows = ends
+         if features:
+             return x
+-        x = x[torch.tensor(list(rows), device=dev)]
++        rows = list(rows)
++        if rows != list(range(x.shape[0])):
++            x = x[torch.tensor(rows, device=dev)]
++        return self._head(x)
++
++    def _head(self, x: torch.Tensor) -> torch.Tensor:
+         out = []
+         for r0 in range(0, x.shape[0], ops.DECODE_ROWS):          # the head's GEMV takes 128 rows a call
+             out.append(self._logits(x[r0:r0 + ops.DECODE_ROWS]))
+diff --git a/src/tensorfold/families/mimo_v2/cuda/graphs.py b/src/tensorfold/families/mimo_v2/cuda/graphs.py
+new file mode 100644
+index 0000000..4f7f8b4
+--- /dev/null
++++ b/src/tensorfold/families/mimo_v2/cuda/graphs.py
+@@ -0,0 +1,114 @@
++"""Decode forwards replayed as CUDA graphs per (chain widths, full-attention key bucket); inputs in fixed buffers.
++
++A replay launches the eager decode forward's kernels with the same grids: full layers read ``bucket / CK`` key chunks
++(chunks past a row's position are skipped inside the kernel), so a replayed row carries the eager row's bits for any
++position within the bucket. Shapes outside the graphed set fall back to the eager forward.
++"""
++
++from __future__ import annotations
++
++import gc
++import os
++from collections import OrderedDict
++from typing import Sequence
++
++import torch
++
++from . import attention, ops
++from .forward import Chain, Model
++
++BUCKET = 8192            # smallest key span a graph covers; longer contexts take the next power of two
++KEEP = int(os.environ.get("TF_MIMO_GRAPHS_KEEP", "48"))      # graphs held (least recently replayed dropped)
++MAX_ROWS = 32            # widest window graphed
++
++
++class Staged:
++    """A key's fixed device inputs and the pinned host mirror refreshed before each replay."""
++
++    def __init__(self, model: Model, widths: tuple[int, ...], bucket: int) -> None:
++        dev = model.w.embed.device
++        self.widths, self.width, self.streams = widths, sum(widths), len(widths)
++        self.chunks = bucket // attention.CK
++        w = self.width
++        self.host32 = torch.zeros(2 * w, dtype=torch.int32).pin_memory()      # positions, slots
++        self.dev32 = torch.zeros(2 * w, dtype=torch.int32, device=dev)
++        self.pos32, self.slot32 = self.dev32[:w], self.dev32[w:]
++        self.host64 = torch.zeros(w, dtype=torch.int64).pin_memory()
++        self.ids = torch.zeros(w, dtype=torch.int64, device=dev)
++
++    def refresh(self, chains: Sequence[Chain]) -> None:
++        w = self.width
++        h32, h64 = self.host32.numpy(), self.host64.numpy()
++        at = 0
++        for c in chains:
++            n = len(c.tokens)
++            h64[at:at + n] = c.tokens
++            h32[at:at + n] = range(c.p0, c.p0 + n)
++            h32[w + at:w + at + n] = c.slot
++            at += n
++        self.dev32.copy_(self.host32, non_blocking=True)
++        self.ids.copy_(self.host64, non_blocking=True)
++
++
++class Graphs:
++    def __init__(self, model: Model) -> None:
++        self.model = model
++        self.pool = torch.cuda.graph_pool_handle()
++        self.entries: OrderedDict[tuple, tuple] = OrderedDict()
++        self.replays = self.captures = self.eager = 0
++
++    def _bucket(self, end: int) -> int:
++        return min(-(-self.model.context // attention.CK) * attention.CK,
++                   max(BUCKET, 1 << (end - 1).bit_length()))
++
++    def eligible(self, chains: Sequence[Chain]) -> bool:
++        widths = [len(c.tokens) for c in chains]
++        return max(widths) <= MAX_ROWS and sum(widths) <= ops.DECODE_ROWS
++
++    @torch.no_grad()
++    def forward(self, chains: Sequence[Chain]) -> torch.Tensor:
++        """fp32 logits of every row of ``chains`` (decode rows only)."""
++
++        m = self.model
++        if not self.eligible(chains):
++            self.eager += 1
++            return m.forward(chains, prompt=False, rows=range(sum(len(c.tokens) for c in chains)))
++        m.check(chains)
++        widths = tuple(len(c.tokens) for c in chains)
++        key = (widths, self._bucket(max(c.p0 + len(c.tokens) for c in chains)))
++        entry = self.entries.get(key)
++        if entry is None:
++            entry = self._capture(key, chains)
++        else:
++            self.entries.move_to_end(key)
++        g, staged, out = entry
++        staged.refresh(chains)
++        g.replay()
++        self.replays += 1
++        return out
++
++    def _capture(self, key, chains):
++        while len(self.entries) >= KEEP:
++            self.entries.popitem(last=False)
++        staged = Staged(self.model, key[0], key[1])
++        staged.refresh(chains)
++
++        def run():
++            return self.model.forward(None, prompt=False, staged=staged)
++
++        # A warm-up run writes the same cache rows the replay will (idempotent: same inputs, same bits) and grows
++        # every scratch buffer to this shape before capture.
++        run()
++        torch.cuda.synchronize()
++        g = torch.cuda.CUDAGraph()
++        enabled = gc.isenabled()
++        gc.disable()                                   # collecting an old graph mid-capture invalidates it
++        try:
++            with torch.cuda.graph(g, pool=self.pool):
++                out = run()
++        finally:
++            if enabled:
++                gc.enable()
++        self.captures += 1
++        entry = self.entries[key] = (g, staged, out)
++        return entry
+diff --git a/src/tensorfold/families/mimo_v2/cuda/moe.py b/src/tensorfold/families/mimo_v2/cuda/moe.py
+index 5ceebbb..8ab40d8 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/moe.py
++++ b/src/tensorfold/families/mimo_v2/cuda/moe.py
+@@ -11,6 +11,7 @@ from tensorfold.cuda import moe as shared
+ from tensorfold.cuda.exl3 import experts as x3experts
+ 
+ WINDOW = 1024            # rows a routed call (its grouping keeps every pick in shared memory)
++_EXL3_ROUTER = __import__("os").environ.get("TF_MIMO_DEBUG_EXL3_ROUTER") == "1"
+ 
+ 
+ @triton.jit
+@@ -48,6 +49,9 @@ class MoE:
+         rows, experts, k = x.shape[0], router.shape[0], self.top_k
+         x = x.contiguous()
+         logits = shared.router(x, router)                                  # [R, E] fp32
++        if _EXL3_ROUTER:            # debug A/B only: exllamav3's fp16 logits and mean-centred fp16 bias
++            logits = logits.half().float()
++            bias = (bias.float() - bias.float().mean()).half().float()
+         pick = torch.empty((rows, k), dtype=torch.int32, device=x.device)
+         wts = torch.empty((rows, k), dtype=torch.float32, device=x.device)
+         _topk[(rows,)](logits, bias, pick, wts, float(scale), NE=experts, TOPK=k,
+diff --git a/src/tensorfold/families/mimo_v2/cuda/ops.py b/src/tensorfold/families/mimo_v2/cuda/ops.py
+index 62f4d4a..2101360 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/ops.py
++++ b/src/tensorfold/families/mimo_v2/cuda/ops.py
+@@ -10,6 +10,9 @@ from tensorfold.cuda.exl3 import prefill as x3prefill
+ from tensorfold.cuda.exl3.linear import Exl3Linear
+ 
+ DECODE_ROWS = 128        # the EXL3 GEMV's row limit; decode forwards stay within it
++# Activations between the fp32 residual and the EXL3 kernels: fp16 as exllamav3 (11-bit mantissa; the kernels
++# rotate inputs to fp16 anyway), bf16 for A/B. Measured on the agent text: bf16 drifts 8x further from exllamav3.
++ACT = {"fp16": torch.float16, "bf16": torch.bfloat16}[__import__("os").environ.get("TF_MIMO_ACT", "fp16")]
+ 
+ 
+ @triton.jit
+@@ -19,15 +22,15 @@ def _rms(X, W, OUT, N: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.constexpr):
+     ok = c < N
+     x = tl.load(X + r * N + c, mask=ok, other=0.0).to(tl.float32)
+     y = x * tl.rsqrt(tl.sum(x * x, 0) / N + EPS) * tl.load(W + c, mask=ok, other=0.0)
+-    tl.store(OUT + r * N + c, y.to(tl.bfloat16), mask=ok)
++    tl.store(OUT + r * N + c, y.to(OUT.dtype.element_ty), mask=ok)
+ 
+ 
+ def rms(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+-    """bf16 rms(x) * w over the last dimension."""
++    """rms(x) * w over the last dimension, in ``ACT``."""
+ 
+     n = x.shape[-1]
+     x = x.contiguous()
+-    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
++    out = torch.empty(x.shape, dtype=ACT, device=x.device)
+     _rms[(x.numel() // n,)](x, w, out, N=n, EPS=float(eps), BLOCK=triton.next_power_of_2(n), num_warps=4)
+     return out
+ 
+@@ -42,12 +45,12 @@ def _add_rms(X, RES, W, OUT, N: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.const
+     res = tl.load(RES + r * N + c, mask=ok, other=0.0) + tl.load(X + r * N + c, mask=ok, other=0.0).to(tl.float32)
+     tl.store(RES + r * N + c, res, mask=ok)
+     y = res * tl.rsqrt(tl.sum(res * res, 0) / N + EPS) * tl.load(W + c, mask=ok, other=0.0)
+-    tl.store(OUT + r * N + c, y.to(tl.bfloat16), mask=ok)
++    tl.store(OUT + r * N + c, y.to(OUT.dtype.element_ty), mask=ok)
+ 
+ 
+ def add_rms(x: torch.Tensor, res: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+     n = res.shape[-1]
+-    out = torch.empty(res.shape, dtype=torch.bfloat16, device=res.device)
++    out = torch.empty(res.shape, dtype=ACT, device=res.device)
+     _add_rms[(res.shape[0],)](x.contiguous(), res, w, out, N=n, EPS=float(eps), BLOCK=triton.next_power_of_2(n),
+                               num_warps=4)
+     return out
+@@ -59,12 +62,12 @@ def _silu_mul(G, U, OUT, N: tl.constexpr, BLOCK: tl.constexpr):
+     c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+     g = tl.load(G + r * N + c).to(tl.float32)
+     u = tl.load(U + r * N + c).to(tl.float32)
+-    tl.store(OUT + r * N + c, (g / (1.0 + tl.exp(-g)) * u).to(tl.bfloat16))
++    tl.store(OUT + r * N + c, (g / (1.0 + tl.exp(-g)) * u).to(OUT.dtype.element_ty))
+ 
+ 
+ def silu_mul(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+     n = g.shape[1]
+-    out = torch.empty_like(g, dtype=torch.bfloat16)
++    out = torch.empty_like(g, dtype=ACT)
+     _silu_mul[(g.shape[0], n // 1024)](g.contiguous(), u.contiguous(), out, N=n, BLOCK=1024, num_warps=4)
+     return out
+ 
+@@ -76,9 +79,9 @@ class Proj:
+         self.ws = x3prefill.Workspace()
+ 
+     def __call__(self, lin: Exl3Linear, x: torch.Tensor, *, prompt: bool,
+-                 out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
++                 out_dtype: torch.dtype | None = None) -> torch.Tensor:
+         m = x.shape[0]
+-        out = torch.empty((m, lin.n), dtype=out_dtype, device=x.device)
++        out = torch.empty((m, lin.n), dtype=out_dtype or ACT, device=x.device)
+         if prompt:
+             return x3prefill.matmul(lin, x.contiguous(), out, self.ws)
+         if m > DECODE_ROWS:
+diff --git a/src/tensorfold/families/mimo_v2/cuda/tp.py b/src/tensorfold/families/mimo_v2/cuda/tp.py
+new file mode 100644
+index 0000000..a00a0e5
+--- /dev/null
++++ b/src/tensorfold/families/mimo_v2/cuda/tp.py
+@@ -0,0 +1,80 @@
++"""MiMo-V2 on two ranks: rank 0 schedules; every forward it runs is described to rank 1, which runs the same one.
++
++The description (kind, chains, tokens) goes through NCCL, which waits without a limit while rank 1 idles; the
++forward's own all-gathers go over RoCE when they fit. Both ranks gather the same partials and sum them in rank
++order, so their logits are bit-equal and only rank 0 samples.
++"""
++
++from __future__ import annotations
++
++import torch
++
++from .forward import Chain
++
++HEADER = 256            # int32 words a description carries in one gather; longer ones send the rest in a second
++STOP, PROMPT, DECODE = 0, 1, 2
++
++
++def _nccl(comm):
++    return getattr(comm, "nccl", comm)                # RoceComm wraps NCCL; descriptions take NCCL's unbounded wait
++
++
++class Mirror:
++    def __init__(self, comm, rank: int) -> None:
++        self.comm, self.rank = _nccl(comm), rank
++
++    def _gather(self, words: list[int], n: int) -> list[int]:
++        mine = torch.zeros(n, dtype=torch.int32)
++        if self.rank == 0:
++            mine[:len(words)] = torch.tensor(words, dtype=torch.int32)
++        got = torch.empty(2 * n, dtype=torch.int32, device="cuda")
++        self.comm.all_gather(mine.pin_memory().cuda(non_blocking=True), got)
++        if self.rank == 0:                               # its own words: no wait on the gather here
++            return (list(words) + [0] * n)[:n]
++        return got[:n].tolist()                          # rank 0's words
++
++    def send(self, kind: int, chains=()) -> None:
++        assert self.rank == 0
++        words = [kind, len(chains), sum(len(c.tokens) for c in chains)]
++        for c in chains:
++            words += [c.slot, c.p0, len(c.tokens)]
++        for c in chains:
++            words += list(c.tokens)
++        self._exchange(words)
++
++    def _exchange(self, words: list[int]) -> list[int]:
++        head = self._gather(words[:HEADER], HEADER)
++        kind, n, total = head[0], head[1], head[2]
++        size = 3 + 3 * n + total
++        if size > HEADER:
++            head = head + self._gather(words[HEADER:size], size - HEADER)
++        return head[:size]
++
++    def receive(self) -> tuple[int, list[Chain]]:
++        assert self.rank == 1
++        w = self._exchange([])
++        kind, n = w[0], w[1]
++        chains, at = [], 3 + 3 * n
++        for i in range(n):
++            slot, p0, length = w[3 + 3 * i:6 + 3 * i]
++            chains.append(Chain(slot, p0, w[at:at + length]))
++            at += length
++        return kind, chains
++
++
++def follow(model, graphs, mirror: Mirror) -> None:
++    """Rank 1: run every forward rank 0 describes until it says stop."""
++
++    while True:
++        kind, chains = mirror.receive()
++        if kind == STOP:
++            return
++        try:
++            if kind == PROMPT:
++                model.forward(chains, prompt=True)
++            elif graphs is not None:
++                graphs.forward(chains)
++            else:
++                model.forward(chains, prompt=False, rows=range(sum(len(c.tokens) for c in chains)))
++        except ValueError as exc:            # refused before any gather, on rank 0 too (the same check)
++            print(f"[tensorfold] mimo_v2 rank 1: {exc}", flush=True)
+diff --git a/src/tensorfold/families/mimo_v2/cuda/weights.py b/src/tensorfold/families/mimo_v2/cuda/weights.py
+index 69fec7d..666e697 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/weights.py
++++ b/src/tensorfold/families/mimo_v2/cuda/weights.py
+@@ -21,6 +21,8 @@ import torch
+ from tensorfold.cuda.exl3 import experts as x3experts
+ from tensorfold.cuda.exl3.linear import Exl3Linear
+ 
++from .ops import ACT
++
+ INTERM_DIV = {47: 128.0}        # exllamav3's MiMo-V2 module: layer 47's routed experts overflow fp16 otherwise
+ 
+ 
+@@ -101,7 +103,7 @@ class Layer:
+     o: Exl3Linear                   # a rank's input columns: partial outputs under TP
+     sinks: torch.Tensor | None      # fp32 [H] (this rank's heads), sliding layers
+     post_norm: torch.Tensor         # fp32 [D], before the MLP
+-    router: torch.Tensor | None = None          # bf16 [E, D]
++    router: torch.Tensor | None = None          # [E, D] in the activation dtype (exact from bf16)
+     bias: torch.Tensor | None = None            # fp32 [E] (e_score_correction_bias)
+     experts: x3experts.Exl3RoutedExperts | None = None
+     route_scale: float = 1.0
+@@ -203,7 +205,10 @@ def load(model_dir: str | Path, device: str = "cuda", *, rank: int = 0, world: i
+                 down.append(cut(triple(x + "down_proj"), r * ni, (r + 1) * ni, "k"))
+             L.experts = x3experts.prepare(gate, up, down, "mul1", device=device)
+             del gate, up, down
+-            L.router = get(m + "gate.weight").to(torch.bfloat16).contiguous()
++            router = get(m + "gate.weight").to(torch.bfloat16)
++            L.router = router.to(ACT).contiguous()          # the router GEMM reads activations' dtype
++            if not torch.equal(L.router.to(torch.bfloat16), router):
++                raise ValueError(f"layer {i}: the router weights do not convert to {ACT} exactly")
+             L.bias = get(m + "gate.e_score_correction_bias").float().contiguous()
+             L.route_scale = INTERM_DIV.get(i, 1.0)
+         else:
+-- 
+2.53.0
+

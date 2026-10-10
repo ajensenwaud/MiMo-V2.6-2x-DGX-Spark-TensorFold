@@ -1,7 +1,7 @@
 From 008f19a591ca54fb2e43c0fa93fc671fcc72377f Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Tue, 6 Oct 2026 13:51:59 +1100
-Subject: [PATCH 16/23] perf(kolibri1 cuda): o_proj on 16 K slices
+Subject: [PATCH 16/30] perf(kolibri1 cuda): o_proj on 16 K slices
  (Fp8BlockLinear.sk, shape-fixed); qmm split sweep tool
 
 ---

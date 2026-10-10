@@ -1,7 +1,7 @@
 From ea36c89e135fc5882e17e09636dc31893a17de5d Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Tue, 6 Oct 2026 14:25:18 +1100
-Subject: [PATCH 18/23] fix(fp8 linear): a weight's own K slices for decode
+Subject: [PATCH 18/30] fix(fp8 linear): a weight's own K slices for decode
  calls only, row tiles at any M (no fused-path refusal); prompt rows keep the
  shape rule; KL tool saves logits
 

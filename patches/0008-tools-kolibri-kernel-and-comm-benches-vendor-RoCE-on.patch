@@ -1,7 +1,7 @@
 From 42e7932df4021607a62509e595f1ea223ff5af84 Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Tue, 6 Oct 2026 13:03:22 +1100
-Subject: [PATCH 08/23] tools: kolibri kernel and comm benches; vendor RoCE
+Subject: [PATCH 08/30] tools: kolibri kernel and comm benches; vendor RoCE
  one-shot all-gather (b12x RoCEnante, Apache-2.0) from TensorFold GLM image
 
 ---

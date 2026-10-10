@@ -1,0 +1,904 @@
+From fd97712d8cca4f8731ec51b4f4f04f8601524590 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Fri, 9 Oct 2026 08:21:24 +1100
+Subject: [PATCH 24/30] feat(mimo_v2): MiMo-V2.6-Flash on CUDA from EXL3 packs:
+ weights (128-aligned TP cuts), attention (qk 192 / v 128, partial RoPE,
+ sinks, chunked decode + query-tiled prompt kernels), sigmoid+bias top-8 MoE
+ on the grouped EXL3 kernel, forward
+
+---
+ src/tensorfold/families/mimo_v2/__init__.py   |  38 +++
+ .../families/mimo_v2/cuda/__init__.py         |   1 +
+ .../families/mimo_v2/cuda/attention.py        | 267 ++++++++++++++++++
+ .../families/mimo_v2/cuda/forward.py          | 161 +++++++++++
+ src/tensorfold/families/mimo_v2/cuda/moe.py   |  59 ++++
+ src/tensorfold/families/mimo_v2/cuda/ops.py   |  86 ++++++
+ .../families/mimo_v2/cuda/weights.py          | 222 +++++++++++++++
+ 7 files changed, 834 insertions(+)
+ create mode 100644 src/tensorfold/families/mimo_v2/__init__.py
+ create mode 100644 src/tensorfold/families/mimo_v2/cuda/__init__.py
+ create mode 100644 src/tensorfold/families/mimo_v2/cuda/attention.py
+ create mode 100644 src/tensorfold/families/mimo_v2/cuda/forward.py
+ create mode 100644 src/tensorfold/families/mimo_v2/cuda/moe.py
+ create mode 100644 src/tensorfold/families/mimo_v2/cuda/ops.py
+ create mode 100644 src/tensorfold/families/mimo_v2/cuda/weights.py
+
+diff --git a/src/tensorfold/families/mimo_v2/__init__.py b/src/tensorfold/families/mimo_v2/__init__.py
+new file mode 100644
+index 0000000..f88d5ec
+--- /dev/null
++++ b/src/tensorfold/families/mimo_v2/__init__.py
+@@ -0,0 +1,38 @@
++"""MiMo-V2.6-Flash (mimo_v2): Xiaomi's MoE with sliding-window and full attention, from EXL3 packs, on CUDA."""
++# 48 layers: 39 sliding (window 128, sink logits) and 9 full; 256 routed experts, top 8 by sigmoid score plus bias.
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any
++
++MODEL_TYPES = ("mimo_v2",)
++TITLE = "MiMo-V2.6-Flash"
++MODELS = ("benthecarman/MiMo-V2.6-Flash-RL-exl3",)
++QUANT_METHODS = {"cuda": ("exl3",)}
++EXL3_VARIANT = "any"           # tensorfold.families.EXL3_VARIANT_ANY: every width; the loader takes the mul1 codebook
++
++
++def check(model_dir: str | Path) -> None:
++    """An EXL3 pack of the mimo_v2 architecture (any bit widths, the mul1 codebook)."""
++
++    from .cuda.weights import Config
++
++    Config.read(model_dir)
++
++
++def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
++                master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None,
++                context: int | None = None, **options: Any):
++    """One GPU or two ranks (--tp 2); ``--parallel`` requests decoded together; the context sized from memory."""
++
++    if drafter:
++        raise ValueError(f"{TITLE}: the DFlash drafter is not wired on CUDA yet: drop --drafter")
++    if int(tp) not in (1, 2):
++        raise ValueError(f"{TITLE} runs on one GPU or two ranks (--tp 2)")
++    from .cuda.engine import MiMoEngine
++
++    return MiMoEngine(Path(model_dir), context=int(context) if context else None,
++                      explicit=bool(options.get("context_explicit")),
++                      streams=max(1, int(options.get("parallel") or 1)),
++                      tp=int(tp), rank=int(rank), master=master, port=int(master_port))
+diff --git a/src/tensorfold/families/mimo_v2/cuda/__init__.py b/src/tensorfold/families/mimo_v2/cuda/__init__.py
+new file mode 100644
+index 0000000..aa77dbf
+--- /dev/null
++++ b/src/tensorfold/families/mimo_v2/cuda/__init__.py
+@@ -0,0 +1 @@
++"""MiMo-V2.6-Flash's CUDA engine: EXL3 projections and experts, sliding and full attention, one or two ranks."""
+diff --git a/src/tensorfold/families/mimo_v2/cuda/attention.py b/src/tensorfold/families/mimo_v2/cuda/attention.py
+new file mode 100644
+index 0000000..43b70df
+--- /dev/null
++++ b/src/tensorfold/families/mimo_v2/cuda/attention.py
+@@ -0,0 +1,267 @@
++"""MiMo-V2's attention: q/k heads of 192 (the leading 64 rotated), v heads of 128, sink logits on sliding layers.
++
++Caches hold keys [slots, LEN, HK, 192] and values [slots, LEN, HK, 128]; a full layer's LEN is the context, a
++sliding layer's a ring (key p at p % LEN). Every forward writes its rows' keys and values first (``qkv``), then
++attends from the caches alone.
++
++Decode rows (and sliding prompt rows): a program per (row, key head, key chunk of CK keys at absolute positions),
++then a merge over the chunks in order with the sink logit last. A row's bits depend on its position only, never on
++the rows beside it or the window it rides in, so drafted rows equal serial ones. Full prompt rows: a program per
++(BM rows, key head) holding the head group's queries, keys walked in order; prompt rows have the prompt kernel's bits.
++"""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++CK = 256          # keys a decode chunk (absolute positions)
++BN = 64           # keys a tile
++GP = 16           # query heads a program holds (a key head's group, padded)
++BM = 8            # prompt rows a full-attention prompt program (x 16 heads = 128 query rows)
++
++
++@triton.jit
++def _qkv(Q, K, V, COS, SIN, POS, SLOT, QO, KC, VC, LEN, H: tl.constexpr, HK: tl.constexpr, RD: tl.constexpr):
++    """Program (row, head of H + HK + HK): q and k get RoPE on their first RD dims (NEOX halves), k and v go to the
++    caches at pos % LEN. Head dims: q/k 192 = 128 + 64, v 128."""
++
++    r = tl.program_id(0).to(tl.int64)
++    hd = tl.program_id(1)
++    pos = tl.load(POS + r)
++    at = tl.load(SLOT + r).to(tl.int64) * LEN + pos % LEN
++    d64 = tl.arange(0, 64)
++    d128 = tl.arange(0, 128)
++    if hd < H + HK:
++        is_q = hd < H
++        if is_q:
++            src = Q + (r * H + hd) * 192
++        else:
++            src = K + (r * HK + (hd - H)) * 192
++        # rotated part: dims [0, RD) with RD == 64
++        x = tl.load(src + d64).to(tl.float32)
++        half: tl.constexpr = RD // 2
++        xp = tl.load(src + (d64 + half) % RD).to(tl.float32)
++        j = d64 % half
++        cos = tl.load(COS + pos.to(tl.int64) * half + j)
++        sin = tl.load(SIN + pos.to(tl.int64) * half + j)
++        y = (x * cos + tl.where(d64 < half, -xp, xp) * sin).to(tl.bfloat16)
++        rest = tl.load(src + 64 + d128)                     # dims [64, 192) pass through
++        if is_q:
++            dst = QO + (r * H + hd) * 192
++        else:
++            dst = KC + (at * HK + (hd - H)) * 192
++        tl.store(dst + d64, y)
++        tl.store(dst + 64 + d128, rest)
++    else:
++        k = hd - H - HK                                         # v_proj is 192 a head in the pack: 128 real, 64 pad
++        tl.store(VC + (at * HK + k) * 128 + d128, tl.load(V + (r * HK + k) * 192 + d128))
++
++
++def qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, pos: torch.Tensor,
++        slots: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, *, heads: int, kv_heads: int,
++        rope_dim: int) -> torch.Tensor:
++    """q [n, H*192], k [n, HK*192], v [n, HK*192] (exllamav3 widens V to 192 a head with zeros; the first 128 are
++    the values) bf16 -> rotated q [n, H, 192]; keys and values into the caches."""
++
++    n = q.shape[0]
++    if rope_dim != 64 or q.shape[1] != heads * 192 or k.shape[1] != kv_heads * 192 or v.shape[1] != kv_heads * 192:
++        raise ValueError(f"MiMo-V2 attention: q/k/v heads of 192 (64 rotated, V padded), got q {tuple(q.shape)}, "
++                         f"k {tuple(k.shape)}, v {tuple(v.shape)} for {heads}/{kv_heads} heads")
++    qo = torch.empty((n, heads, 192), dtype=torch.bfloat16, device=q.device)
++    _qkv[(n, heads + 2 * kv_heads)](q.contiguous(), k.contiguous(), v.contiguous(), cos, sin, pos, slots, qo,
++                                    k_cache, v_cache, k_cache.shape[1], H=heads, HK=kv_heads, RD=rope_dim,
++                                    num_warps=1)
++    return qo
++
++
++def rope_tables(context: int, theta: float, rope_dim: int, device) -> tuple[torch.Tensor, torch.Tensor]:
++    """cos, sin [context, rope_dim / 2] fp32, computed in float64 (inv_freq = theta^(-2j / rope_dim))."""
++
++    half = rope_dim // 2
++    inv = 1.0 / theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float64, device=device) / rope_dim)
++    ang = torch.arange(context, dtype=torch.float64, device=device)[:, None] * inv[None, :]
++    return ang.cos().float().contiguous(), ang.sin().float().contiguous()
++
++
++@triton.jit
++def _scores(qa, qb, ka, kb, valid, SCALE: tl.constexpr):
++    s = (tl.dot(qa, tl.trans(ka)) + tl.dot(qb, tl.trans(kb))).to(tl.float32) * SCALE
++    return tl.where(valid[None, :], s, float("-inf"))
++
++
++@triton.jit
++def _online(s, v, m, l, o):
++    tile_m = tl.max(s, 1)
++    active = tile_m != float("-inf")
++    next_m = tl.where(active, tl.maximum(m, tile_m), m)
++    alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
++    p = tl.where(active[:, None], tl.exp(s - next_m[:, None]), 0.0)
++    o = o * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
++    l = l * alpha + tl.sum(p, 1)
++    return next_m, l, o
++
++
++@triton.jit
++def _rows(Q, KC, VC, POS, SLOT, PO, PM, PL, LEN, NCH, H: tl.constexpr, HK: tl.constexpr, G: tl.constexpr,
++          WIN: tl.constexpr, SCALE: tl.constexpr, CK: tl.constexpr, BN: tl.constexpr, GP: tl.constexpr):
++    """Program (row, key head, chunk c): the row's G heads over keys of chunk c within its range; partial m, l, o.
++
++    Range: (pos - WIN, pos] when WIN > 0 (sliding: chunk c counts from the range's first chunk), else [0, pos]."""
++
++    r = tl.program_id(0).to(tl.int64)
++    hk = tl.program_id(1)
++    c = tl.program_id(2)
++    pos = tl.load(POS + r)
++    base = tl.load(SLOT + r).to(tl.int64) * LEN
++    gg = tl.arange(0, GP)
++    hm = gg < G
++    da = tl.arange(0, 128)
++    db = tl.arange(0, 64)
++    qrow = (r * H + hk * G + gg[:, None]) * 192
++    qa = tl.load(Q + qrow + da[None, :], mask=hm[:, None], other=0.0)
++    qb = tl.load(Q + qrow + 128 + db[None, :], mask=hm[:, None], other=0.0)
++    if WIN > 0:
++        lo = tl.maximum(pos - WIN + 1, 0)
++        c0 = lo // CK + c
++    else:
++        lo = 0
++        c0 = c
++    m = tl.full((GP,), float("-inf"), tl.float32)
++    l = tl.zeros((GP,), tl.float32)
++    o = tl.zeros((GP, 128), tl.float32)
++    start = c0 * CK
++    if start <= pos:
++        for t in range(0, CK // BN):
++            keys = start + t * BN + tl.arange(0, BN)
++            valid = (keys >= lo) & (keys <= pos)
++            at = ((base + keys % LEN) * HK + hk)[:, None]
++            ka = tl.load(KC + at * 192 + da[None, :], mask=valid[:, None], other=0.0)
++            kb = tl.load(KC + at * 192 + 128 + db[None, :], mask=valid[:, None], other=0.0)
++            v = tl.load(VC + at * 128 + da[None, :], mask=valid[:, None], other=0.0)
++            m, l, o = _online(_scores(qa, qb, ka, kb, valid, SCALE), v, m, l, o)
++    heads = hk * G + gg
++    part = (r * NCH + c) * H + heads
++    tl.store(PM + part, m, mask=hm)
++    tl.store(PL + part, l, mask=hm)
++    tl.store(PO + part[:, None] * 128 + da[None, :], o, mask=hm[:, None])
++
++
++@triton.jit
++def _merge(PO, PM, PL, SINKS, OUT, NCH, H: tl.constexpr, HAS_SINK: tl.constexpr):
++    """Program (row, head): chunks folded in order, then the sink logit; bf16 out."""
++
++    r = tl.program_id(0).to(tl.int64)
++    h = tl.program_id(1)
++    d = tl.arange(0, 128)
++    m = float("-inf")
++    for c in range(0, NCH):
++        m = tl.maximum(m, tl.load(PM + (r * NCH + c) * H + h))
++    if HAS_SINK:
++        sink = tl.load(SINKS + h)
++        m = tl.maximum(m, sink)
++    l = 0.0
++    o = tl.zeros((128,), tl.float32)
++    for c in range(0, NCH):
++        at = (r * NCH + c) * H + h
++        cm = tl.load(PM + at)
++        f = tl.where(cm == float("-inf"), 0.0, tl.exp(cm - m))
++        l += tl.load(PL + at) * f
++        o += tl.load(PO + at * 128 + d) * f
++    if HAS_SINK:
++        l += tl.exp(sink - m)
++    tl.store(OUT + (r * H + h) * 128 + d, (o / l).to(tl.bfloat16))
++
++
++class Partials:
++    """Scratch of the chunk partials, grown to the largest (rows x chunks) seen (static under graph capture)."""
++
++    def __init__(self) -> None:
++        self.o = self.m = self.l = None
++
++    def get(self, n: int, h: int, device):
++        if self.m is None or self.m.numel() < n * h:
++            self.o = torch.empty((n * h * 128,), dtype=torch.float32, device=device)
++            self.m = torch.empty((n * h,), dtype=torch.float32, device=device)
++            self.l = torch.empty((n * h,), dtype=torch.float32, device=device)
++        return self.o, self.m, self.l
++
++
++def rows(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, pos: torch.Tensor, slots: torch.Tensor,
++         sinks: torch.Tensor | None, scratch: Partials, *, window: int, chunks: int, scale: float) -> torch.Tensor:
++    """q [W, H, 192] at ``pos`` of streams ``slots`` -> [W, H, 128] bf16. ``window`` > 0: sliding (2 chunks always
++    cover it); else full, ``chunks`` CK-key chunks from position 0 (enough for the largest position)."""
++
++    w, h, _ = q.shape
++    hk, ln = k_cache.shape[2], k_cache.shape[1]
++    g = h // hk
++    if h % hk or g > GP:
++        raise ValueError("attention: heads a multiple of key heads, at most 16 a group")
++    nch = (-(-window // CK) + 1) if window > 0 else int(chunks)
++    po, pm, pl = scratch.get(w * nch, h, q.device)
++    _rows[(w, hk, nch)](q, k_cache, v_cache, pos, slots, po, pm, pl, ln, nch, H=h, HK=hk, G=g, WIN=int(window),
++                        SCALE=float(scale), CK=CK, BN=BN, GP=GP, num_warps=4, num_stages=2)
++    out = torch.empty((w, h, 128), dtype=torch.bfloat16, device=q.device)
++    _merge[(w, h)](po, pm, pl, sinks if sinks is not None else pm, out, nch, H=h, HAS_SINK=sinks is not None,
++                   num_warps=1)
++    return out
++
++
++@triton.jit
++def _prompt(Q, KC, VC, OUT, P0, W, H: tl.constexpr, HK: tl.constexpr, G: tl.constexpr, SCALE: tl.constexpr,
++            BM: tl.constexpr, BN: tl.constexpr):
++    """Program (row block, key head): BM rows x G heads of queries at positions P0 + [b BM, (b + 1) BM) over every
++    key at or before each row (one stream's full cache), in order; bf16 out. G * BM rows a tile (16 x 8)."""
++
++    b = tl.program_id(0)
++    hk = tl.program_id(1)
++    QR: tl.constexpr = BM * G
++    i = tl.arange(0, QR)
++    row = b * BM + i // G
++    head = hk * G + i % G
++    ok = row < W
++    pos = P0 + row
++    da = tl.arange(0, 128)
++    db = tl.arange(0, 64)
++    qrow = (row.to(tl.int64) * H + head) * 192
++    qa = tl.load(Q + qrow[:, None] + da[None, :], mask=ok[:, None], other=0.0)
++    qb = tl.load(Q + qrow[:, None] + 128 + db[None, :], mask=ok[:, None], other=0.0)
++    m = tl.full((QR,), float("-inf"), tl.float32)
++    l = tl.zeros((QR,), tl.float32)
++    o = tl.zeros((QR, 128), tl.float32)
++    last = P0 + tl.minimum(W, (b + 1) * BM) - 1
++    for t in range(0, last // BN + 1):
++        keys = t * BN + tl.arange(0, BN)
++        at = (keys.to(tl.int64) * HK + hk)[:, None]
++        kin = keys <= last
++        ka = tl.load(KC + at * 192 + da[None, :], mask=kin[:, None], other=0.0)
++        kb = tl.load(KC + at * 192 + 128 + db[None, :], mask=kin[:, None], other=0.0)
++        v = tl.load(VC + at * 128 + da[None, :], mask=kin[:, None], other=0.0)
++        s = (tl.dot(qa, tl.trans(ka)) + tl.dot(qb, tl.trans(kb))).to(tl.float32) * SCALE
++        s = tl.where((keys[None, :] <= pos[:, None]) & ok[:, None], s, float("-inf"))
++        m, l, o = _online(s, v, m, l, o)
++    out = o / tl.where(l > 0, l, 1.0)[:, None]
++    tl.store(OUT + ((row.to(tl.int64) * H + head) * 128)[:, None] + da[None, :], out.to(tl.bfloat16),
++             mask=ok[:, None])
++
++
++def prompt(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, p0: int, *, scale: float) -> torch.Tensor:
++    """One stream's prompt rows q [W, H, 192] at [p0, p0 + W) over its full caches k [LEN, HK, 192], v [LEN, HK, 128]
++    (the chunk's keys already written) -> [W, H, 128] bf16. No sinks (MiMo's full layers have none)."""
++
++    w, h, _ = q.shape
++    hk = k_cache.shape[1]
++    g = h // hk
++    if g != 16:
++        raise ValueError("full-attention prompt kernel: 16 query heads a key head")
++    out = torch.empty((w, h, 128), dtype=torch.bfloat16, device=q.device)
++    _prompt[(triton.cdiv(w, BM), hk)](q, k_cache, v_cache, out, int(p0), w, H=h, HK=hk, G=g, SCALE=float(scale),
++                                      BM=BM, BN=BN, num_warps=8, num_stages=2)
++    return out
++
++
++def ring_size(rows: int, window: int) -> int:
++    """Ring slots a sliding layer keeps: a forward writes ``rows`` keys before its first row reads ``window`` back."""
++
++    return -(-(rows + window) // BN) * BN
+diff --git a/src/tensorfold/families/mimo_v2/cuda/forward.py b/src/tensorfold/families/mimo_v2/cuda/forward.py
+new file mode 100644
+index 0000000..a8a2f7f
+--- /dev/null
++++ b/src/tensorfold/families/mimo_v2/cuda/forward.py
+@@ -0,0 +1,161 @@
++"""MiMo-V2's forward over streams' serial chains of rows: prompt chunks and decode rows, a cache slot a stream."""
++# Decode rows run row-invariant kernels (their bits depend on position, never on the rows beside them); prompt rows
++# run the prompt kernels and have those kernels' bits.
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Sequence
++
++import torch
++
++from . import attention, ops
++from .moe import MoE
++from .weights import Weights
++
++PROMPT_CHUNK = 8192            # prompt rows a forward
++
++
++@dataclass
++class Chain:
++    """A stream's rows in one forward: its cache slot, first position, tokens."""
++
++    slot: int
++    p0: int
++    tokens: Sequence[int]
++
++
++class Model:
++    """The weights and ``slots`` streams' caches: full layers keep ``context`` positions, sliding ones a ring."""
++
++    def __init__(self, w: Weights, context: int, slots: int = 1, device: str = "cuda", comm=None) -> None:
++        cfg = w.config
++        self.w, self.cfg, self.context, self.slots = w, cfg, int(context), int(slots)
++        self.comm = comm if w.world > 1 else None
++        if w.world > 1 and comm is None:
++            raise ValueError("a rank's share of the weights needs its communicator")
++        self.ring = attention.ring_size(PROMPT_CHUNK, cfg.window)
++        self.k, self.v = [], []
++        for i, full in enumerate(cfg.full):
++            n = self.context if full else self.ring
++            hk = cfg.kv_heads(i)
++            self.k.append(torch.zeros((self.slots, n, hk, cfg.qk_dim), dtype=torch.bfloat16, device=device))
++            self.v.append(torch.zeros((self.slots, n, hk, cfg.v_dim), dtype=torch.bfloat16, device=device))
++        self.rope = {}
++        for theta in {cfg.theta_full, cfg.theta_swa}:
++            self.rope[theta] = attention.rope_tables(self.context, theta, cfg.rope_dim, device)
++        self.scale = cfg.qk_dim ** -0.5
++        self.proj = ops.Proj()
++        self.partials = attention.Partials()
++        first = next(L.experts for L in w.layers if L.experts is not None)
++        self.moe = MoE(first, cfg.top_k, device)
++
++    @staticmethod
++    def slot_bytes(cfg, context: int) -> int:
++        """Cache bytes a stream takes at ``context`` positions (bf16 keys and values)."""
++
++        ring = attention.ring_size(PROMPT_CHUNK, cfg.window)
++        n = 0
++        for i, full in enumerate(cfg.full):
++            n += cfg.kv_heads(i) * (cfg.qk_dim + cfg.v_dim) * 2 * (context if full else ring)
++        return n
++
++    def _sum(self, part: torch.Tensor) -> torch.Tensor:
++        """Under TP the ranks' partial rows summed in rank order (fp32; the same bits on both ranks)."""
++
++        if self.comm is None:
++            return part
++        part = part.contiguous()
++        recv = torch.empty((2, *part.shape), dtype=part.dtype, device=part.device)
++        self.comm.all_gather(part, recv)
++        return recv[0].float() + recv[1].float()
++
++    def _logits(self, x: torch.Tensor) -> torch.Tensor:
++        part = self.proj(self.w.head, x, prompt=False, out_dtype=torch.float32)   # a rank's vocab slice
++        if self.comm is None:
++            return part
++        recv = torch.empty((2, *part.shape), dtype=part.dtype, device=part.device)
++        self.comm.all_gather(part.contiguous(), recv)
++        return recv.permute(1, 0, 2).reshape(part.shape[0], 2 * part.shape[1])
++
++    def check(self, chains: Sequence[Chain]) -> None:
++        for c in chains:
++            if len(c.tokens) > self.ring - self.cfg.window:
++                raise ValueError(f"a chain of {len(c.tokens)} rows overruns the {self.ring}-key sliding ring")
++            if c.p0 + len(c.tokens) > self.context:
++                raise ValueError(f"positions through {c.p0 + len(c.tokens)} exceed the {self.context}-token cache")
++
++    @torch.no_grad()
++    def forward(self, chains: Sequence[Chain], *, prompt: bool, rows: Sequence[int] | None = None,
++                features: bool = False) -> torch.Tensor:
++        """fp32 logits of ``rows`` (default: each chain's last), or with ``features`` every row's normed state."""
++
++        cfg, w = self.cfg, self.w
++        dev = w.embed.device
++        if prompt and len(chains) != 1:
++            raise ValueError("a prompt forward takes one stream's chunk")
++        self.check(chains)
++        ids = torch.tensor([t for c in chains for t in c.tokens], dtype=torch.int64).to(dev, non_blocking=True)
++        pos_l = [c.p0 + i for c in chains for i in range(len(c.tokens))]
++        n = len(pos_l)
++        pos32 = torch.tensor(pos_l, dtype=torch.int32).to(dev, non_blocking=True)
++        slot32 = torch.tensor([c.slot for c in chains for _ in c.tokens], dtype=torch.int32).to(dev, non_blocking=True)
++        chunks = max(pos_l) // attention.CK + 1
++        res = w.embed[ids].float()
++        h, eps = cfg.heads, cfg.eps
++        x = ops.rms(res, w.layers[0].input_norm, eps)
++        for i, L in enumerate(w.layers):
++            hk = cfg.kv_heads(i)
++            q = self.proj(L.q, x, prompt=prompt)
++            k = self.proj(L.k, x, prompt=prompt)
++            v = self.proj(L.v, x, prompt=prompt)
++            cos, sin = self.rope[cfg.theta(i)]
++            qr = attention.qkv(q, k, v, cos, sin, pos32, slot32, self.k[i], self.v[i], heads=h, kv_heads=hk,
++                               rope_dim=cfg.rope_dim)
++            if not cfg.full[i]:
++                a = attention.rows(qr, self.k[i], self.v[i], pos32, slot32, L.sinks, self.partials,
++                                   window=cfg.window, chunks=0, scale=self.scale)
++            elif prompt:
++                c = chains[0]
++                a = attention.prompt(qr, self.k[i][c.slot], self.v[i][c.slot], c.p0, scale=self.scale)
++            else:
++                a = attention.rows(qr, self.k[i], self.v[i], pos32, slot32, None, self.partials, window=0,
++                                   chunks=chunks, scale=self.scale)
++            o = self.proj(L.o, a.view(n, h * cfg.v_dim), prompt=prompt, out_dtype=torch.float32)
++            x = ops.add_rms(self._sum(o), res, L.post_norm, eps)
++            if L.experts is not None:
++                m = self.moe(x, L.router, L.bias, L.experts, L.route_scale)
++            else:
++                g = self.proj(L.gate, x, prompt=prompt)
++                u = self.proj(L.up, x, prompt=prompt)
++                m = self.proj(L.down, ops.silu_mul(g, u), prompt=prompt, out_dtype=torch.float32)
++            after = w.layers[i + 1].input_norm if i + 1 < len(w.layers) else w.norm
++            x = ops.add_rms(self._sum(m), res, after, eps)
++        if rows is None:
++            ends, at = [], 0
++            for c in chains:
++                at += len(c.tokens)
++                ends.append(at - 1)
++            rows = ends
++        if features:
++            return x
++        x = x[torch.tensor(list(rows), device=dev)]
++        out = []
++        for r0 in range(0, x.shape[0], ops.DECODE_ROWS):          # the head's GEMV takes 128 rows a call
++            out.append(self._logits(x[r0:r0 + ops.DECODE_ROWS]))
++        return out[0] if len(out) == 1 else torch.cat(out)
++
++    def prefill(self, prompt: Sequence[int], start: int = 0, slot: int = 0, chunk: int | None = None) -> torch.Tensor:
++        """The prompt from ``start`` in chunks; the last row's logits [1, V]."""
++
++        chunk = chunk or PROMPT_CHUNK
++        logits = None
++        for a in range(start, len(prompt), chunk):
++            b = min(len(prompt), a + chunk)
++            logits = self.forward([Chain(slot, a, prompt[a:b])], prompt=True)
++        return logits
++
++    def step(self, tokens: Sequence[int], positions: Sequence[int], slots: Sequence[int]) -> torch.Tensor:
++        """One decode row a stream: logits [streams, V]."""
++
++        return self.forward([Chain(s, p, [t]) for t, p, s in zip(tokens, positions, slots)], prompt=False)
+diff --git a/src/tensorfold/families/mimo_v2/cuda/moe.py b/src/tensorfold/families/mimo_v2/cuda/moe.py
+new file mode 100644
+index 0000000..5ceebbb
+--- /dev/null
++++ b/src/tensorfold/families/mimo_v2/cuda/moe.py
+@@ -0,0 +1,59 @@
++"""MiMo-V2's MoE: fp32 router logits, top 8 by sigmoid score plus the correction bias (ties to the lower id), each
++weighted by its sigmoid score normalised over the 8 (times layer 47's interm_div), on the grouped EXL3 kernel."""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++from tensorfold.cuda import moe as shared
++from tensorfold.cuda.exl3 import experts as x3experts
++
++WINDOW = 1024            # rows a routed call (its grouping keeps every pick in shared memory)
++
++
++@triton.jit
++def _topk(L, BIAS, PICK, WTS, SCALE, NE: tl.constexpr, TOPK: tl.constexpr, BLOCK: tl.constexpr,
++          KP: tl.constexpr):
++    r = tl.program_id(0).to(tl.int64)
++    ar = tl.arange(0, BLOCK)
++    ak = tl.arange(0, KP)
++    s = 1.0 / (1.0 + tl.exp(-tl.load(L + r * NE + ar, mask=ar < NE, other=0.0)))
++    v = tl.where(ar < NE, s + tl.load(BIAS + ar, mask=ar < NE, other=0.0), float("-inf"))
++    picks = tl.zeros((KP,), dtype=tl.int32)
++    w = tl.zeros((KP,), dtype=tl.float32)
++    for k in tl.static_range(TOPK):
++        top = tl.max(v, axis=0)
++        idx = tl.min(tl.where(v == top, ar, BLOCK), axis=0)
++        picks = tl.where(ak == k, idx, picks)
++        w = tl.where(ak == k, tl.sum(tl.where(ar == idx, s, 0.0), axis=0), w)
++        v = tl.where(ar == idx, float("-inf"), v)
++    w = w / (tl.sum(w, axis=0) + 1e-20) * SCALE
++    tl.store(PICK + r * TOPK + ak, picks, mask=ak < TOPK)
++    tl.store(WTS + r * TOPK + ak, w, mask=ak < TOPK)
++
++
++class MoE:
++    """Scratch shared by every MoE layer (they have one shape)."""
++
++    def __init__(self, ex: x3experts.Exl3RoutedExperts, top_k: int, device) -> None:
++        self.top_k = top_k
++        self.scratch = x3experts.Scratch(ex, WINDOW, top_k, device=device)
++
++    def __call__(self, x: torch.Tensor, router: torch.Tensor, bias: torch.Tensor, ex: x3experts.Exl3RoutedExperts,
++                 scale: float) -> torch.Tensor:
++        """x [R, D] bf16 -> [R, D] fp32: the weighted sum of its experts (a rank's share of their width under TP)."""
++
++        rows, experts, k = x.shape[0], router.shape[0], self.top_k
++        x = x.contiguous()
++        logits = shared.router(x, router)                                  # [R, E] fp32
++        pick = torch.empty((rows, k), dtype=torch.int32, device=x.device)
++        wts = torch.empty((rows, k), dtype=torch.float32, device=x.device)
++        _topk[(rows,)](logits, bias, pick, wts, float(scale), NE=experts, TOPK=k,
++                       BLOCK=triton.next_power_of_2(experts), KP=triton.next_power_of_2(k), num_warps=4)
++        out = torch.empty((rows, ex.dims), dtype=torch.float32, device=x.device)
++        for r0 in range(0, rows, WINDOW):
++            n = min(WINDOW, rows - r0)
++            x3experts.routed(x[r0:r0 + n], pick[r0:r0 + n], wts[r0:r0 + n], ex, self.scratch, out[r0:r0 + n], n)
++        return out
+diff --git a/src/tensorfold/families/mimo_v2/cuda/ops.py b/src/tensorfold/families/mimo_v2/cuda/ops.py
+new file mode 100644
+index 0000000..62f4d4a
+--- /dev/null
++++ b/src/tensorfold/families/mimo_v2/cuda/ops.py
+@@ -0,0 +1,86 @@
++"""MiMo-V2's small ops: RMS norms (a row a program, fp32) and the EXL3 projection with its decode and prompt paths."""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++from tensorfold.cuda.exl3 import prefill as x3prefill
++from tensorfold.cuda.exl3.linear import Exl3Linear
++
++DECODE_ROWS = 128        # the EXL3 GEMV's row limit; decode forwards stay within it
++
++
++@triton.jit
++def _rms(X, W, OUT, N: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.constexpr):
++    r = tl.program_id(0).to(tl.int64)
++    c = tl.arange(0, BLOCK)
++    ok = c < N
++    x = tl.load(X + r * N + c, mask=ok, other=0.0).to(tl.float32)
++    y = x * tl.rsqrt(tl.sum(x * x, 0) / N + EPS) * tl.load(W + c, mask=ok, other=0.0)
++    tl.store(OUT + r * N + c, y.to(tl.bfloat16), mask=ok)
++
++
++def rms(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
++    """bf16 rms(x) * w over the last dimension."""
++
++    n = x.shape[-1]
++    x = x.contiguous()
++    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
++    _rms[(x.numel() // n,)](x, w, out, N=n, EPS=float(eps), BLOCK=triton.next_power_of_2(n), num_warps=4)
++    return out
++
++
++@triton.jit
++def _add_rms(X, RES, W, OUT, N: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.constexpr):
++    """res (fp32, in place) += x; out = bf16(rms(res) * w)."""
++
++    r = tl.program_id(0).to(tl.int64)
++    c = tl.arange(0, BLOCK)
++    ok = c < N
++    res = tl.load(RES + r * N + c, mask=ok, other=0.0) + tl.load(X + r * N + c, mask=ok, other=0.0).to(tl.float32)
++    tl.store(RES + r * N + c, res, mask=ok)
++    y = res * tl.rsqrt(tl.sum(res * res, 0) / N + EPS) * tl.load(W + c, mask=ok, other=0.0)
++    tl.store(OUT + r * N + c, y.to(tl.bfloat16), mask=ok)
++
++
++def add_rms(x: torch.Tensor, res: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
++    n = res.shape[-1]
++    out = torch.empty(res.shape, dtype=torch.bfloat16, device=res.device)
++    _add_rms[(res.shape[0],)](x.contiguous(), res, w, out, N=n, EPS=float(eps), BLOCK=triton.next_power_of_2(n),
++                              num_warps=4)
++    return out
++
++
++@triton.jit
++def _silu_mul(G, U, OUT, N: tl.constexpr, BLOCK: tl.constexpr):
++    r = tl.program_id(0).to(tl.int64)
++    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    g = tl.load(G + r * N + c).to(tl.float32)
++    u = tl.load(U + r * N + c).to(tl.float32)
++    tl.store(OUT + r * N + c, (g / (1.0 + tl.exp(-g)) * u).to(tl.bfloat16))
++
++
++def silu_mul(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
++    n = g.shape[1]
++    out = torch.empty_like(g, dtype=torch.bfloat16)
++    _silu_mul[(g.shape[0], n // 1024)](g.contiguous(), u.contiguous(), out, N=n, BLOCK=1024, num_warps=4)
++    return out
++
++
++class Proj:
++    """EXL3 projections' shared scratch: decode rows (<= 128) on the GEMV, prompt rows on the decoded-tile GEMM."""
++
++    def __init__(self) -> None:
++        self.ws = x3prefill.Workspace()
++
++    def __call__(self, lin: Exl3Linear, x: torch.Tensor, *, prompt: bool,
++                 out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
++        m = x.shape[0]
++        out = torch.empty((m, lin.n), dtype=out_dtype, device=x.device)
++        if prompt:
++            return x3prefill.matmul(lin, x.contiguous(), out, self.ws)
++        if m > DECODE_ROWS:
++            raise ValueError(f"a decode forward takes at most {DECODE_ROWS} rows, not {m}")
++        return lin(x, out=out)
+diff --git a/src/tensorfold/families/mimo_v2/cuda/weights.py b/src/tensorfold/families/mimo_v2/cuda/weights.py
+new file mode 100644
+index 0000000..69fec7d
+--- /dev/null
++++ b/src/tensorfold/families/mimo_v2/cuda/weights.py
+@@ -0,0 +1,222 @@
++"""MiMo-V2.6-Flash's EXL3 pack on the GPU: trellis projections and routed experts, bf16 embeddings, router and norms.
++
++Under tensor parallelism (``world`` 2) a rank holds its query heads and key/value heads, its o_proj input columns,
++half of every expert's width, half the dense MLP and half the vocabulary. EXL3 rotates inputs and outputs in
++independent 128-wide Hadamard blocks, so a cut on a 128 boundary of K or N is an exact sub-matrix (every cut here is).
++
++Two scales were folded into the pack by its converter and are NOT applied again here: attention_value_scale (into
++o_proj) and layer 47's 1/128 on the experts' up_proj (``interm_div``, kept fp16-safe). The latter's compensation is
++a routing weight: ``Layer.route_scale``.
++"""
++
++from __future__ import annotations
++
++import json
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++
++import torch
++
++from tensorfold.cuda.exl3 import experts as x3experts
++from tensorfold.cuda.exl3.linear import Exl3Linear
++
++INTERM_DIV = {47: 128.0}        # exllamav3's MiMo-V2 module: layer 47's routed experts overflow fp16 otherwise
++
++
++@dataclass(frozen=True)
++class Config:
++    layers: int
++    hidden: int
++    heads: int                      # query heads (both kinds of layer)
++    kv_full: int                    # key/value heads, full layers
++    kv_swa: int                     # key/value heads, sliding layers
++    qk_dim: int                     # 192
++    v_dim: int                      # 128
++    rope_dim: int                   # 64: the leading dims of q and k that rotate (NEOX halves)
++    theta_full: float
++    theta_swa: float
++    window: int
++    full: tuple[bool, ...]          # each layer: full attention, else sliding with sink logits
++    moe: tuple[bool, ...]           # each layer: routed experts, else the dense MLP
++    vocab: int
++    experts: int
++    top_k: int
++    moe_width: int
++    dense_width: int
++    eps: float
++    eos: tuple[int, ...]
++    sinks_full: bool
++    sinks_swa: bool
++
++    @classmethod
++    def read(cls, model_dir: str | Path) -> "Config":
++        d = Path(model_dir)
++        c = json.loads((d / "config.json").read_text())
++        if c.get("model_type") != "mimo_v2":
++            raise ValueError(f"not a MiMo-V2 checkpoint: model_type {c.get('model_type')!r}")
++        q = c.get("quantization_config") or {}
++        if q.get("quant_method") != "exl3":
++            raise ValueError("MiMo-V2.6-Flash's CUDA engine reads EXL3 packs (exllamav3 >= 1.5.2 conversions)")
++        if c.get("scoring_func") != "sigmoid" or c.get("topk_method") != "noaux_tc" or int(c.get("n_group", 1)) != 1:
++            raise ValueError("MiMo-V2: expected sigmoid scores, noaux_tc selection and one group")
++        if c.get("n_shared_experts") or (c.get("routed_scaling_factor") not in (None, 1, 1.0)):
++            raise ValueError("MiMo-V2: shared experts or a routed scaling factor are not supported")
++        eos = c.get("eos_token_id")
++        eos = list(eos) if isinstance(eos, list) else [eos]
++        gen = d / "generation_config.json"
++        if gen.is_file():
++            more = json.loads(gen.read_text()).get("eos_token_id") or []
++            eos += [e for e in (more if isinstance(more, list) else [more]) if e not in eos]
++        hd = int(c["head_dim"])
++        if int(c.get("swa_head_dim", hd)) != hd or int(c.get("swa_v_head_dim", c["v_head_dim"])) != int(c["v_head_dim"]):
++            raise ValueError("MiMo-V2: sliding and full layers must share head sizes")
++        rope = c.get("rope_parameters") or {}
++        prf = float(rope.get("partial_rotary_factor", c.get("partial_rotary_factor", 1.0)))
++        return cls(
++            layers=int(c["num_hidden_layers"]), hidden=int(c["hidden_size"]), heads=int(c["num_attention_heads"]),
++            kv_full=int(c["num_key_value_heads"]), kv_swa=int(c["swa_num_key_value_heads"]), qk_dim=hd,
++            v_dim=int(c["v_head_dim"]), rope_dim=int(hd * prf),
++            theta_full=float(rope.get("rope_theta", c.get("rope_theta"))), theta_swa=float(c["swa_rope_theta"]),
++            window=int(c["sliding_window"]), full=tuple(int(t) == 0 for t in c["hybrid_layer_pattern"]),
++            moe=tuple(bool(m) for m in c["moe_layer_freq"]), vocab=int(c["vocab_size"]),
++            experts=int(c["n_routed_experts"]), top_k=int(c["num_experts_per_tok"]),
++            moe_width=int(c["moe_intermediate_size"]), dense_width=int(c["intermediate_size"]),
++            eps=float(c.get("layernorm_epsilon", c.get("rms_norm_eps", 1e-6))), eos=tuple(int(e) for e in eos if e is not None),
++            sinks_full=bool(c.get("add_full_attention_sink_bias")), sinks_swa=bool(c.get("add_swa_attention_sink_bias")))
++
++    def kv_heads(self, i: int) -> int:
++        return self.kv_full if self.full[i] else self.kv_swa
++
++    def theta(self, i: int) -> float:
++        return self.theta_full if self.full[i] else self.theta_swa
++
++
++@dataclass
++class Layer:
++    input_norm: torch.Tensor        # fp32 [D]
++    q: Exl3Linear
++    k: Exl3Linear
++    v: Exl3Linear
++    o: Exl3Linear                   # a rank's input columns: partial outputs under TP
++    sinks: torch.Tensor | None      # fp32 [H] (this rank's heads), sliding layers
++    post_norm: torch.Tensor         # fp32 [D], before the MLP
++    router: torch.Tensor | None = None          # bf16 [E, D]
++    bias: torch.Tensor | None = None            # fp32 [E] (e_score_correction_bias)
++    experts: x3experts.Exl3RoutedExperts | None = None
++    route_scale: float = 1.0
++    gate: Exl3Linear | None = None              # the dense MLP (layer 0)
++    up: Exl3Linear | None = None
++    down: Exl3Linear | None = None
++
++
++@dataclass
++class Weights:
++    config: Config                  # this rank's heads (``full`` holds the checkpoint's)
++    full: Config
++    embed: torch.Tensor             # bf16 [V, D]
++    layers: list[Layer] = field(default_factory=list)
++    norm: torch.Tensor | None = None
++    head: Exl3Linear | None = None  # a rank's V / world rows
++    rank: int = 0
++    world: int = 1
++
++    def nbytes(self) -> int:
++        n = self.embed.numel() * 2 + self.head.nbytes()
++        for L in self.layers:
++            for lin in (L.q, L.k, L.v, L.o, L.gate, L.up, L.down):
++                n += lin.nbytes() if lin is not None else 0
++            if L.experts is not None:
++                n += sum(t.numel() * t.element_size() for t in L.experts.keep)
++        return n
++
++
++def load(model_dir: str | Path, device: str = "cuda", *, rank: int = 0, world: int = 1) -> Weights:
++    """The pack, or rank ``rank``'s share of it under tensor parallelism (``world`` 2)."""
++
++    from dataclasses import replace
++
++    from tensorfold.cuda.direct_read import SafeTensors
++
++    model_dir = Path(model_dir)
++    full = Config.read(model_dir)
++    if world not in (1, 2) or not 0 <= rank < world:
++        raise ValueError(f"MiMo-V2 runs on 1 or 2 ranks, not rank {rank} of {world}")
++    for what, n in (("query heads", full.heads), ("full key heads", full.kv_full), ("sliding key heads", full.kv_swa)):
++        if n % world:
++            raise ValueError(f"MiMo-V2's {what} ({n}) do not split over {world} ranks")
++    for what, n in (("expert width", full.moe_width), ("dense width", full.dense_width), ("vocabulary", full.vocab)):
++        if n % (128 * world):
++            raise ValueError(f"MiMo-V2's {what} ({n}) does not split into 128-wide blocks over {world} ranks")
++    cfg = replace(full, heads=full.heads // world, kv_full=full.kv_full // world, kv_swa=full.kv_swa // world)
++    index = json.loads((model_dir / "model.safetensors.index.json").read_text())["weight_map"]
++    f = SafeTensors(sorted({model_dir / v for v in index.values()}))
++    t0 = time.perf_counter()
++
++    def get(name: str) -> torch.Tensor:
++        return f.get(name, device)
++
++    def triple(prefix: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        if prefix + ".mul1" not in f:
++            raise ValueError(f"{prefix}: only the mul1 EXL3 codebook is wired (pack written by exllamav3 >= 1.5)")
++        return get(prefix + ".trellis"), get(prefix + ".suh"), get(prefix + ".svh")
++
++    def cut(t: tuple, lo: int, hi: int, axis: str) -> tuple:
++        """Columns (axis "n": outputs) or rows (axis "k": inputs) [lo, hi) of an EXL3 matrix, 128-aligned."""
++
++        tr, suh, svh = t
++        if world == 1:
++            return t
++        if lo % 128 or hi % 128:
++            raise ValueError("EXL3 cuts must fall on 128-wide Hadamard blocks")
++        if axis == "n":
++            return tr[:, lo // 16:hi // 16].contiguous(), suh, svh[lo:hi].contiguous()
++        return tr[lo // 16:hi // 16].contiguous(), suh[lo:hi].contiguous(), svh
++
++    def linear(t: tuple) -> Exl3Linear:
++        return Exl3Linear.from_tensors(*t, codebook="mul1", device=device)
++
++    r = rank
++    hq, dq, dv = cfg.heads, full.qk_dim, full.v_dim
++    w = Weights(cfg, full, get("model.embed_tokens.weight").to(torch.bfloat16).contiguous(), rank=rank, world=world)
++    ni, nd = full.moe_width // world, full.dense_width // world
++    for i in range(full.layers):
++        p = f"model.layers.{i}."
++        a = p + "self_attn."
++        hk = cfg.kv_heads(i)
++        sinks = None
++        if (full.sinks_full if full.full[i] else full.sinks_swa):
++            sinks = get(a + "attention_sink_bias").float()[r * hq:(r + 1) * hq].contiguous()
++        L = Layer(input_norm=get(p + "input_layernorm.weight").float().contiguous(),
++                  q=linear(cut(triple(a + "q_proj"), r * hq * dq, (r + 1) * hq * dq, "n")),
++                  k=linear(cut(triple(a + "k_proj"), r * hk * dq, (r + 1) * hk * dq, "n")),
++                  v=linear(cut(triple(a + "v_proj"), r * hk * dq, (r + 1) * hk * dq, "n")),   # 192 a head: V + 64 pad
++                  o=linear(cut(triple(a + "o_proj"), r * hq * dv, (r + 1) * hq * dv, "k")),
++                  sinks=sinks, post_norm=get(p + "post_attention_layernorm.weight").float().contiguous())
++        if full.moe[i]:
++            m = p + "mlp."
++            gate, up, down = [], [], []
++            for e in range(full.experts):
++                x = f"{m}experts.{e}."
++                gate.append(cut(triple(x + "gate_proj"), r * ni, (r + 1) * ni, "n"))
++                up.append(cut(triple(x + "up_proj"), r * ni, (r + 1) * ni, "n"))
++                down.append(cut(triple(x + "down_proj"), r * ni, (r + 1) * ni, "k"))
++            L.experts = x3experts.prepare(gate, up, down, "mul1", device=device)
++            del gate, up, down
++            L.router = get(m + "gate.weight").to(torch.bfloat16).contiguous()
++            L.bias = get(m + "gate.e_score_correction_bias").float().contiguous()
++            L.route_scale = INTERM_DIV.get(i, 1.0)
++        else:
++            m = p + "mlp."
++            L.gate = linear(cut(triple(m + "gate_proj"), r * nd, (r + 1) * nd, "n"))
++            L.up = linear(cut(triple(m + "up_proj"), r * nd, (r + 1) * nd, "n"))
++            L.down = linear(cut(triple(m + "down_proj"), r * nd, (r + 1) * nd, "k"))
++        w.layers.append(L)
++        if i % 8 == 7 or i == full.layers - 1:
++            torch.cuda.empty_cache()
++            print(f"[tensorfold] mimo_v2: {i + 1}/{full.layers} layers in {time.perf_counter() - t0:.0f}s", flush=True)
++    w.norm = get("model.norm.weight").float().contiguous()
++    v = full.vocab // world
++    w.head = linear(cut(triple("lm_head"), r * v, (r + 1) * v, "n"))
++    f.close()
++    return w
+-- 
+2.53.0
+

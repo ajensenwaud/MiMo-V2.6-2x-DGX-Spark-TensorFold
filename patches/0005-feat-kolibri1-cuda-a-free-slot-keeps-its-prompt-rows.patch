@@ -1,7 +1,7 @@
 From afb37f44bcf4702d75cbd18dab90da86253c141e Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=BCrgen=20Schmied?= <juergenschmied70@gmail.com>
 Date: Sun, 4 Oct 2026 08:30:51 +0200
-Subject: [PATCH 05/23] feat(kolibri1 cuda): a free slot keeps its prompt rows;
+Subject: [PATCH 05/30] feat(kolibri1 cuda): a free slot keeps its prompt rows;
  a prompt extending them resumes there (equal to a fresh prefill)
 
 ---

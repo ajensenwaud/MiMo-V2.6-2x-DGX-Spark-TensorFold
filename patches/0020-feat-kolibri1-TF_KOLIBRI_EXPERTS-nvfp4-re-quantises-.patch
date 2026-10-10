@@ -1,7 +1,7 @@
 From 3b23b21902b747032c79ad04cedf43f63d335b8a Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Tue, 6 Oct 2026 23:25:12 +1100
-Subject: [PATCH 20/23] feat(kolibri1): TF_KOLIBRI_EXPERTS=nvfp4 re-quantises
+Subject: [PATCH 20/30] feat(kolibri1): TF_KOLIBRI_EXPERTS=nvfp4 re-quantises
  the FP8 experts to NVFP4 at load (MSE-chosen block scales) on the grouped
  NVFP4 kernel
 

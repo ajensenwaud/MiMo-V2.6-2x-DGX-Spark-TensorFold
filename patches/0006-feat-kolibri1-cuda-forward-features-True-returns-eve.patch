@@ -1,7 +1,7 @@
 From 3ed19cb07b0b320db2518efd0884c85c98684f8b Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=BCrgen=20Schmied?= <juergenschmied70@gmail.com>
 Date: Sun, 4 Oct 2026 09:31:49 +0200
-Subject: [PATCH 06/23] feat(kolibri1 cuda): forward(features=True) returns
+Subject: [PATCH 06/30] feat(kolibri1 cuda): forward(features=True) returns
  every row's normed state (what the head reads)
 
 ---

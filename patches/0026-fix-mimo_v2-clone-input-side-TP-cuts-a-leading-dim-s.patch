@@ -1,0 +1,28 @@
+From 76493e6f9639451f67c0fc746f39e5f5c631bc7f Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sat, 10 Oct 2026 07:24:41 +1100
+Subject: [PATCH 26/30] fix(mimo_v2): clone input-side TP cuts (a leading-dim
+ slice kept the whole matrix alive: 57.1 -> 45.4 GiB a rank on 2.27)
+
+---
+ src/tensorfold/families/mimo_v2/cuda/weights.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/tensorfold/families/mimo_v2/cuda/weights.py b/src/tensorfold/families/mimo_v2/cuda/weights.py
+index 666e697..e27ee66 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/weights.py
++++ b/src/tensorfold/families/mimo_v2/cuda/weights.py
+@@ -173,7 +173,9 @@ def load(model_dir: str | Path, device: str = "cuda", *, rank: int = 0, world: i
+             raise ValueError("EXL3 cuts must fall on 128-wide Hadamard blocks")
+         if axis == "n":
+             return tr[:, lo // 16:hi // 16].contiguous(), suh, svh[lo:hi].contiguous()
+-        return tr[lo // 16:hi // 16].contiguous(), suh[lo:hi].contiguous(), svh
++        # A leading-dimension slice is already contiguous, so .contiguous() would return a view that keeps the whole
++        # matrix alive (measured: 57.1 GiB a rank on the 2.27 pack instead of ~44); clone copies just the rows.
++        return tr[lo // 16:hi // 16].clone(), suh[lo:hi].clone(), svh
+ 
+     def linear(t: tuple) -> Exl3Linear:
+         return Exl3Linear.from_tensors(*t, codebook="mul1", device=device)
+-- 
+2.53.0
+

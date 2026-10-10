@@ -1,7 +1,7 @@
 From 320042d6529d2236470f64518804f0e6d48af275 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=BCrgen=20Schmied?= <juergenschmied70@gmail.com>
 Date: Sat, 3 Oct 2026 23:21:01 +0200
-Subject: [PATCH 02/23] feat(kolibri1 cuda): Aleph Alpha's Kolibri 1 FP8
+Subject: [PATCH 02/30] feat(kolibri1 cuda): Aleph Alpha's Kolibri 1 FP8
  checkpoint on one GPU: grouped block-FP8 experts, sliding-window rings,
  sigmoid routing, --parallel streams
 

@@ -1,0 +1,48 @@
+From d8040287b791ad4ef8a704ac0e24aadc55eed7a2 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sat, 10 Oct 2026 12:14:45 +1100
+Subject: [PATCH 30/30] mimo_v2: fp16 prompt partials measured and rejected
+ (exchange -0.65 s, casts +0.9 s a 16K chunk)
+
+---
+ src/tensorfold/families/mimo_v2/cuda/forward.py | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/src/tensorfold/families/mimo_v2/cuda/forward.py b/src/tensorfold/families/mimo_v2/cuda/forward.py
+index 163743c..685a7e9 100644
+--- a/src/tensorfold/families/mimo_v2/cuda/forward.py
++++ b/src/tensorfold/families/mimo_v2/cuda/forward.py
+@@ -75,8 +75,10 @@ class Model:
+             n += cfg.kv_heads(i) * (cfg.qk_dim + cfg.v_dim) * 2 * (context if full else ring)
+         return n
+ 
+-    def _sum(self, part: torch.Tensor) -> torch.Tensor:
+-        """Under TP the ranks' partial rows summed in rank order (fp32; the same bits on both ranks)."""
++    def _sum(self, part: torch.Tensor, prompt: bool = False) -> torch.Tensor:
++        """Under TP the ranks' partial rows summed in rank order (fp32; the same bits on both ranks). (Measured and
++        rejected: fp16 partials for prompt chunks cut the exchange 2.68 -> 2.03 s a 16K chunk but the casts and
++        overflow guard cost more; the chunk went 13.06 -> 13.32 s.)"""
+ 
+         if self.comm is None:
+             return part
+@@ -154,7 +156,7 @@ class Model:
+                 a = attention.rows(qr, self.k[i], self.v[i], pos32, slot32, None, self.partials, window=0,
+                                    chunks=chunks, scale=self.scale)
+             o = self.proj(L.o, a.view(n, h * cfg.v_dim), prompt=prompt, out_dtype=torch.float32)
+-            x = ops.add_rms(self._sum(o), res, L.post_norm, eps)
++            x = ops.add_rms(self._sum(o, prompt), res, L.post_norm, eps)
+             if capture is not None:
+                 capture[f"{i}.attn"] = res.detach().clone()
+             if L.experts is not None:
+@@ -164,7 +166,7 @@ class Model:
+                 u = self.proj(L.up, x, prompt=prompt)
+                 m = self.proj(L.down, ops.silu_mul(g, u), prompt=prompt, out_dtype=torch.float32)
+             after = w.layers[i + 1].input_norm if i + 1 < len(w.layers) else w.norm
+-            x = ops.add_rms(self._sum(m), res, after, eps)
++            x = ops.add_rms(self._sum(m, prompt), res, after, eps)
+             if capture is not None:
+                 capture[f"{i}"] = res.detach().clone()
+             if i in tap_at:
+-- 
+2.53.0
+

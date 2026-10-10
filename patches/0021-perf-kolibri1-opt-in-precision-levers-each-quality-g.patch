@@ -1,7 +1,7 @@
 From e282fc56d9c8768cb9ee8bdd40c68a80f10e361b Mon Sep 17 00:00:00 2001
 From: aj <aj@local>
 Date: Wed, 7 Oct 2026 00:31:20 +1100
-Subject: [PATCH 21/23] perf(kolibri1): opt-in precision levers, each
+Subject: [PATCH 21/30] perf(kolibri1): opt-in precision levers, each
  quality-gated: NVFP4 experts with decode split-K (nvfp4 / nvfp4-gu /
  nvfp4-decode dual copy, on-disk quant cache), FP8 LM head (Triton,
  per-(row,128) scales, fp32 logits), FP8 full-layer KV cache (shared tree
