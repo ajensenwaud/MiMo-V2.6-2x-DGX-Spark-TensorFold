@@ -1,0 +1,76 @@
+{
+ "tag": "4.0",
+ "task": "mmlu_pro",
+ "n": 500,
+ "correct": 368,
+ "acc": 0.736,
+ "ci95": 0.0386,
+ "unparsed": 12,
+ "truncated": 22,
+ "gen_tokens": 284814,
+ "wall_s": 0.0,
+ "by_category": {
+  "business": [
+   24,
+   33
+  ],
+  "law": [
+   22,
+   46
+  ],
+  "psychology": [
+   25,
+   31
+  ],
+  "biology": [
+   25,
+   30
+  ],
+  "chemistry": [
+   35,
+   40
+  ],
+  "history": [
+   9,
+   16
+  ],
+  "other": [
+   30,
+   43
+  ],
+  "health": [
+   24,
+   32
+  ],
+  "economics": [
+   27,
+   29
+  ],
+  "math": [
+   51,
+   68
+  ],
+  "physics": [
+   42,
+   56
+  ],
+  "computer science": [
+   11,
+   12
+  ],
+  "philosophy": [
+   14,
+   23
+  ],
+  "engineering": [
+   29,
+   41
+  ]
+ },
+ "settings": {
+  "thinking": "off",
+  "temperature": 0,
+  "max_tokens": 1536,
+  "concurrency": 4
+ }
+}
