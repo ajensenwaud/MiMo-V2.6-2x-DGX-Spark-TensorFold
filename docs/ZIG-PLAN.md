@@ -219,5 +219,23 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
   - Regression: Z3 windows gate re-run on this code + aot4: 1,905/1,905, both ranks.
 - Open nit: rank teardown exits 70 via fail-fast when the peer finishes first; fix with the server's stop message (Z5).
 
-**Next:** Z5 (server on :8892: OpenAI API, scheduler, joint_widths draft widths, Jay's test list, 1-hour stress), Z6
-(prompt path exact), then speed (Z7/Z8).
+### 2026-10-11 (session 6; serve down ~30 min while idle, restarted)
+- **Z5 first slice: MiMo served by the Zig engine's own server (`tensorfold-native serve`), both Sparks.**
+  `native.zig`: the lanes backend (prefill as 128-row decode windows, keyed host draws, held DFlash drafts, `keep` a
+  no-op: rejected rows are overwritten), load-time costs (windows 1-8 rows 24.1-47.1 ms, shared 32 rows 65.8 ms, draft
+  6.0 ms); rank 0 sends each GPU step over the TP plan link, rank 1 runs `tf-mimo follow`. Registered in
+  `native/cuda.zig`; two upstream touches: families without snap_* serve without the prompt cache, and TP families
+  admit their rank's weight share (`rankWeights`). Launch: `tools/zig_serve.sh` (:8892).
+  - Text: `/tokenize` on 20 conversation cases (tools, tool round trip, thinking on/off, efforts, Chinese, emoji,
+    2,901-token prompt, completions): **20/20 prompt ids equal to the Python server's.**
+  - Replies (`tools/mimo_zig_replies.py`): the answer key's 8 prompts over HTTP, greedy: **8/8 equal serially and
+    8/8 with 8 concurrent requests on 4 streams.**
+  - First spark-bench read (quick preset, decode only, 256 tokens; not like-for-like with the Python baseline's
+    preset): 1 stream code 64.0 / chat 44.4 / agent 51.8 / report 50.6 tok/s; 4 streams aggregate code 94.1 /
+    chat 61.5 / agent 73.1 / report 70.3. Python baseline: code 83.0, chat 52.9, agent 60.6, report 50.2; 4 streams
+    code 91.4, chat 85.1. Single-stream gap is the expected one before Z7 (host argmax/sampling over 152k logits and
+    8 logits rows copied each round; lanes' draft widths not tuned to MiMo).
+- Remaining Z5: sampled-draw parity with the Python server, Jay's test list, 1-hour stress, the full 608,256-token
+  context, a like-for-like spark-bench run against Python (same preset, same night).
+
+**Next:** finish Z5, then Z6 (prompt path exact: needed for prefill speed), then Z7 speed-ups.

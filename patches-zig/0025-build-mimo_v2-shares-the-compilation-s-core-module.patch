@@ -1,0 +1,36 @@
+From 78a9a411a3389fdd8f98d00103c5c52ac154b030 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 17:17:11 +1100
+Subject: [PATCH 25/26] build: mimo_v2 shares the compilation's core module
+
+---
+ zig/build/cuda.zig | 8 +++-----
+ 1 file changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 806f2e85..1cf02ea0 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -150,16 +150,14 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
+         .target = target,
+         .optimize = optimize,
+         .link_libc = true,
+-        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron }, .{ .name = "mimo_v2", .module = mimoModule(b, target, optimize, cuda, lanes) } },
++        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron }, .{ .name = "mimo_v2", .module = mimoModule(b, target, optimize, cuda, lanes, nemotron) } },
+     });
+     return .{ .api = api, .engines = mod };
+ }
+ 
+ /// MiMo-V2 on the Zig engine (families/mimo_v2): its decode forward, DFlash drafter and native lane backend.
+-fn mimoModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
+-    const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
+-    const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+-    core.addImport("tokenizer", tokenizer);
++fn mimoModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module) *std.Build.Module {
++    const core = nemotron.import_table.get("core").?; // the one `core` module of this compilation (family())
+     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/mimo_v2/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     m.addImport("cuda", cuda);
+     m.addImport("core", core);
+-- 
+2.53.0
+

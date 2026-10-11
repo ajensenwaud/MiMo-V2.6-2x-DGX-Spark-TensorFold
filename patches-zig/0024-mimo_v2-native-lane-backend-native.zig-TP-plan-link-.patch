@@ -1,0 +1,693 @@
+From 63e30f4f0ca3e075a04c0022719620ae70e10e53 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 17:15:51 +1100
+Subject: [PATCH 24/26] mimo_v2: native lane backend (native.zig), TP plan-link
+ mirroring, tf-mimo follow; registered with the native CUDA server
+
+---
+ zig/build/cuda.zig                   |  17 +-
+ zig/src/families/mimo_v2/forward.zig |   8 +-
+ zig/src/families/mimo_v2/m1_main.zig |  34 +-
+ zig/src/families/mimo_v2/native.zig  | 488 +++++++++++++++++++++++++++
+ zig/src/families/mimo_v2/root.zig    |   1 +
+ zig/src/native/cuda.zig              |   6 +-
+ 6 files changed, 545 insertions(+), 9 deletions(-)
+ create mode 100644 zig/src/families/mimo_v2/native.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 865c400d..806f2e85 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -132,6 +132,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     mimo_mod.addImport("cuda", cuda);
+     mimo_mod.addImport("core", mods.core);
+     mimo_mod.addImport("tp", tp_mod);
++    mimo_mod.addImport("lanes", mods.lanes);
+     const mimo_exe = b.createModule(.{ .root_source_file = b.path("zig/src/families/mimo_v2/m1_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     mimo_exe.addImport("cuda", cuda);
+     mimo_exe.addImport("core", mods.core);
+@@ -149,11 +150,24 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
+         .target = target,
+         .optimize = optimize,
+         .link_libc = true,
+-        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron } },
++        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron }, .{ .name = "mimo_v2", .module = mimoModule(b, target, optimize, cuda, lanes) } },
+     });
+     return .{ .api = api, .engines = mod };
+ }
+ 
++/// MiMo-V2 on the Zig engine (families/mimo_v2): its decode forward, DFlash drafter and native lane backend.
++fn mimoModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
++    const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    core.addImport("tokenizer", tokenizer);
++    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/mimo_v2/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    m.addImport("cuda", cuda);
++    m.addImport("core", core);
++    m.addImport("lanes", lanes);
++    m.addImport("tp", @import("tp.zig").module(b, target, optimize, cuda));
++    return m;
++}
++
+ /// The checkpoint subcommands' module: `models`, `info` and `pull` over the CUDA families.
+ fn checkpointCli(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: ?bool, engines_mod: *std.Build.Module) *std.Build.Module {
+     return b.createModule(.{ .root_source_file = b.path("zig/src/cli/cli.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{.{ .name = "native_engines", .module = engines_mod }} });
+@@ -208,6 +222,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     mimo.addImport("cuda", cuda);
+     mimo.addImport("core", mods.core);
+     mimo.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
++    mimo.addImport("lanes", mods.lanes);
+     const mimo_test = b.addRunArtifact(b.addTest(.{ .root_module = mimo }));
+     step.dependOn(&mimo_test.step);
+     b.step("test-mimo", "MiMo-V2 family host tests").dependOn(&mimo_test.step);
+diff --git a/zig/src/families/mimo_v2/forward.zig b/zig/src/families/mimo_v2/forward.zig
+index b7c2c0dd..b3d01025 100644
+--- a/zig/src/families/mimo_v2/forward.zig
++++ b/zig/src/families/mimo_v2/forward.zig
+@@ -291,17 +291,17 @@ pub const Model = struct {
+     }
+ 
+     /// Eager decode window: fp32 logits of every row into `out` [n, V] (Model.forward(prompt=False, rows=all)).
+-    pub fn forward(m: *Model, s: Stream, rows: []const Row, out: []f32, cap: ?Capture) !void {
++    pub fn forward(m: *Model, s: Stream, rows: []const Row, out: ?[]f32, cap: ?Capture) !void {
+         try m.stage(rows);
+         var end: usize = 0;
+         for (rows) |r| end = @max(end, r.pos);
+         try m.run(s, rows.len, end / CK + 1, cap);
+-        try m.logitsTo(s, rows.len, out);
++        if (out) |o| try m.logitsTo(s, rows.len, o) else try s.synchronize();
+     }
+ 
+     /// graphs.Graphs.forward: a replayed graph per (rows, bucket), captured on first use after a warm-up run;
+     /// windows outside the graphed set (a chain wider than 32 rows) run eagerly.
+-    pub fn graphed(m: *Model, s: Stream, rows: []const Row, out: []f32) !void {
++    pub fn graphed(m: *Model, s: Stream, rows: []const Row, out: ?[]f32) !void {
+         var per: [DECODE_ROWS]usize = @splat(0);
+         var end: usize = 0;
+         for (rows) |r| {
+@@ -334,7 +334,7 @@ pub const Model = struct {
+             try exec.launchOn(s);
+             m.captures += 1;
+         }
+-        try m.logitsTo(s, rows.len, out);
++        if (out) |o| try m.logitsTo(s, rows.len, o) else try s.synchronize();
+     }
+ 
+     /// The window's kernels on staged inputs: no host work, so a stream capture records exactly these launches.
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index 19e219b7..d52f666c 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -70,11 +70,13 @@ pub fn main(init: std.process.Init) !u8 {
+     const is_win = args.len >= 6 and std.mem.eql(u8, args[1], "windows");
+     const is_dfl = args.len >= 6 and std.mem.eql(u8, args[1], "dflash");
+     const is_drafted = args.len >= 5 and std.mem.eql(u8, args[1], "drafted");
+-    if (!is_m1 and !is_win and !is_dfl and !is_drafted) {
++    const is_follow = args.len >= 4 and std.mem.eql(u8, args[1], "follow");
++    if (!is_m1 and !is_win and !is_dfl and !is_drafted and !is_follow) {
+         std.debug.print("usage: tf-mimo m1 MODEL ORACLE(rank<R>.safetensors) AOT_DIR [CONTEXT]\n" ++
+             "       tf-mimo windows MODEL ORACLE AOT_DIR WINDOWS_JSON(windows-r<R>.json)\n" ++
+             "       tf-mimo dflash MODEL ORACLE AOT_DIR DFLASH_JSON(dflash-r<R>.json)\n" ++
+-            "       tf-mimo drafted MODEL ORACLE AOT_DIR\n", .{});
++            "       tf-mimo drafted MODEL ORACLE AOT_DIR\n" ++
++            "       tf-mimo follow MODEL AOT_DIR   (TP rank 1 behind tensorfold-native serve on rank 0)\n", .{});
+         return 2;
+     }
+     const gpa = init.gpa;
+@@ -92,6 +94,7 @@ pub fn main(init: std.process.Init) !u8 {
+     if (world > 1) try session.open(&driver, cfg, "");
+     defer if (world > 1) session.close();
+     const rank: usize = cfg.rank;
++    if (is_follow) return follow(gpa, io, &driver, &session, args[2], args[3]);
+     var s = try cuda.Stream.init(&driver, false);
+     defer s.deinit();
+ 
+@@ -442,3 +445,30 @@ fn drafted(gpa: std.mem.Allocator, io: std.Io, model: *mimo.forward.Model, s: cu
+     std.debug.print("{s} drafted rank {d}: 8 replies {s} the answer key's greedy replies; {d} tokens in {d} forwards (prompt windows included){s}; drafts accepted {d}/{d} ({d:.1}%); graphs {d} captured / {d} replayed; {d:.1}s\n", .{ if (all_ok) "PASS" else "FAIL", rank, if (all_ok) "byte-identical to" else "NOT equal to", total_tokens, total_forwards, "", accepted_n, drafted_n, 100.0 * @as(f64, @floatFromInt(accepted_n)) / @as(f64, @floatFromInt(@max(drafted_n, 1))), model.captures, model.replays, secs });
+     return if (all_ok) 0 else 1;
+ }
++
++/// Rank 1 behind the native server: the model rank 0 announces (hello), then every step rank 0 sends, until it stops.
++fn follow(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, session: *tp.Session, model_dir: []const u8, aot_dir: []const u8) !u8 {
++    if (session.cfg.world < 2 or session.cfg.rank == 0) return error.FollowNeedsRankOne;
++    var buf: std.ArrayList(i64) = .empty;
++    defer buf.deinit(gpa);
++    const h = try session.plan.recvGrow(gpa, &buf);
++    if (h.len < 5 or h[0] != @intFromEnum(mimo.native.Op.hello)) return error.NoHello;
++    const context: usize = @intCast(h[2]);
++    const slots: usize = @intCast(h[3]);
++    const drafts = h[4] != 0;
++    std.debug.print("[follow] rank {d}: context {d}, {d} slots, drafter {s}\n", .{ session.cfg.rank, context, slots, if (drafts) "on" else "off" });
++    const e = try mimo.native.Engine.init(gpa, io, d, model_dir, aot_dir, context, slots, drafts, session);
++    defer e.deinit();
++    std.debug.print("[follow] loaded; following\n", .{});
++    var steps: usize = 0;
++    while (true) {
++        const words = session.plan.recvGrow(gpa, &buf) catch |err| switch (err) {
++            error.PeerClosed => break,
++            else => return err,
++        };
++        if (!try e.follow(words)) break;
++        steps += 1;
++    }
++    std.debug.print("[follow] stopped after {d} steps\n", .{steps});
++    return 0;
++}
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+new file mode 100644
+index 00000000..da190f4c
+--- /dev/null
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -0,0 +1,488 @@
++//! MiMo-V2.6-Flash behind the native server (ZIG-PLAN Z5): the lane backend over the Zig decode forward (forward.zig)
++//! and the DFlash drafter (dflash.zig), on one GPU or two TP ranks.
++//!
++//! - Rank 0 serves; before each GPU step (a forward window, a draft pass) it sends the step to the other rank over the
++//!   TP plan link (Jay Leaton's #636), as the Python engine's mirror sends PROMPT / DRAFT / DECODE chains; rank 1 runs
++//!   `tf-mimo follow` (follow.zig), which replays every step on its half of the model until rank 0 stops.
++//! - Prompts run as decode rows, 128 a forward (row-invariant: equal to serial decode rows) until the prompt kernels
++//!   land (Z6). The drafter's context is fed by every forward (taps + update), so drafting needs no absorb step.
++//! - Rejected draft rows are overwritten by the next window before any query reads them (Python's semantics): `keep`
++//!   moves nothing.
++//! - Draws: greedy is the first maximum; sampled rows use the lane core's keyed host sampler (exact_sampling.py).
++
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const lanes = @import("lanes");
++const tp = @import("tp");
++const load_ = @import("load.zig");
++const fwd = @import("forward.zig");
++const dflash = @import("dflash.zig");
++const be = lanes.backend;
++
++pub const model_type = "mimo_v2";
++pub const formats: []const []const u8 = &.{"exl3"};
++pub const default_context: i64 = 131072;
++pub const max_segments: u32 = 1;
++pub const prompt_rows: u32 = fwd.DECODE_ROWS;
++
++pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
++pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
++
++pub const Loaded = struct {
++    backend: be.Backend,
++    facts: lanes.Model,
++    rows: u32,
++    stream_bytes: usize,
++    free_streams: u32 = 1,
++    ctx: *anyopaque,
++    deinit: *const fn (*anyopaque) void,
++    lone: ?LoneRun = null,
++    target: *anyopaque, // no prompt cache (no snap_* decls): never read
++};
++
++/// The plan link's words: one GPU step each, executed by every rank in order.
++pub const Op = enum(i64) { hello = 0x31A0, forward = 1, draft = 2, stop = 3 };
++
++/// The acceptance of DFlash drafts at depth 1, 2, ... given the ones before (the Python drafter on the answer key's
++/// prompts, results/zig-z4), until a stream has its own.
++const draft_prior = [_]f64{ 0.789, 0.78, 0.801, 0.833, 0.833, 0.846, 0.825 };
++
++const slots_default: usize = 4;
++
++/// The model, its kernels and the TP session: what rank 0 serves and rank 1 follows.
++pub const Engine = struct {
++    gpa: std.mem.Allocator,
++    d: *const cuda.Driver,
++    w: load_.Weights,
++    k3: cuda.exl3.Kernels,
++    set: cuda.aot.Set,
++    model: fwd.Model,
++    dr: ?*dflash.Drafter = null,
++    session: ?*tp.Session = null,
++    s: cuda.Stream,
++    logits: []f32, // [128, V] host
++    words: std.ArrayList(i64) = .empty,
++
++    /// Load everything on this rank. `session`: the open TP session (world > 1), null on one GPU.
++    pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, aot_dir: []const u8, context: usize, slots: usize, drafts: bool, session: ?*tp.Session) !*Engine {
++        const e = try gpa.create(Engine);
++        errdefer gpa.destroy(e);
++        e.* = .{ .gpa = gpa, .d = d, .w = undefined, .k3 = undefined, .set = undefined, .model = undefined, .s = undefined, .logits = &.{}, .session = session };
++        const rank: usize = if (session) |ss| ss.cfg.rank else 0;
++        const world: usize = if (session) |ss| ss.cfg.world else 1;
++        e.s = try cuda.Stream.init(d, false);
++        errdefer e.s.deinit();
++        e.w = try load_.load(gpa, io, d, dir, rank, world, rank == 0);
++        errdefer e.w.deinit();
++        e.k3 = try cuda.exl3.Kernels.load(d);
++        errdefer e.k3.deinit();
++        e.set = try cuda.aot.Set.load(gpa, io, d, 0, aot_dir);
++        errdefer e.set.deinit();
++        e.model = try fwd.Model.init(gpa, d, &e.w, &e.set, &e.k3, if (session) |ss| ss.comm() else null, context, fwd.DECODE_ROWS, slots, e.s);
++        errdefer e.model.deinit();
++        if (drafts) {
++            const ddir = try std.fmt.allocPrint(gpa, "{s}/dflash", .{dir});
++            defer gpa.free(ddir);
++            e.dr = try dflash.Drafter.init(gpa, io, &e.model, ddir, e.s);
++            e.model.dr = e.dr;
++        }
++        e.logits = try gpa.alloc(f32, fwd.DECODE_ROWS * e.w.full.vocab);
++        return e;
++    }
++
++    pub fn deinit(e: *Engine) void {
++        const gpa = e.gpa;
++        e.words.deinit(gpa);
++        gpa.free(e.logits);
++        if (e.dr) |dr| dr.deinit();
++        e.model.deinit();
++        e.set.deinit();
++        e.k3.deinit();
++        e.w.deinit();
++        e.s.deinit();
++        gpa.destroy(e);
++    }
++
++    fn send(e: *Engine, words: []const i64) !void {
++        if (e.session) |ss| try ss.plan.send(words);
++    }
++
++    /// A forward window on every rank; rank 0's logits [n, V] land in `logits`.
++    pub fn forward(e: *Engine, rows: []const fwd.Row, out: bool) !void {
++        e.words.clearRetainingCapacity();
++        try e.words.appendSlice(e.gpa, &.{ @intFromEnum(Op.forward), @intCast(rows.len) });
++        for (rows) |r| try e.words.appendSlice(e.gpa, &.{ r.slot, r.pos, r.token });
++        try e.send(e.words.items);
++        try e.model.graphed(e.s, rows, if (out) e.logits else null);
++    }
++
++    /// A draft pass on every rank: drafts [S, block - 1] into `out`.
++    pub fn draft(e: *Engine, tokens: []const i64, pos0: []const u32, slots: []const u32, out: []i32) !void {
++        e.words.clearRetainingCapacity();
++        try e.words.appendSlice(e.gpa, &.{ @intFromEnum(Op.draft), @intCast(tokens.len) });
++        for (tokens, pos0, slots) |t, p, s| try e.words.appendSlice(e.gpa, &.{ t, p, s });
++        try e.send(e.words.items);
++        try e.dr.?.draft(e.s, tokens, pos0, slots, out);
++    }
++
++    /// One step from the plan link, on a follower; false at stop.
++    pub fn follow(e: *Engine, words: []const i64) !bool {
++        if (words.len < 2) return error.ShortPlan;
++        const op: Op = @enumFromInt(words[0]);
++        const n: usize = @intCast(words[1]);
++        if (words.len != 2 + 3 * n) return error.BadPlan;
++        switch (op) {
++            .forward => {
++                var rows: [fwd.DECODE_ROWS]fwd.Row = undefined;
++                if (n > rows.len) return error.BadPlan;
++                for (0..n) |i| rows[i] = .{ .slot = @intCast(words[2 + 3 * i]), .pos = @intCast(words[3 + 3 * i]), .token = words[4 + 3 * i] };
++                try e.model.graphed(e.s, rows[0..n], null);
++            },
++            .draft => {
++                var t: [16]i64 = undefined;
++                var p: [16]u32 = undefined;
++                var sl: [16]u32 = undefined;
++                var out: [16 * 16]i32 = undefined;
++                if (n > t.len) return error.BadPlan;
++                for (0..n) |i| {
++                    t[i] = words[2 + 3 * i];
++                    p[i] = @intCast(words[3 + 3 * i]);
++                    sl[i] = @intCast(words[4 + 3 * i]);
++                }
++                try e.dr.?.draft(e.s, t[0..n], p[0..n], sl[0..n], &out);
++            },
++            .stop => return false,
++            .hello => return error.LateHello,
++        }
++        return true;
++    }
++};
++
++/// The setup rank 0 announces first, so the follower builds the same model: [hello, 3, context, slots, drafts, 0, 0, 0].
++pub fn hello(context: usize, slots: usize, drafts: bool) [8]i64 {
++    return .{ @intFromEnum(Op.hello), 2, @intCast(context), @intCast(slots), @intFromBool(drafts), 0, 0, 0 };
++}
++
++const Lane = struct { slot: u32, held: [16]u32 = undefined, nheld: u32 = 0 };
++const ring = 1024;
++
++pub const Lanes = struct {
++    gpa: std.mem.Allocator,
++    e: *Engine,
++    lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
++    free: u32, // slot bits
++    drawn: [ring]u32 = undefined,
++    next: u64 = 0,
++    costs: [8]lanes.config.Cost = undefined,
++    shared: [32]lanes.config.Cost = undefined,
++    nshared: usize = 0,
++    draft_ms: f64 = 0,
++
++    fn of(p: *anyopaque) *Lanes {
++        return @ptrCast(@alignCast(p));
++    }
++
++    pub fn backend(l: *Lanes) be.Backend {
++        return .{ .ptr = l, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn } };
++    }
++
++    pub fn facts(l: *const Lanes) lanes.Model {
++        const drafting = l.e.dr != null;
++        const B: u32 = if (l.e.dr) |dr| @intCast(dr.block) else 1;
++        return .{
++            .exact_width = B,
++            .gpu_tokens = false,
++            .mtp = drafting,
++            .speculate = drafting,
++            .speculate_early = false,
++            .draft_prior = &draft_prior,
++            .drafts = B - 1,
++            .window_costs = l.costs[0..B],
++            .mtp_step_ms = l.draft_ms,
++            .hidden_rows = true,
++            .batch_rows = fwd.DECODE_ROWS,
++            .max_streams = @intCast(l.e.model.slots),
++            .shared_costs = l.shared[0..l.nshared],
++            .draft_streams = true,
++        };
++    }
++
++    /// Forward costs at load (graphed, after a warm-up): one stream's windows of 1 .. block rows, shared windows of
++    /// 2 .. 32 rows over up to `slots` streams, and a one-stream draft pass. Rows land at positions 64 .. of each slot
++    /// (every stream's prefill overwrites them).
++    pub fn measure(l: *Lanes, io: std.Io) !void {
++        const e = l.e;
++        const B: usize = if (e.dr) |dr| dr.block else 1;
++        var rows: [32]fwd.Row = undefined;
++        const reps = 6;
++        for (1..B + 1) |w| {
++            for (0..w) |j| rows[j] = .{ .slot = 0, .pos = @intCast(64 + j), .token = 1000 };
++            l.costs[w - 1] = .{ .width = @intCast(w), .ms = try l.time(io, rows[0..w], reps) };
++        }
++        l.nshared = 0;
++        const S = e.model.slots;
++        for (2..33) |n| {
++            for (0..n) |j| rows[j] = .{ .slot = @intCast(j % S), .pos = @intCast(64 + j / S), .token = 1000 };
++            l.shared[l.nshared] = .{ .width = @intCast(n), .ms = try l.time(io, rows[0..n], reps) };
++            l.nshared += 1;
++        }
++        if (e.dr) |dr| {
++            var out: [16]i32 = undefined;
++            try e.draft(&.{1000}, &.{64}, &.{0}, &out);
++            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++            for (0..reps) |_| try e.draft(&.{1000}, &.{64}, &.{0}, &out);
++            l.draft_ms = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6 / reps;
++            _ = dr;
++        }
++        std.log.info("mimo costs: window ms {d:.2} .. {d:.2} (1 .. {d} rows), shared 32 rows {d:.2}, draft {d:.2}", .{ l.costs[0].ms, l.costs[B - 1].ms, B, l.shared[l.nshared - 1].ms, l.draft_ms });
++    }
++
++    fn time(l: *Lanes, io: std.Io, rows: []const fwd.Row, reps: usize) !f64 {
++        try l.e.forward(rows, false); // capture
++        try l.e.s.synchronize();
++        const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++        for (0..reps) |_| try l.e.forward(rows, false);
++        try l.e.s.synchronize();
++        return @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6 / @as(f64, @floatFromInt(reps));
++    }
++
++    fn take(l: *Lanes, token: u32) u64 {
++        const h = l.next;
++        l.drawn[h % ring] = token;
++        l.next += 1;
++        return h;
++    }
++
++    fn value(l: *const Lanes, feed: be.Feed) u32 {
++        return switch (feed) {
++            .handle => |h| l.drawn[h % ring],
++            .value => |v| v,
++        };
++    }
++
++    fn rowOf(l: *Lanes, r: usize) []const f32 {
++        const V = l.e.w.full.vocab;
++        return l.e.logits[r * V ..][0..V];
++    }
++
++    fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
++        const l = of(p);
++        const e = l.e;
++        const ids = s.prompt();
++        const B: usize = if (e.dr) |dr| dr.block else 1;
++        if (ids.len == 0 or ids.len + s.max_new + B > e.model.context) return error.PromptTooLong;
++        const gop = try l.lanes.getOrPut(l.gpa, s);
++        if (!gop.found_existing) {
++            if (l.free == 0) {
++                l.lanes.removeByPtr(gop.key_ptr);
++                return error.NoFreeSlot;
++            }
++            const slot: u32 = @ctz(l.free);
++            l.free &= ~(@as(u32, 1) << @intCast(slot));
++            gop.value_ptr.* = .{ .slot = slot };
++        }
++        gop.value_ptr.nheld = 0;
++        const slot = gop.value_ptr.slot;
++        s.cached = 0;
++        var rows: [fwd.DECODE_ROWS]fwd.Row = undefined;
++        var at: usize = 0;
++        while (at < ids.len) {
++            if (s.isCancelled()) return error.Cancelled;
++            const n = @min(fwd.DECODE_ROWS, ids.len - at);
++            for (0..n) |j| rows[j] = .{ .slot = slot, .pos = @intCast(at + j), .token = ids[at + j] };
++            const last = at + n == ids.len;
++            try e.forward(rows[0..n], last);
++            if (last) _ = l.take(try draw(l.gpa, l.rowOf(n - 1), s.sampling, ids.len));
++            at += n;
++        }
++    }
++
++    fn firstFn(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
++        const l = of(p);
++        if (position != s.prompt_len) return error.PositionMismatch;
++        return l.next - 1;
++    }
++
++    fn queueFn(_: *anyopaque, _: *lanes.Stream, _: be.Feed, _: u64) anyerror!u64 {
++        return error.NotPipelined;
++    }
++
++    fn readFn(p: *anyopaque, handle: u64) anyerror!u32 {
++        const l = of(p);
++        if (handle >= l.next or l.next - handle > ring) return error.NoSuchToken;
++        return l.drawn[handle % ring];
++    }
++
++    /// Every window's rows in one forward; each row drawn with its stream's sampling at its keyed position.
++    fn verifyFn(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
++        const l = of(p);
++        var rows: [fwd.DECODE_ROWS]fwd.Row = undefined;
++        var n: usize = 0;
++        for (windows) |w| {
++            if (w.parents != null) return error.TreesNotBuilt;
++            const lane = l.lanes.getPtr(w.stream) orelse return error.UnknownStream;
++            if (n + w.rows() > rows.len) return error.WindowTooWide;
++            if (w.held > lane.nheld) return error.NoHeldDrafts;
++            for (0..w.rows()) |r| {
++                const tok: u32 = if (r == 0) w.pending else if (w.held > 0) lane.held[r - 1] else w.tokens[r - 1];
++                rows[n] = .{ .slot = lane.slot, .pos = @intCast(w.positions[r] - 1), .token = tok };
++                n += 1;
++            }
++        }
++        try l.e.forward(rows[0..n], true);
++        var r0: usize = 0;
++        for (windows, out) |w, *o| {
++            const lane = l.lanes.getPtr(w.stream).?;
++            for (0..w.rows()) |r| o.sampled[r] = try draw(l.gpa, l.rowOf(r0 + r), w.stream.sampling, w.positions[r]);
++            if (w.held > 0) @memcpy(o.drafts, lane.held[0..w.held]) else @memcpy(o.drafts, w.tokens);
++            r0 += w.rows();
++        }
++    }
++
++    fn keepFn(_: *anyopaque, _: []const be.Window, paths: []const []const u32) anyerror!void {
++        for (paths) |path| {
++            if (path.len == 0) return error.EmptyPath;
++            for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
++        }
++    }
++
++    /// One draft pass for every request that asks for drafts (their contexts are fed already).
++    fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
++        const l = of(p);
++        const dr = l.e.dr orelse return error.NoDraftHead;
++        var toks: [16]i64 = undefined;
++        var pos0: [16]u32 = undefined;
++        var sl: [16]u32 = undefined;
++        var who: [16]*Lane = undefined;
++        var depth: [16]u32 = undefined;
++        var n: usize = 0;
++        for (requests) |r| {
++            const lane = l.lanes.getPtr(r.stream) orelse return error.UnknownStream;
++            lane.nheld = 0;
++            if (r.depth == 0) continue;
++            if (n == toks.len) return error.TooManyStreams;
++            const pending: u32 = if (r.follow.len > 0) r.follow[r.follow.len - 1] else l.value(r.first orelse return error.NoFirstToken);
++            toks[n] = pending;
++            pos0[n] = @intCast(r.position - 1);
++            sl[n] = lane.slot;
++            who[n] = lane;
++            depth[n] = @min(r.depth, @as(u32, @intCast(dr.block - 1)));
++            n += 1;
++        }
++        if (n == 0) return;
++        var out: [16 * 16]i32 = undefined;
++        try l.e.draft(toks[0..n], pos0[0..n], sl[0..n], &out);
++        for (0..n) |i| {
++            for (0..depth[i]) |j| who[i].held[j] = @intCast(out[i * (dr.block - 1) + j]);
++            who[i].nheld = depth[i];
++        }
++    }
++
++    fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
++        const l = of(p);
++        const kv = l.lanes.fetchRemove(s) orelse return;
++        l.free |= @as(u32, 1) << @intCast(kv.value.slot);
++    }
++};
++
++/// The token for a row: the first maximum when greedy (or temperature 0), else the keyed sampler over the top-k.
++pub fn draw(gpa: std.mem.Allocator, row: []const f32, settings: ?lanes.Sampling, position: u64) !u32 {
++    const best = fwd.argmax(row);
++    if (!std.math.isFinite(row[best])) return error.NonfiniteLogits;
++    const sampling = settings orelse return @intCast(best);
++    if (sampling.temperature <= 0) return @intCast(best);
++    const k = if (sampling.top_k == 0) row.len else @min(row.len, sampling.top_k);
++    const values = try gpa.alloc(f64, k);
++    defer gpa.free(values);
++    const ids = try gpa.alloc(u64, k);
++    defer gpa.free(ids);
++    var filled: usize = 0;
++    for (row, 0..) |x32, id| {
++        const x: f64 = x32;
++        if (k == row.len) {
++            values[id] = x;
++            ids[id] = id;
++            continue;
++        }
++        if (filled == k and x <= values[k - 1]) continue;
++        var at = @min(filled, k - 1);
++        while (at > 0 and x > values[at - 1]) : (at -= 1) {
++            values[at] = values[at - 1];
++            ids[at] = ids[at - 1];
++        }
++        values[at] = x;
++        ids[at] = id;
++        filled = @min(filled + 1, k);
++    }
++    return @intCast(try lanes.sampling.choose(gpa, values, ids, position, sampling));
++}
++
++const Owned = struct { gpa: std.mem.Allocator, e: *Engine, l: Lanes, session: ?*tp.Session };
++
++fn env(name: [:0]const u8) ?[]const u8 {
++    return std.mem.span(std.c.getenv(name) orelse return null);
++}
++
++/// The native family entry: TF_TP_* for two ranks (rank 0 serves; start `tf-mimo follow` on rank 1),
++/// TF_MIMO_AOT (the captured Triton set, required), TF_MIMO_SLOTS (streams, default 4).
++pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
++    const aot_dir = kernels orelse env("TF_MIMO_AOT") orelse return error.NoCapturedTritonSet;
++    const slots: usize = if (env("TF_MIMO_SLOTS")) |t| try std.fmt.parseInt(usize, t, 10) else slots_default;
++    if (slots == 0 or slots > 16) return error.Slots;
++    var session: ?*tp.Session = null;
++    const cfg = tp.Config.fromEnv() catch null;
++    if (cfg) |c| if (c.world > 1) {
++        if (c.rank != 0) return error.FollowerServes; // rank 1 runs `tf-mimo follow`
++        const ss = try gpa.create(tp.Session);
++        errdefer gpa.destroy(ss);
++        try ss.open(ctx.d, c, "");
++        session = ss;
++        const h = hello(o.context, slots, o.drafts);
++        try ss.plan.send(&h);
++    };
++    errdefer if (session) |ss| {
++        ss.announceStop();
++        ss.close();
++        gpa.destroy(ss);
++    };
++    const e = try Engine.init(gpa, io, ctx.d, dir, aot_dir, o.context, slots, o.drafts, session);
++    errdefer e.deinit();
++    const own = try gpa.create(Owned);
++    errdefer gpa.destroy(own);
++    own.* = .{ .gpa = gpa, .e = e, .l = .{ .gpa = gpa, .e = e, .free = if (slots == 32) ~@as(u32, 0) else (@as(u32, 1) << @intCast(slots)) - 1 }, .session = session };
++    try own.l.measure(io);
++    return .{
++        .backend = own.l.backend(),
++        .facts = own.l.facts(),
++        .rows = if (e.dr) |dr| @intCast(dr.block) else 1,
++        .stream_bytes = 0,
++        .free_streams = @intCast(slots),
++        .ctx = own,
++        .deinit = release,
++        .target = own,
++    };
++}
++
++pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
++    return switch (err) {
++        error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
++        error.NoFreeSlot => "every stream slot is busy: retry once another request ends",
++        else => null,
++    };
++}
++
++fn release(p: *anyopaque) void {
++    const own: *Owned = @ptrCast(@alignCast(p));
++    if (own.session) |ss| {
++        ss.plan.send(&.{ @intFromEnum(Op.stop), 0 }) catch {};
++    }
++    own.l.lanes.deinit(own.gpa);
++    own.e.deinit();
++    if (own.session) |ss| {
++        ss.announceStop();
++        ss.close();
++        own.gpa.destroy(ss);
++    }
++    own.gpa.destroy(own);
++}
+diff --git a/zig/src/families/mimo_v2/root.zig b/zig/src/families/mimo_v2/root.zig
+index c1406d08..6294201f 100644
+--- a/zig/src/families/mimo_v2/root.zig
++++ b/zig/src/families/mimo_v2/root.zig
+@@ -5,6 +5,7 @@ pub const config = @import("config.zig");
+ pub const load = @import("load.zig");
+ pub const forward = @import("forward.zig");
+ pub const dflash = @import("dflash.zig");
++pub const native = @import("native.zig");
+ pub const Config = config.Config;
+ 
+ test {
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 4f702516..3fe6762f 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -4,12 +4,13 @@ const cuda = @import("cuda");
+ const api = @import("engine_api");
+ const lanes = @import("lanes");
+ const nemotron = @import("nemotron");
++const mimo_v2 = @import("mimo_v2");
+ const Allocator = std.mem.Allocator;
+ const budget = @import("cuda_memory.zig");
+ const Pool = budget.Pool;
+ 
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+-const registry = .{nemotron.native};
++const registry = .{ nemotron.native, mimo_v2.native };
+ 
+ /// Nemotron's prompt-cache copies. A file-level value so the store's pointer stays valid for the process.
+ const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
+@@ -374,7 +375,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     const h = try gpa.create(Host);
+     errdefer gpa.destroy(h);
+     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
+-    const cache = budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free));
++    // families without prompt-cache copies (no snap_* decls) serve without the cache
++    const cache = if (@hasDecl(F, "snap_bytes")) budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free)) else 0;
+     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}{s}; {s}", .{
+         capability,                                                                                                   device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
+         if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache",
+-- 
+2.53.0
+

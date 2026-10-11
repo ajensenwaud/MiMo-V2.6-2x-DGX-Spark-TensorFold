@@ -1,7 +1,7 @@
 From a668297ad9da36e2b0b916c244db4699ee9945f3 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 15:32:34 +1100
-Subject: [PATCH 16/23] mimo_v2: pack loader, decode forward (AOT Triton + EXL3
+Subject: [PATCH 16/26] mimo_v2: pack loader, decode forward (AOT Triton + EXL3
  + glue, TP sums), tf-mimo m1 gate
 
 ---

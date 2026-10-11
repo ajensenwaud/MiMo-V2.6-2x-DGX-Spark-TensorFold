@@ -1,7 +1,7 @@
 From e9e25d13aff73dadec566810906d65a4ae0634ad Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 14:15:57 +1100
-Subject: [PATCH 10/23] exl3.zig: function fields prefixed f_
+Subject: [PATCH 10/26] exl3.zig: function fields prefixed f_
 
 ---
  zig/src/cuda/exl3.zig | 72 +++++++++++++++++++++----------------------

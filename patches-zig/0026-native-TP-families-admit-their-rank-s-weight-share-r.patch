@@ -1,0 +1,46 @@
+From 4b92c2e4d66f8a7dcc134a5454a471eda3623731 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 17:20:46 +1100
+Subject: [PATCH 26/26] native: TP families admit their rank's weight share
+ (rankWeights)
+
+---
+ zig/src/families/mimo_v2/native.zig | 7 +++++++
+ zig/src/native/cuda.zig             | 3 ++-
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index da190f4c..9b62386b 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -464,6 +464,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     };
+ }
+ 
++/// The weights this rank loads: the checkpoint over TF_TP_WORLD ranks (the drafter and embeddings are whole on each,
++/// a small share of the total).
++pub fn rankWeights(total: u64) u64 {
++    const world: u64 = if (env("TF_TP_WORLD")) |w| std.fmt.parseInt(u64, w, 10) catch 1 else 1;
++    return total / @max(world, 1);
++}
++
+ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+     return switch (err) {
+         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 3fe6762f..722c65c3 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -350,7 +350,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         },
+     };
+     const before = try pool(a, io, &g.ctx, problem) orelse return null;
+-    const weights = weightBytes(io, o.dir);
++    // a TP family holds its rank's share of the checkpoint
++    const weights = if (@hasDecl(F, "rankWeights")) F.rankWeights(weightBytes(io, o.dir)) else weightBytes(io, o.dir);
+     const held0 = cuda.usage(false).device;
+     if (weights > before.room(held0)) {
+         problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
+-- 
+2.53.0
+
