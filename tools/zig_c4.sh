@@ -10,7 +10,7 @@ docker logs mimo-tf > $L/mimo-tf-$(date +%Y%m%d-%H%M%S).log 2>&1
 cd $HOME/mimo/recipe && ./stop.sh >/dev/null 2>&1
 while [ $# -ge 2 ]; do
   a=$1; x=$2; shift 2
-  CONTEXT=608256 BIN=/mimo/zig-out-z6 AOT=/mimo/oracle/aot5-sm121 EXTRA_ENV="$x" bash $T/zig_serve.sh >/dev/null 2>&1 || { echo "$a: serve failed"; continue; }
+  CONTEXT=608256 BIN=${BIN:-/mimo/zig-out-z6} AOT=/mimo/oracle/aot5-sm121 EXTRA_ENV="$x" bash $T/zig_serve.sh >/dev/null 2>&1 || { echo "$a: serve failed"; continue; }
   echo "== $a"
   for i in 1 2; do
     (cd /tmp/spark-bench && /usr/bin/python3 scripts/bench.py --base-url http://localhost:8892 --suites decode --concurrency 4 \

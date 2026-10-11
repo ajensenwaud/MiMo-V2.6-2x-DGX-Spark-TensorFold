@@ -367,3 +367,15 @@ where Python overlaps at 1 row, mirror it (likely the RoCE gather's launch/strea
 
 **Next:** 4K prefill and small-prompt cost (load every kernel at start; per-call launch overhead of the per-expert
 path), decode at 128K (-8%), the drafted-rows difference, the 4-5% on multi-row verifies, then Z8.
+
+## Z7, session 11 (speed, exactness relaxed)
+
+- First copy window 6 rows (was 15): fixed texts chat 46.8 -> 48.2, agent 58.2 -> 60.2. Copies off was worse.
+- Prompts under 256 tokens on decode rows (TF_MIMO_PROMPT_MIN): 4-stream code 94-105 -> 117-120 agg. Not
+  byte-identical to Python from here; gates are quality (GSM8K/MMLU) and the bench.
+- Prompt MoE: unpack + GEMM costs 2.4 s fixed + 0.57 ms a row; the grouped trellis kernel 1.26 ms a row, no fixed
+  cost. Grouped up to 3,072 rows in 1,024-row windows (512 rows 2.62 -> 0.74 s). results/zig-z7/ptime.log
+- Full bench z7c: 1 stream chat 43.7 / code 76.3 / agent 58.2 / report 48.0; 4 streams 80.9 / 113.4 / 84.8 / 84.9;
+  prefill 4K/16K/64K/128K 772 / 1,317 / 1,210 / 1,066; decode at 128K 30.8; GSM8K 96.0%, MMLU 86.0%.
+
+**Next:** fused trellis MMA for big prompt chunks (drop the fp16 unpack); decode at long context (-8%); 1-stream chat.
