@@ -1,7 +1,7 @@
 From 78a9a411a3389fdd8f98d00103c5c52ac154b030 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 17:17:11 +1100
-Subject: [PATCH 25/26] build: mimo_v2 shares the compilation's core module
+Subject: [PATCH 25/27] build: mimo_v2 shares the compilation's core module
 
 ---
  zig/build/cuda.zig | 8 +++-----

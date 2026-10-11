@@ -1,0 +1,211 @@
+From 04b88f626b58bce999471ca56cefe05b8192ca76 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 18:34:16 +1100
+Subject: [PATCH 27/27] mimo_v2: device argmax for greedy rows
+ (TF_MIMO_HOST_ARGMAX=1: the host path)
+
+---
+ zig/kernels/cuda/mimo_v2/glue.cu     | 35 ++++++++++++++++++++++++++++
+ zig/src/families/mimo_v2/forward.zig | 17 ++++++++++++++
+ zig/src/families/mimo_v2/native.zig  | 35 +++++++++++++++++++++-------
+ 3 files changed, 78 insertions(+), 9 deletions(-)
+
+diff --git a/zig/kernels/cuda/mimo_v2/glue.cu b/zig/kernels/cuda/mimo_v2/glue.cu
+index 0d48398f..0fcee924 100644
+--- a/zig/kernels/cuda/mimo_v2/glue.cu
++++ b/zig/kernels/cuda/mimo_v2/glue.cu
+@@ -6,6 +6,10 @@
+ // Built with the glue flags (no contraction, IEEE division): see zig/build/cuda.zig.
+ 
+ #include <cstdint>
++#include <math_constants.h>
++#ifndef INFINITY
++#define INFINITY CUDART_INF_F
++#endif
+ 
+ extern "C" __global__ void mimo_embed_f32(const uint16_t* __restrict__ table, const int64_t* __restrict__ ids,
+                                           float* __restrict__ out, int D) {
+@@ -34,3 +38,34 @@ extern "C" __global__ void mimo_rope_tables(float* __restrict__ cos_out, float*
+         sin_out[i] = __double2float_rn(sin(ang));
+     }
+ }
++
++// logits.argmax(-1) over the gathered head (rank-major recv [world, n, vr], or one rank's [n, vr] when world 1): the
++// first index of the maximum, as torch.argmax; a NaN counts as the maximum (its first index). out int32 [n].
++extern "C" __global__ void mimo_argmax(const float* __restrict__ recv, int32_t* __restrict__ out, int world, int n,
++                                       int vr) {
++    __shared__ float bv[256];
++    __shared__ int bi[256];
++    const int r = blockIdx.x, tid = threadIdx.x, vocab = world * vr;
++    float best = -INFINITY;
++    int idx = 0x7fffffff;
++    for (int c = tid; c < vocab; c += 256) {
++        const int k = c / vr, j = c % vr;
++        const float v = recv[((int64_t)k * n + r) * vr + j];
++        const bool nan_v = v != v, nan_b = best != best;
++        if (idx == 0x7fffffff || (nan_v && !nan_b) || (!nan_b && v > best)) { best = v; idx = c; }
++    }
++    bv[tid] = best;
++    bi[tid] = idx;
++    __syncthreads();
++    for (int o = 128; o > 0; o >>= 1) {
++        if (tid < o) {
++            const float v = bv[tid + o], b = bv[tid];
++            const int i = bi[tid + o];
++            const bool nv = v != v, nb = b != b;
++            const bool take = i != 0x7fffffff && (bi[tid] == 0x7fffffff || (nv && !nb) || (nv == nb && (nv ? i < bi[tid] : (v > b || (v == b && i < bi[tid])))));
++            if (take) { bv[tid] = v; bi[tid] = i; }
++        }
++        __syncthreads();
++    }
++    if (tid == 0) out[r] = bi[0];
++}
+diff --git a/zig/src/families/mimo_v2/forward.zig b/zig/src/families/mimo_v2/forward.zig
+index b3d01025..27863954 100644
+--- a/zig/src/families/mimo_v2/forward.zig
++++ b/zig/src/families/mimo_v2/forward.zig
+@@ -74,6 +74,7 @@ const Bufs = struct {
+     up: u64,
+     h: u64,
+     head: u64, // f32 [R, Vr]
++    am: u64, // i32 [R]: device argmax of each row
+     sc: exl3.Scratch,
+ };
+ 
+@@ -85,6 +86,7 @@ pub const Model = struct {
+     glue: cuda.Module,
+     f_embed: cuda.Function,
+     f_add2: cuda.Function,
++    f_argmax: cuda.Function,
+     comm: ?tp.Collective,
+     context: usize,
+     ring: usize,
+@@ -130,6 +132,7 @@ pub const Model = struct {
+         m.glue = try cuda.Module.load(d, cuda.kernels.mimo_glue);
+         m.f_embed = try m.glue.function("mimo_embed_f32");
+         m.f_add2 = try m.glue.function("mimo_add2_f32");
++        m.f_argmax = try m.glue.function("mimo_argmax");
+         const ar = &m.arena;
+         // caches: keys [1, LEN, HK, 192], values [1, LEN, HK, 128], zeroed (forward.Model.__init__)
+         m.kc = try gpa.alloc(u64, cfg.layers);
+@@ -198,6 +201,7 @@ pub const Model = struct {
+         b.up = try ar.zeros(R * nd * 2);
+         b.h = try ar.zeros(R * nd * 2);
+         b.head = try ar.zeros(R * vr * 4);
++        b.am = try ar.zeros(R * 4);
+         // experts.Scratch(ex, WINDOW, top_k): the decode path's (rows only size it)
+         const first = for (w.layers) |L| {
+             if (L.experts) |e| break e;
+@@ -415,6 +419,19 @@ pub const Model = struct {
+         if (m.comm) |c| try c.allGather(m.b.head, m.b.recv, n * m.w.head.n, .f32, s.handle);
+     }
+ 
++    /// Each row's argmax (torch.argmax over the gathered vocab) on the device; only the ids reach the host.
++    pub fn argmaxTo(m: *Model, s: Stream, n: usize, out: []i32) !void {
++        var a: cuda.Args = .{};
++        a.add(if (m.comm != null) m.b.recv else m.b.head);
++        a.add(m.b.am);
++        a.add(@as(c_int, @intCast(m.w.world)));
++        a.add(@as(c_int, @intCast(n)));
++        a.add(@as(c_int, @intCast(m.w.head.n)));
++        try cuda.launch.launch(m.f_argmax, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
++        try s.synchronize();
++        try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(out.ptr), m.b.am, n * 4), "argmax");
++    }
++
+     /// The window's logits on the host: row r = [rank 0's slice, rank 1's slice, ...] (permute(1, 0, 2)).
+     pub fn logitsTo(m: *Model, s: Stream, n: usize, out: []f32) !void {
+         const vr = m.w.head.n;
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index 9b62386b..c4b6face 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -62,6 +62,9 @@ pub const Engine = struct {
+     session: ?*tp.Session = null,
+     s: cuda.Stream,
+     logits: []f32, // [128, V] host
++    ids: [fwd.DECODE_ROWS]i32 = undefined, // device argmax of each row (Want.ids)
++    /// TF_MIMO_HOST_ARGMAX=1: greedy rows read back whole and scanned on the host (the Z5 path) instead of on the device.
++    host_argmax: bool = false,
+     words: std.ArrayList(i64) = .empty,
+ 
+     /// Load everything on this rank. `session`: the open TP session (world > 1), null on one GPU.
+@@ -88,6 +91,7 @@ pub const Engine = struct {
+             e.model.dr = e.dr;
+         }
+         e.logits = try gpa.alloc(f32, fwd.DECODE_ROWS * e.w.full.vocab);
++        e.host_argmax = if (std.c.getenv("TF_MIMO_HOST_ARGMAX")) |v| v[0] == '1' else false;
+         return e;
+     }
+ 
+@@ -108,13 +112,21 @@ pub const Engine = struct {
+         if (e.session) |ss| try ss.plan.send(words);
+     }
+ 
+-    /// A forward window on every rank; rank 0's logits [n, V] land in `logits`.
+-    pub fn forward(e: *Engine, rows: []const fwd.Row, out: bool) !void {
++    pub const Want = enum { none, ids, logits };
++
++    /// A forward window on every rank; on rank 0 `ids` leaves each row's argmax in `ids`, `logits` the rows [n, V].
++    pub fn forward(e: *Engine, rows: []const fwd.Row, want: Want) !void {
+         e.words.clearRetainingCapacity();
+         try e.words.appendSlice(e.gpa, &.{ @intFromEnum(Op.forward), @intCast(rows.len) });
+         for (rows) |r| try e.words.appendSlice(e.gpa, &.{ r.slot, r.pos, r.token });
+         try e.send(e.words.items);
+-        try e.model.graphed(e.s, rows, if (out) e.logits else null);
++        const w: Want = if (want == .ids and e.host_argmax) .logits else want;
++        try e.model.graphed(e.s, rows, if (w == .logits) e.logits else null);
++        if (want == .ids) {
++            if (e.host_argmax) {
++                for (0..rows.len) |r| e.ids[r] = @intCast(fwd.argmax(e.logits[r * e.w.full.vocab ..][0..e.w.full.vocab]));
++            } else try e.model.argmaxTo(e.s, rows.len, e.ids[0..rows.len]);
++        }
+     }
+ 
+     /// A draft pass on every rank: drafts [S, block - 1] into `out`.
+@@ -239,10 +251,10 @@ pub const Lanes = struct {
+     }
+ 
+     fn time(l: *Lanes, io: std.Io, rows: []const fwd.Row, reps: usize) !f64 {
+-        try l.e.forward(rows, false); // capture
++        try l.e.forward(rows, .ids); // capture
+         try l.e.s.synchronize();
+         const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+-        for (0..reps) |_| try l.e.forward(rows, false);
++        for (0..reps) |_| try l.e.forward(rows, .ids);
+         try l.e.s.synchronize();
+         return @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6 / @as(f64, @floatFromInt(reps));
+     }
+@@ -292,8 +304,9 @@ pub const Lanes = struct {
+             const n = @min(fwd.DECODE_ROWS, ids.len - at);
+             for (0..n) |j| rows[j] = .{ .slot = slot, .pos = @intCast(at + j), .token = ids[at + j] };
+             const last = at + n == ids.len;
+-            try e.forward(rows[0..n], last);
+-            if (last) _ = l.take(try draw(l.gpa, l.rowOf(n - 1), s.sampling, ids.len));
++            const greedy = s.sampling == null or s.sampling.?.temperature <= 0;
++            try e.forward(rows[0..n], if (!last) .none else if (greedy) .ids else .logits);
++            if (last) _ = l.take(if (greedy) @intCast(e.ids[n - 1]) else try draw(l.gpa, l.rowOf(n - 1), s.sampling, ids.len));
+             at += n;
+         }
+     }
+@@ -330,11 +343,15 @@ pub const Lanes = struct {
+                 n += 1;
+             }
+         }
+-        try l.e.forward(rows[0..n], true);
++        var all_greedy = true;
++        for (windows) |w| if (w.stream.sampling) |sm| if (sm.temperature > 0) {
++            all_greedy = false;
++        };
++        try l.e.forward(rows[0..n], if (all_greedy) .ids else .logits);
+         var r0: usize = 0;
+         for (windows, out) |w, *o| {
+             const lane = l.lanes.getPtr(w.stream).?;
+-            for (0..w.rows()) |r| o.sampled[r] = try draw(l.gpa, l.rowOf(r0 + r), w.stream.sampling, w.positions[r]);
++            for (0..w.rows()) |r| o.sampled[r] = if (all_greedy) @intCast(l.e.ids[r0 + r]) else try draw(l.gpa, l.rowOf(r0 + r), w.stream.sampling, w.positions[r]);
+             if (w.held > 0) @memcpy(o.drafts, lane.held[0..w.held]) else @memcpy(o.drafts, w.tokens);
+             r0 += w.rows();
+         }
+-- 
+2.53.0
+

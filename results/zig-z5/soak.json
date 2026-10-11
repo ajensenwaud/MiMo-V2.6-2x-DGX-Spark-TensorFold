@@ -1,0 +1,20 @@
+{
+ "requests": 722,
+ "errors": [],
+ "by_kind": {
+  "long": 149,
+  "greedy": 143,
+  "completion": 133,
+  "sampled": 151,
+  "stream": 146
+ },
+ "canaries": 12,
+ "canary_mismatch": 0,
+ "seconds": 3618.1879732608795,
+ "failfast": {
+  "outcome": "HTTPError: HTTP Error 500: Internal Server Error",
+  "seconds_after_kill": 1.4,
+  "fails_fast": true
+ },
+ "pass": true
+}

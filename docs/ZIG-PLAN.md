@@ -235,7 +235,41 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
     chat 61.5 / agent 73.1 / report 70.3. Python baseline: code 83.0, chat 52.9, agent 60.6, report 50.2; 4 streams
     code 91.4, chat 85.1. Single-stream gap is the expected one before Z7 (host argmax/sampling over 152k logits and
     8 logits rows copied each round; lanes' draft widths not tuned to MiMo).
-- Remaining Z5: sampled-draw parity with the Python server, Jay's test list, 1-hour stress, the full 608,256-token
-  context, a like-for-like spark-bench run against Python (same preset, same night).
+- Decision (Anders, 2026-10-11): no same-preset race against Python; benchmark the Zig engine as it stands.
 
-**Next:** finish Z5, then Z6 (prompt path exact: needed for prefill speed), then Z7 speed-ups.
+### 2026-10-11 (session 7; Python serve down from 17:40 for the full context, bench and soak)
+- Full context: the Zig server serves 608,256 tokens a stream x 4 (as Python), model + caches 100.9 GiB on rank 0.
+- Qualification (`tools/mimo_zig_qual.py`, Python's answers recorded first on :8891; Python repeats itself 6/6):
+  - greedy parity: answer key 8/8 serial and concurrent at full context; a 14,602-token prompt's reply equal to the
+    Python server's.
+  - sampled: 3/6 equal to the Python server, 6/6 repeatable on Zig. Cause: Python prefills prompts with its prompt
+    kernels (different bits from decode rows), so later logits differ in the last bits; greedy argmax survives,
+    top_p's cut does not always. Sampled parity moves to Z6 (exact prompt path). Zig's request defaults set to
+    Python's CUDA server's (top_k 20, top_p 0.95).
+  - drafted == plain, concurrent == solo: the replies gate (Z4/Z5). resumed == fresh: n/a (no prompt cache yet).
+  - cancellation: 3 streamed replies dropped after 16 chunks; streams freed, canary equal to its solo reply.
+- spark-bench full (`results/zig-z5/spark-bench-full.json`), tok/s a stream (aggregate):
+  chat 46.1 / 26.0 (47.5) / 19.2 (68.5) at 1/2/4 streams; code 72.8 / 46.4 (89.7) / 27.2 (95.2); agent 50.0 /
+  36.8 (66.5) / 21.8 (78.4); report 48.1 / 29.1 (54.6) / 19.0 (72.2). Depth (prefill, decode): 4K 418 / 37.6,
+  16K 398 / 41.8, 64K 351 / 35.8, 128K 317 / 32.8. Quality: GSM8K 96.0% (192/200), MMLU 86.0% (196/228).
+- Soak (`tools/mimo_zig_soak.py`, results/zig-z5/soak.json): **722 requests in 1 h (greedy, sampled, streamed and
+  dropped, completions, 2-7K prompts), 0 errors, canaries 12/12.** Fail-fast: follower killed mid-reply, the request
+  failed (HTTP 500) 1.4 s later and rank 0 exited 70 for a clean restart; no hang. **Z5 passes** (sessions/prefix
+  reuse deferred with the prompt cache; sampled parity moves to Z6).
+
+### Z7 arms, first two (session 7; `tools/zig_arms.sh`, spark-bench full preset's decode cells, 608K context)
+| arm | chat 1 / 4 agg | code 1 / 4 agg | agent 1 / 4 agg | report 1 / 4 agg | gate |
+|---|---|---|---|---|---|
+| Z5 (host argmax, NCCL) | 46.1 / 68.5 | 72.8 / 95.2 | 50.0 / 78.4 | 48.1 / 72.2 | replies 8/8 |
+| + device argmax | 46.8 / 72.5 | 83.4 / 112.5 | 50.1 / 88.4 | 48.8 / 79.6 | replies 8/8 |
+| + device argmax + RoCE | 45.6 / 74.7 | 60.8 / 114.9 | 53.8 / 90.7 | 47.0 / 77.6 | replies 8/8 |
+- **Device argmax kept (default on; TF_MIMO_HOST_ARGMAX=1 is the old path):** 4-stream aggregates +6 to +18%,
+  single stream flat within noise. Single-run 1-stream cells swing +-15% (code 60.8 vs 83.4 on the same build):
+  judge levers by the 4-stream aggregates and the measured window costs, or repeat runs.
+- **RoCE: no gain** (1-row window 24.38 vs 24.32 ms); NCCL stays the default.
+- Python (same preset, earlier night): code 83.0 / 91.4, chat 52.9 / 85.1. Zig now ahead on code and agent at 4
+  streams; behind on chat (1 and 4 streams) and on prefill (Z6).
+
+**Next:** Z7 draft-width tuning for MiMo (chat/report acceptance under lanes' rule vs Python's joint_widths), then
+Z6 prompt path.
+
