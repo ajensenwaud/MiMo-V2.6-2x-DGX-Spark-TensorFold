@@ -1,0 +1,24 @@
+From 249afec3f70a4a0fed54bf7faadc9d2c3f461cae Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 17:09:35 +1100
+Subject: [PATCH 23/23] m1_main: drafted summary wording
+
+---
+ zig/src/families/mimo_v2/m1_main.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index f83f3770..19e219b7 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -439,6 +439,6 @@ fn drafted(gpa: std.mem.Allocator, io: std.Io, model: *mimo.forward.Model, s: cu
+         }
+     }
+     const secs = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9;
+-    std.debug.print("{s} drafted rank {d}: 8 replies {s} the answer key's greedy replies; {d} tokens in {d} forwards ({d} prompt windows included); drafts accepted {d}/{d} ({d:.1}%); graphs {d} captured / {d} replayed; {d:.1}s\n", .{ if (all_ok) "PASS" else "FAIL", rank, if (all_ok) "byte-identical to" else "NOT equal to", total_tokens, total_forwards, 0, accepted_n, drafted_n, 100.0 * @as(f64, @floatFromInt(accepted_n)) / @as(f64, @floatFromInt(@max(drafted_n, 1))), model.captures, model.replays, secs });
++    std.debug.print("{s} drafted rank {d}: 8 replies {s} the answer key's greedy replies; {d} tokens in {d} forwards (prompt windows included){s}; drafts accepted {d}/{d} ({d:.1}%); graphs {d} captured / {d} replayed; {d:.1}s\n", .{ if (all_ok) "PASS" else "FAIL", rank, if (all_ok) "byte-identical to" else "NOT equal to", total_tokens, total_forwards, "", accepted_n, drafted_n, 100.0 * @as(f64, @floatFromInt(accepted_n)) / @as(f64, @floatFromInt(@max(drafted_n, 1))), model.captures, model.replays, secs });
+     return if (all_ok) 0 else 1;
+ }
+-- 
+2.53.0
+

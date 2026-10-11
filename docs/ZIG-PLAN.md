@@ -203,4 +203,21 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
   full-attention prompt kernel, per-expert prompt GEMM), whose bits differ from decode rows, so an exact Zig prompt
   path means porting those, not reusing decode windows. Z3.3 (spark-bench arm) needs the server: after Z5.
 
-**Next:** Z4 (DFlash drafter: drafted == plain), Z5 (server on :8892), Z6 (prompt path exact), then speed (Z7/Z8).
+### 2026-10-11 (session 5; serve down ~25 min while idle, restarted)
+- **Z4 DFlash passed.** `dflash.zig` (Drafter.update / Drafter.draft: EXL3 via cuda/exl3.zig, _rms / _silu_mul from the
+  captured set, target head + gather) and `dflash.cu` (block embed, per-head norm + NEOX rope, windowed attention with
+  sinks, argmax; glue flags). The target forward taps layers 0/11/23/35/47 and feeds the drafter inside the graphed
+  sequence, as attach_drafter does.
+  - `tf-mimo dflash` vs `tools/mimo_zig_dflash.py` (Python drafter, same protocol): **draft tokens equal 13,275/13,279
+    (99.97%), whole blocks 1,893/1,897; accepted 6,035 vs 6,035, equal per prompt.** Not bit-exact by design: the
+    drafter's torch glue (mean, einsum, softmax) is reimplemented; it only proposes, the target verifies.
+  - `tf-mimo drafted` (4 streams, verify windows graphed): **8/8 replies byte-identical to the plain answer key, both
+    ranks**; 1,645 tokens in 191 forwards (prompt windows included), drafts accepted 1,166/3,257 at fixed width 8.
+  - Kernel set `aot4-sm121` (28 variants): `tools/mimo_zig_variants.py` records every decode-path specialisation
+    (row counts 1-128, 1/2/16-chunk classes, draft for 1-4 streams). Found when a 32-row window needed `_router`
+    BM=32 with M%16==0, which no earlier run had launched.
+  - Regression: Z3 windows gate re-run on this code + aot4: 1,905/1,905, both ranks.
+- Open nit: rank teardown exits 70 via fail-fast when the peer finishes first; fix with the server's stop message (Z5).
+
+**Next:** Z5 (server on :8892: OpenAI API, scheduler, joint_widths draft widths, Jay's test list, 1-hour stress), Z6
+(prompt path exact), then speed (Z7/Z8).

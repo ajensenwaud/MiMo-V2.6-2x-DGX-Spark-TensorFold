@@ -1,7 +1,7 @@
 From 32b0edb7ac932c8e998bc41966fd400a5620da59 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 14:33:26 +1100
-Subject: [PATCH 14/20] tf-cuda-test mimo-exl3-fixtures: EXL3 launches against
+Subject: [PATCH 14/23] tf-cuda-test mimo-exl3-fixtures: EXL3 launches against
  the Python engine's bytes
 
 ---

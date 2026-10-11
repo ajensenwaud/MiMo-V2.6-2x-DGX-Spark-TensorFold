@@ -1,7 +1,7 @@
 From 9e579a45d1a754f9840d9309655e50e6c32b77e2 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 14:23:17 +1100
-Subject: [PATCH 12/20] mimo-exl3 test: trellis words at int16 alignment
+Subject: [PATCH 12/23] mimo-exl3 test: trellis words at int16 alignment
 
 ---
  zig/tests/cuda/mimo_exl3_tests.zig | 2 +-
