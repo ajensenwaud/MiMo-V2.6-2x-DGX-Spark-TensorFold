@@ -1,0 +1,178 @@
+From 363bbfbe18bda3b58d4ba8b75326f105a349f8a2 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 21:32:17 +1100
+Subject: [PATCH 36/43] dflash: draft attention a block per (row, KV head),
+ keys and values shared by the group's heads (was re-read per head: 9.8 ms
+ draft at position 9,000)
+
+---
+ zig/kernels/cuda/mimo_v2/dflash.cu  | 121 +++++++++++++++++-----------
+ zig/src/families/mimo_v2/dflash.zig |   3 +-
+ 2 files changed, 77 insertions(+), 47 deletions(-)
+
+diff --git a/zig/kernels/cuda/mimo_v2/dflash.cu b/zig/kernels/cuda/mimo_v2/dflash.cu
+index 3744806b..e4ad5cc7 100644
+--- a/zig/kernels/cuda/mimo_v2/dflash.cu
++++ b/zig/kernels/cuda/mimo_v2/dflash.cu
+@@ -62,62 +62,91 @@ extern "C" __global__ void dr_store(const __half* __restrict__ in, const int32_t
+     for (int i = threadIdx.x; i < NH * 128; i += blockDim.x) cache[at + i] = in[(int64_t)r * NH * 128 + i];
+ }
+ 
+-// Draft attention: a block per (row r = s * B + b, head h), 128 threads. Keys pos0[s] - (W - 1) + t, t < W - 1 + B,
+-// visible when >= 0 and > the query's position - W (and within the block: all are); scores q.K * scale, the head's sink
+-// logit as one more column; softmax; out fp16 [S * B, H * 128] = (p @ V).to(fp16).
+-extern "C" __global__ void dr_attn(const float* __restrict__ q, const __half* __restrict__ kc,
++// Draft attention: a block per (row r = s * B + b, KV head), one warp per query head of the group (H / KV, <= 8).
++// Keys pos0[s] - (W - 1) + t, t < W - 1 + B, visible when >= 0 and > the query's position - W (and within the block:
++// all are); scores q.K * scale; the head's sink logit as one more column; softmax; out fp16 [S * B, H * 128] =
++// (p @ V).to(fp16). Keys and values come through shared memory 32 at a time, read once for the group's heads; the
++// softmax runs online (max / sum rescaled per tile), so its rounding differs from torch's two-pass softmax.
++#define DR_TILE 32
++extern "C" __global__ void __launch_bounds__(256) dr_attn(const float* __restrict__ q, const __half* __restrict__ kc,
+                                    const __half* __restrict__ vc, const float* __restrict__ sinks,
+                                    const int32_t* __restrict__ pos0, const int32_t* __restrict__ slot,
+                                    __half* __restrict__ out, int B, int W, int ring, int H, int KV, float scale) {
+-    extern __shared__ float sc[];   // [W - 1 + B]
+-    __shared__ float qs[128];
+-    __shared__ float red[4];
+-    const int r = blockIdx.x, h = blockIdx.y, s = r / B, b = r % B, tid = threadIdx.x;
+-    const int kvh = h / (H / KV);
++    __shared__ float qs[8][128];
++    __shared__ __half ks[DR_TILE][130];   // padded rows: lane j reads row j, conflict-free
++    __shared__ __half vs[DR_TILE][128];
++    const int r = blockIdx.x, kvh = blockIdx.y, s = r / B, b = r % B;
++    const int G = H / KV, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     const int span = W - 1 + B;
+     const int p0 = pos0[s], qpos = p0 + b;
+     const int64_t base = (int64_t)slot[s] * ring;
+-    qs[tid] = q[((int64_t)r * H + h) * 128 + tid];
+-    __syncthreads();
+-    const int warp = tid >> 5, lane = tid & 31;
+-    for (int t = warp; t < span; t += 4) {
++    const int h = kvh * G + warp;
++    const bool active = warp < G;
++    for (int i = threadIdx.x; i < G * 128; i += blockDim.x) qs[i / 128][i % 128] = q[((int64_t)r * H + kvh * G + i / 128) * 128 + i % 128];
++    float m = -INFINITY, l = 0.0f;
++    float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++    // the first key any query of this row sees: past kp < 0 and past qpos - W
++    int t_first = (W - 1) - p0;               // kp >= 0
++    if (t_first < 0) t_first = 0;
++    const int t_vis = qpos - W + 1 - (p0 - (W - 1));   // kp > qpos - W
++    if (t_vis > t_first) t_first = t_vis;
++    for (int t0 = t_first - (t_first % DR_TILE); t0 < span; t0 += DR_TILE) {
++        __syncthreads();
++        for (int i = threadIdx.x; i < DR_TILE * 64; i += blockDim.x) {   // 64 half2 a row
++            const int j = i / 64, d2 = i % 64;
++            const int kp = p0 - (W - 1) + t0 + j;
++            __half2 kv = __float2half2_rn(0.0f), vv = __float2half2_rn(0.0f);
++            if (t0 + j < span && kp >= 0) {
++                const int64_t at = ((base + kp % ring) * KV + kvh) * 128 + 2 * d2;
++                kv = *reinterpret_cast<const __half2*>(kc + at);
++                vv = *reinterpret_cast<const __half2*>(vc + at);
++            }
++            ks[j][2 * d2] = __low2half(kv);
++            ks[j][2 * d2 + 1] = __high2half(kv);
++            *reinterpret_cast<__half2*>(&vs[j][2 * d2]) = vv;
++        }
++        __syncthreads();
++        if (!active) continue;
++        const int t = t0 + lane;
+         const int kp = p0 - (W - 1) + t;
+-        float acc = 0.0f;
+-        if (kp >= 0) {
+-            const __half* k = kc + ((base + kp % ring) * KV + kvh) * 128;
+-            for (int dd = lane; dd < 128; dd += 32) acc += qs[dd] * __half2float(k[dd]);
++        float sc = -INFINITY;
++        if (t < span && kp >= 0 && kp > qpos - W) {
++            float acc = 0.0f;
++#pragma unroll 8
++            for (int d = 0; d < 128; ++d) acc += qs[warp][d] * __half2float(ks[lane][d]);
++            sc = acc * scale;
+         }
+-        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, o);
+-        if (lane == 0) sc[t] = (kp >= 0 && kp > qpos - W) ? acc * scale : -INFINITY;
+-    }
+-    __syncthreads();
+-    const float sink = sinks ? sinks[h] : -INFINITY;
+-    float m = sink;
+-    for (int t = tid; t < span; t += 128) m = fmaxf(m, sc[t]);
+-    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+-    if (lane == 0) red[warp] = m;
+-    __syncthreads();
+-    m = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
+-    __syncthreads();
+-    float l = 0.0f;
+-    for (int t = tid; t < span; t += 128) {
+-        const float e = sc[t] == -INFINITY ? 0.0f : expf(sc[t] - m);
+-        sc[t] = e;
+-        l += e;
+-    }
+-    for (int o = 16; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffff, l, o);
+-    if (lane == 0) red[warp] = l;
+-    __syncthreads();
+-    l = red[0] + red[1] + red[2] + red[3] + (sinks ? expf(sink - m) : 0.0f);
+-    float o = 0.0f;
+-    for (int t = 0; t < span; ++t) {
+-        const float e = sc[t];
+-        if (e != 0.0f) {
+-            const int kp = p0 - (W - 1) + t;
+-            o += e * __half2float(vc[((base + kp % ring) * KV + kvh) * 128 + tid]);
++        float tm = sc;
++        for (int k = 16; k > 0; k >>= 1) tm = fmaxf(tm, __shfl_xor_sync(0xffffffff, tm, k));
++        if (tm == -INFINITY) continue;        // nothing visible in this tile for this query
++        const float mn = fmaxf(m, tm);
++        const float corr = m == -INFINITY ? 0.0f : expf(m - mn);
++        const float p = sc == -INFINITY ? 0.0f : expf(sc - mn);
++        float ps = p;
++        for (int k = 16; k > 0; k >>= 1) ps += __shfl_xor_sync(0xffffffff, ps, k);
++        l = l * corr + ps;
++#pragma unroll
++        for (int e = 0; e < 4; ++e) o[e] *= corr;
++        for (int j = 0; j < DR_TILE; ++j) {
++            const float pj = __shfl_sync(0xffffffff, p, j);
++            if (pj != 0.0f) {
++#pragma unroll
++                for (int e = 0; e < 4; ++e) o[e] += pj * __half2float(vs[j][lane * 4 + e]);
++            }
+         }
++        m = mn;
++    }
++    if (!active) return;
++    if (sinks) {
++        const float sk = sinks[h];
++        const float mn = fmaxf(m, sk);
++        const float corr = m == -INFINITY ? 0.0f : expf(m - mn);
++        l = l * corr + expf(sk - mn);
++#pragma unroll
++        for (int e = 0; e < 4; ++e) o[e] *= corr;
+     }
+-    out[((int64_t)r * H + h) * 128 + tid] = __float2half_rn(o / l);
++#pragma unroll
++    for (int e = 0; e < 4; ++e) out[((int64_t)r * H + h) * 128 + lane * 4 + e] = __float2half_rn(o[e] / l);
+ }
+ 
+ // rows s * B + 1 .. s * B + B - 1 of x fp16 [S * B, D] -> [S * (B - 1), D]
+diff --git a/zig/src/families/mimo_v2/dflash.zig b/zig/src/families/mimo_v2/dflash.zig
+index 2b98a254..89aa9cae 100644
+--- a/zig/src/families/mimo_v2/dflash.zig
++++ b/zig/src/families/mimo_v2/dflash.zig
+@@ -124,6 +124,7 @@ pub const Drafter = struct {
+         if (c.is_causal) return error.CausalDrafter;
+         if (c.hidden_size != m.w.cfg.hidden) return error.HiddenMismatch;
+         if (c.head_dim != 128) return error.HeadDim;
++        if (c.num_attention_heads / c.num_key_value_heads > 8) return error.GroupWiderThan8; // dr_attn: a warp per head
+ 
+         const dr = try gpa.create(Drafter);
+         errdefer gpa.destroy(dr);
+@@ -403,7 +404,7 @@ pub const Drafter = struct {
+                 a.add(@as(c_int, @intCast(H)));
+                 a.add(@as(c_int, @intCast(dr.kv)));
+                 a.add(dr.scale);
+-                try launch(dr.f.attn, s, n, H, 128, (dr.window - 1 + B) * 4, &a);
++                try launch(dr.f.attn, s, n, dr.kv, 256, 0, &a); // a block per (row, KV head), a warp per head of the group
+             }
+             try dr.proj(s, L.o, dr.a, dr.o32, true, n);
+             try m.add2(s, dr.x32, dr.o32, dr.x32, n * D);
+-- 
+2.53.0
+

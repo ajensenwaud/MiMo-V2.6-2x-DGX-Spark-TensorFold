@@ -1,0 +1,104 @@
+From 44fda49f95230144f7659dcb30f72af5140fb393 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 21:02:50 +1100
+Subject: [PATCH 34/43] dflash: graphed draft pass per stream count
+ (DraftRunner; TF_MIMO_DRAFT_GRAPHS=0 eager); timing reports draft ms
+
+---
+ zig/src/families/mimo_v2/dflash.zig  | 30 +++++++++++++++++++++++++++-
+ zig/src/families/mimo_v2/m1_main.zig | 19 ++++++++++++++++++
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/mimo_v2/dflash.zig b/zig/src/families/mimo_v2/dflash.zig
+index eafb5ea4..2b98a254 100644
+--- a/zig/src/families/mimo_v2/dflash.zig
++++ b/zig/src/families/mimo_v2/dflash.zig
+@@ -108,6 +108,8 @@ pub const Drafter = struct {
+     rpos: u64, // i32 [SB]
+     rslot: u64, // i32 [SB]
+     drafts: usize = 0,
++    graphs: [17]?cuda.graph.Exec = @splat(null), // DraftRunner: one graph per stream count (TF_MIMO_DRAFT_GRAPHS=0: eager)
++    use_graphs: bool = true,
+ 
+     /// Drafter(model, dir): `dir` the pack's dflash/ (config.json + model.safetensors, mul1 EXL3).
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, m: *fwd.Model, dir: []const u8, s: Stream) !*Drafter {
+@@ -130,6 +132,8 @@ pub const Drafter = struct {
+         dr.d = d;
+         dr.gpa = gpa;
+         dr.drafts = 0;
++        dr.graphs = @splat(null);
++        dr.use_graphs = if (std.c.getenv("TF_MIMO_DRAFT_GRAPHS")) |v| v[0] != '0' else true;
+         dr.hidden = c.hidden_size;
+         dr.inter = c.intermediate_size;
+         dr.heads = c.num_attention_heads;
+@@ -251,6 +255,10 @@ pub const Drafter = struct {
+ 
+     pub fn deinit(dr: *Drafter) void {
+         const gpa = dr.gpa;
++        for (&dr.graphs) |*g| if (g.*) |*e| {
++            e.deinit();
++            g.* = null;
++        };
+         gpa.free(dr.taps);
+         gpa.free(dr.layers);
+         gpa.free(dr.kc);
+@@ -436,7 +444,27 @@ pub const Drafter = struct {
+     /// DraftRunner.__call__ (eager): drafts [S, block - 1] into `out` (row-major).
+     pub fn draft(dr: *Drafter, s: Stream, tokens: []const i64, pos0: []const u32, slots: []const u32, out: []i32) !void {
+         try dr.stage(tokens, pos0, slots);
+-        try dr.run(s, tokens.len);
++        const S = tokens.len;
++        if (!dr.use_graphs or S >= dr.graphs.len) {
++            try dr.run(s, S);
++        } else if (dr.graphs[S]) |e| {
++            try e.launchOn(s);
++        } else {
++            try dr.run(s, S); // warm-up (as DraftRunner); writes the same cache rows the replay will
++            try s.synchronize();
++            try cuda.graph.beginCapture(s, .thread_local);
++            dr.run(s, S) catch |err| {
++                if (cuda.graph.endCapture(s)) |g| {
++                    var gg = g;
++                    gg.deinit();
++                } else |_| {}
++                return err;
++            };
++            var g = try cuda.graph.endCapture(s);
++            defer g.deinit();
++            dr.graphs[S] = try g.instantiate();
++            try dr.graphs[S].?.launchOn(s);
++        }
+         try s.synchronize();
+         const n1 = tokens.len * (dr.block - 1);
+         try dr.d.check(dr.d.api.cuMemcpyDtoH_v2(@ptrCast(out.ptr), dr.am, n1 * 4), "drafts");
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index 5b21c425..a5a813c3 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -510,4 +510,23 @@ fn timing(io: std.Io, model: *mimo.forward.Model, s: cuda.Stream, rank: usize, l
+         }
+         std.debug.print("[timing] rank {d} {s}: {d} rows: step {d:.2} ms, argmax readback {d:.3} ms\n", .{ rank, label, n, @as(f64, @floatFromInt(t_step)) / 1e6 / reps, @as(f64, @floatFromInt(t_am)) / 1e6 / reps });
+     }
++    if (model.dr) |dr| for ([_]usize{ 1, 4 }) |S| {
++        var toks: [4]i64 = undefined;
++        var p0: [4]u32 = undefined;
++        var sl: [4]u32 = undefined;
++        var out: [64]i32 = undefined;
++        for (0..S) |i| {
++            toks[i] = 1000;
++            p0[i] = 9000;
++            sl[i] = @intCast(i);
++        }
++        try dr.draft(s, toks[0..S], p0[0..S], sl[0..S], &out);
++        try dr.draft(s, toks[0..S], p0[0..S], sl[0..S], &out);
++        const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++        for (0..reps) |i| {
++            for (0..S) |k| toks[k] = @intCast(1000 + 7919 * i + k);
++            try dr.draft(s, toks[0..S], p0[0..S], sl[0..S], &out);
++        }
++        std.debug.print("[timing] rank {d} {s}: draft pass, {d} stream(s): {d:.2} ms ({s})\n", .{ rank, label, S, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6 / reps, if (dr.use_graphs) "graphed" else "eager" });
++    };
+ }
+-- 
+2.53.0
+

@@ -1,0 +1,25 @@
+From d54a269aa4e2ee37ff7f4fb0c79fd28b3b2e2f60 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 22:00:40 +1100
+Subject: [PATCH 37/43] m1_run.sh: NSYS= profiles rank 0
+
+---
+ zig/src/families/mimo_v2/m1_run.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/mimo_v2/m1_run.sh b/zig/src/families/mimo_v2/m1_run.sh
+index fe16c76b..bc7d2c45 100644
+--- a/zig/src/families/mimo_v2/m1_run.sh
++++ b/zig/src/families/mimo_v2/m1_run.sh
+@@ -10,7 +10,7 @@ args() {   # RANK ORACLE
+        "-e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 -e NCCL_IB_GID_INDEX=3" \
+        "-e TF_TP_WORLD=2 -e TF_TP_RANK=$1 -e TF_TP_MASTER=10.100.128.1 -e TF_TP_PORT=$PORT -e TF_COMM_BACKEND=${COMM:-nccl} -e TF_TP_ROCE_HCA=rocep1s0f0,roceP2p1s0f0 ${EXTRA_ENV:-}" \
+        "-v $HOME/models/mimo-v2.6/MiMo-V2.6-Flash-RL-exl3-3.0bpw:/model:ro -v $HOME/mimo:/mimo" \
+-       "--entrypoint ${BIN:-/mimo/m1}/tf-mimo mimo-tf:latest ${MODE:-m1} /model $2 /mimo/oracle/${AOT:-aot2-sm121}" \
++       "$(if [ -n "${NSYS:-}" ] && [ "$1" = 0 ]; then echo --entrypoint /usr/local/cuda/bin/nsys mimo-tf:latest profile -o /mimo/nsys/$NSYS --trace=cuda,nvtx --cuda-graph-trace=node --force-overwrite true ${BIN:-/mimo/m1}/tf-mimo; else echo --entrypoint ${BIN:-/mimo/m1}/tf-mimo mimo-tf:latest; fi) ${MODE:-m1} /model $2 /mimo/oracle/${AOT:-aot2-sm121}" \
+        "$(case ${MODE:-m1} in windows|dflash) echo /mimo/oracle/${MODE}-r$1.json;; timing) echo;; *) echo ${CONTEXT:-4096};; esac)"
+ }
+ ssh -n "$WORKER" "docker rm -f mimo-m1 >/dev/null 2>&1; docker run $(args 1 /mimo/oracle/rank1.safetensors) > \$HOME/mimo/m1/${MODE:-m1}-r1.log 2>&1" </dev/null &
+-- 
+2.53.0
+

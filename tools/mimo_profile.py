@@ -40,6 +40,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
     ap.add_argument("ref")
+    ap.add_argument("out", nargs="?", default="")   # the capture launcher's output dir (unused)
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--rank", type=int, default=0)
     ap.add_argument("--master", default="10.100.128.1")

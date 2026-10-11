@@ -1,7 +1,7 @@
 From 249afec3f70a4a0fed54bf7faadc9d2c3f461cae Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 17:09:35 +1100
-Subject: [PATCH 23/33] m1_main: drafted summary wording
+Subject: [PATCH 23/43] m1_main: drafted summary wording
 
 ---
  zig/src/families/mimo_v2/m1_main.zig | 2 +-

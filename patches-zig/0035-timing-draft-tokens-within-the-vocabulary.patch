@@ -1,0 +1,25 @@
+From 5564675c4fefdd23b7c0f34d78368cc0364a712b Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 21:17:59 +1100
+Subject: [PATCH 35/43] timing: draft tokens within the vocabulary
+
+---
+ zig/src/families/mimo_v2/m1_main.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index a5a813c3..855218b5 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -524,7 +524,7 @@ fn timing(io: std.Io, model: *mimo.forward.Model, s: cuda.Stream, rank: usize, l
+         try dr.draft(s, toks[0..S], p0[0..S], sl[0..S], &out);
+         const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+         for (0..reps) |i| {
+-            for (0..S) |k| toks[k] = @intCast(1000 + 7919 * i + k);
++            for (0..S) |k| toks[k] = @intCast(1000 + (7919 * i + 104729 * k) % 140000);
+             try dr.draft(s, toks[0..S], p0[0..S], sl[0..S], &out);
+         }
+         std.debug.print("[timing] rank {d} {s}: draft pass, {d} stream(s): {d:.2} ms ({s})\n", .{ rank, label, S, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6 / reps, if (dr.use_graphs) "graphed" else "eager" });
+-- 
+2.53.0
+

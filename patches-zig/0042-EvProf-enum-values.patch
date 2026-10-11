@@ -1,0 +1,43 @@
+From 5a5c81493a2aac4e69bc5ece58892d8fba3713f3 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 22:54:00 +1100
+Subject: [PATCH 42/43] EvProf: enum values
+
+---
+ zig/src/families/mimo_v2/forward.zig | 2 +-
+ zig/src/families/mimo_v2/m1_main.zig | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/forward.zig b/zig/src/families/mimo_v2/forward.zig
+index aea7fbd6..1c0dcdcc 100644
+--- a/zig/src/families/mimo_v2/forward.zig
++++ b/zig/src/families/mimo_v2/forward.zig
+@@ -31,7 +31,7 @@ pub const EvProf = struct {
+     made: usize = 0,
+     cats: [4096]Cat = undefined,
+     n: usize = 0,
+-    totals: [@typeInfo(Cat).@"enum".fields.len]f64 = @splat(0),
++    totals: [std.enums.values(Cat).len]f64 = @splat(0),
+     forwards: usize = 0,
+ 
+     pub fn mark(ep: *EvProf, d: *const cuda.Driver, s: Stream, c: Cat) !void {
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index fee0f96c..7e0c223e 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -525,10 +525,10 @@ fn timing(io: std.Io, model: *mimo.forward.Model, s: cuda.Stream, rank: usize, l
+         var line: [512]u8 = undefined;
+         var w: std.Io.Writer = .fixed(&line);
+         var total: f64 = 0;
+-        inline for (@typeInfo(mimo.forward.Cat).@"enum".fields, 0..) |fld, ci| {
++        for (std.enums.values(mimo.forward.Cat), 0..) |cat, ci| {
+             const v = prof.totals[ci] / 20.0;
+             total += v;
+-            if (ci > 0) try w.print(" {s} {d:.2}", .{ fld.name, v });
++            if (ci > 0) try w.print(" {s} {d:.2}", .{ @tagName(cat), v });
+         }
+         std.debug.print("[timing] rank {d} {s}: eager {d} rows by category (ms):{s}; total {d:.2}\n", .{ rank, label, n, w.buffered(), total });
+     }
+-- 
+2.53.0
+

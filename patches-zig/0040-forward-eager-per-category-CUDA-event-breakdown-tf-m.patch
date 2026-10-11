@@ -1,0 +1,189 @@
+From 38b034501887e64fcf0c99f076619ed7d17cd9fd Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 22:51:54 +1100
+Subject: [PATCH 40/43] forward: eager per-category CUDA-event breakdown
+ (tf-mimo timing)
+
+---
+ zig/src/families/mimo_v2/forward.zig | 56 ++++++++++++++++++++++++++--
+ zig/src/families/mimo_v2/m1_main.zig | 22 +++++++++++
+ 2 files changed, 75 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/forward.zig b/zig/src/families/mimo_v2/forward.zig
+index 27863954..232588f2 100644
+--- a/zig/src/families/mimo_v2/forward.zig
++++ b/zig/src/families/mimo_v2/forward.zig
+@@ -24,6 +24,34 @@ pub const DECODE_ROWS = 128; // ops.DECODE_ROWS: the EXL3 GEMV's row limit
+ pub const BUCKET = 8192; // graphs.BUCKET
+ pub const MAX_GRAPH_ROWS = 32; // graphs.MAX_ROWS: the widest chain graphed
+ 
++/// Where an eager forward's GPU time goes (tf-mimo timing): CUDA events between the categories' launches.
++pub const Cat = enum(u8) { start, dense, attention, comm, add, norm, router, experts, drafter, head };
++pub const EvProf = struct {
++    events: [4096]cuda.Event = undefined,
++    made: usize = 0,
++    cats: [4096]Cat = undefined,
++    n: usize = 0,
++    totals: [@typeInfo(Cat).@"enum".fields.len]f64 = @splat(0),
++    forwards: usize = 0,
++
++    pub fn mark(p: *EvProf, d: *const cuda.Driver, s: Stream, c: Cat) !void {
++        if (p.n == p.events.len) return error.TooManyMarks;
++        if (p.n == p.made) {
++            p.events[p.made] = try cuda.Event.init(d, true);
++            p.made += 1;
++        }
++        try p.events[p.n].record(s);
++        p.cats[p.n] = c;
++        p.n += 1;
++    }
++    pub fn collect(p: *EvProf, s: Stream) !void {
++        try s.synchronize();
++        for (1..p.n) |i| p.totals[@intFromEnum(p.cats[i])] += try cuda.Event.elapsedMs(p.events[i - 1], p.events[i]);
++        p.n = 0;
++        p.forwards += 1;
++    }
++};
++
+ /// One decode row: a stream's cache slot, its position, its input token.
+ pub const Row = struct { slot: u32, pos: u32, token: i64 };
+ 
+@@ -94,7 +122,8 @@ pub const Model = struct {
+     slots: usize,
+     nch_max: usize,
+     graphs: std.AutoHashMapUnmanaged([2]u32, cuda.graph.Exec) = .empty,
+-    dr: ?*dflash.Drafter = null, // DFlash: fed by every forward (taps + update), as attach_drafter wires it
++    dr: ?*dflash.Drafter = null,
++    ev: ?*EvProf = null, // eager only: per-category GPU time // DFlash: fed by every forward (taps + update), as attach_drafter wires it
+     replays: usize = 0,
+     captures: usize = 0,
+     kc: []u64,
+@@ -123,6 +152,7 @@ pub const Model = struct {
+         m.slots = slots;
+         m.graphs = .empty;
+         m.dr = null;
++        m.ev = null;
+         m.replays = 0;
+         m.captures = 0;
+         m.nch_max = (context + CK - 1) / CK; // a graph's bucket / CK at most, and max(pos) / CK + 1 eagerly
+@@ -235,10 +265,16 @@ pub const Model = struct {
+         const c = m.comm orelse return part;
+         const D = m.w.cfg.hidden;
+         try c.allGather(part, m.b.recv, n * D, .f32, s.handle);
++        try m.mark(s, .comm);
+         try m.add2(s, m.b.recv, m.b.recv + n * D * 4, m.b.sum, n * D);
++        try m.mark(s, .add);
+         return m.b.sum;
+     }
+ 
++    fn mark(m: *Model, s: Stream, c: Cat) !void {
++        if (m.ev) |p| try p.mark(m.d, s, c);
++    }
++
+     pub fn add2(m: *Model, s: Stream, a_: u64, b_: u64, out: u64, n: usize) !void {
+         var a: cuda.Args = .{};
+         a.add(a_);
+@@ -348,6 +384,7 @@ pub const Model = struct {
+         const D = cfg.hidden;
+         const H = cfg.heads;
+         if (chunks > m.nch_max) return error.TooManyChunks;
++        try m.mark(s, .start);
+         // res = embed[ids].float()
+         {
+             var a: cuda.Args = .{};
+@@ -358,11 +395,13 @@ pub const Model = struct {
+             try cuda.launch.launch(m.f_embed, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
+         }
+         try m.rms(s, m.b.res, m.w.layers[0].input_norm, m.b.x, n);
++        try m.mark(s, .norm);
+         for (m.w.layers, 0..) |L, i| {
+             const hk = cfg.kvHeads(i);
+             try m.proj(s, L.q, m.b.x, m.b.q, false, n);
+             try m.proj(s, L.k, m.b.x, m.b.k, false, n);
+             try m.proj(s, L.v, m.b.x, m.b.v, false, n);
++            try m.mark(s, .dense);
+             const full = cfg.full[i];
+             const len = if (full) m.context else m.ring;
+             try m.set.run(s, "_qkv", .{ u(n), u(H + 2 * hk), 1 }, &.{
+@@ -386,9 +425,13 @@ pub const Model = struct {
+                 p("PO", "*fp32", m.b.po),                       p("PM", "*fp32", m.b.pm), p("PL", "*fp32", m.b.pl),
+                 p("SINKS", "*fp32", if (sinks != 0) sinks else m.b.pm), p("OUT", "*fp16", m.b.att), ii("NCH", nch),
+             }, &.{ ci("H", H), ci("HAS_SINK", @intFromBool(sinks != 0)) });
++            try m.mark(s, .attention);
+             if (cap) |c| if (c.hook) |h| try h(c.ctx, .att, i, m.b.att, n * H * 128 * 2);
+             try m.proj(s, L.o, m.b.att, m.b.part, true, n);
+-            try m.addRms(s, try m.sum(s, m.b.part, n), L.post_norm, m.b.x, n);
++            try m.mark(s, .dense);
++            const so = try m.sum(s, m.b.part, n);
++            try m.addRms(s, so, L.post_norm, m.b.x, n);
++            try m.mark(s, .norm);
+             if (cap) |c| if (c.hook) |h| try h(c.ctx, .attn, i, m.b.res, n * D * 4);
+             if (L.experts) |e| {
+                 // moe.MoE: router logits (shared.router's tile by row count), top 8 (sigmoid + bias), routed experts
+@@ -400,6 +443,7 @@ pub const Model = struct {
+                 try m.set.run(s, "_topk", .{ u(n), 1, 1 }, &.{
+                     p("L", "*fp32", m.b.logits), p("BIAS", "*fp32", L.bias), p("PICK", "*i32", m.b.pick), p("WTS", "*fp32", m.b.wts), aot.float("SCALE", L.route_scale),
+                 }, &.{ ci("NE", cfg.experts), ci("TOPK", cfg.top_k), ci("BLOCK", pow2(cfg.experts)), ci("KP", pow2(cfg.top_k)) });
++                try m.mark(s, .router);
+                 try m.k3.routed(s, m.b.x, false, D, m.b.pick, m.b.wts, e, m.b.sc, m.b.part, n, std.math.inf(f32), 1, true);
+             } else {
+                 try m.proj(s, L.gate.?, m.b.x, m.b.g, false, n);
+@@ -408,15 +452,21 @@ pub const Model = struct {
+                 try m.set.run(s, "_silu_mul", .{ u(n), u(nd / 1024), 1 }, &.{ p("G", "*fp16", m.b.g), p("U", "*fp16", m.b.up), p("OUT", "*fp16", m.b.h) }, &.{ ci("N", nd), ci("BLOCK", 1024) });
+                 try m.proj(s, L.down.?, m.b.h, m.b.part, true, n);
+             }
++            try m.mark(s, if (L.experts != null) .experts else .dense);
+             const after = if (i + 1 < m.w.layers.len) m.w.layers[i + 1].input_norm else m.w.norm;
+-            try m.addRms(s, try m.sum(s, m.b.part, n), after, m.b.x, n);
++            const sm = try m.sum(s, m.b.part, n);
++            try m.addRms(s, sm, after, m.b.x, n);
++            try m.mark(s, .norm);
+             if (cap) |c| if (c.hook) |h| try h(c.ctx, .mlp, i, m.b.res, n * D * 4);
+             if (m.dr) |dr| if (cap == null) try dr.tap(s, i, m.b.res, n);
+         }
+         if (m.dr) |dr| if (cap == null) try dr.update(s, n);
++        try m.mark(s, .drafter);
+         // _head / _logits: this rank's vocab slice; gathered over the ranks into recv [world, n, Vr]
+         try m.proj(s, m.w.head, m.b.x, m.b.head, true, n);
++        try m.mark(s, .head);
+         if (m.comm) |c| try c.allGather(m.b.head, m.b.recv, n * m.w.head.n, .f32, s.handle);
++        try m.mark(s, .comm);
+     }
+ 
+     /// Each row's argmax (torch.argmax over the gathered vocab) on the device; only the ids reach the host.
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index 855218b5..fee0f96c 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -510,6 +510,28 @@ fn timing(io: std.Io, model: *mimo.forward.Model, s: cuda.Stream, rank: usize, l
+         }
+         std.debug.print("[timing] rank {d} {s}: {d} rows: step {d:.2} ms, argmax readback {d:.3} ms\n", .{ rank, label, n, @as(f64, @floatFromInt(t_step)) / 1e6 / reps, @as(f64, @floatFromInt(t_am)) / 1e6 / reps });
+     }
++    // eager breakdown by category (CUDA events between launches; eager, so not the graph's wall time)
++    for ([_]usize{ 1, 8 }) |n| {
++        var prof: mimo.forward.EvProf = .{};
++        for (0..n) |j| rows[j] = .{ .slot = 0, .pos = @intCast(9000 + j), .token = 1000 };
++        try model.forward(s, rows[0..n], null, null);
++        model.ev = &prof;
++        for (0..20) |_| {
++            for (0..n) |j| rows[j].token = @intCast(1000 + rng.random().uintLessThan(usize, 140000));
++            try model.forward(s, rows[0..n], null, null);
++            try prof.collect(s);
++        }
++        model.ev = null;
++        var line: [512]u8 = undefined;
++        var w: std.Io.Writer = .fixed(&line);
++        var total: f64 = 0;
++        inline for (@typeInfo(mimo.forward.Cat).@"enum".fields, 0..) |fld, ci| {
++            const v = prof.totals[ci] / 20.0;
++            total += v;
++            if (ci > 0) try w.print(" {s} {d:.2}", .{ fld.name, v });
++        }
++        std.debug.print("[timing] rank {d} {s}: eager {d} rows by category (ms):{s}; total {d:.2}\n", .{ rank, label, n, w.buffered(), total });
++    }
+     if (model.dr) |dr| for ([_]usize{ 1, 4 }) |S| {
+         var toks: [4]i64 = undefined;
+         var p0: [4]u32 = undefined;
+-- 
+2.53.0
+

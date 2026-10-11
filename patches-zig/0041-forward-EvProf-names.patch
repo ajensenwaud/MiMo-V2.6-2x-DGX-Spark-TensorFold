@@ -1,0 +1,59 @@
+From ac88a13a0dbf3371c4842566d8eb44ec19bf5a03 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 22:52:46 +1100
+Subject: [PATCH 41/43] forward: EvProf names
+
+---
+ zig/src/families/mimo_v2/forward.zig | 26 +++++++++++++-------------
+ 1 file changed, 13 insertions(+), 13 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/forward.zig b/zig/src/families/mimo_v2/forward.zig
+index 232588f2..aea7fbd6 100644
+--- a/zig/src/families/mimo_v2/forward.zig
++++ b/zig/src/families/mimo_v2/forward.zig
+@@ -34,21 +34,21 @@ pub const EvProf = struct {
+     totals: [@typeInfo(Cat).@"enum".fields.len]f64 = @splat(0),
+     forwards: usize = 0,
+ 
+-    pub fn mark(p: *EvProf, d: *const cuda.Driver, s: Stream, c: Cat) !void {
+-        if (p.n == p.events.len) return error.TooManyMarks;
+-        if (p.n == p.made) {
+-            p.events[p.made] = try cuda.Event.init(d, true);
+-            p.made += 1;
++    pub fn mark(ep: *EvProf, d: *const cuda.Driver, s: Stream, c: Cat) !void {
++        if (ep.n == ep.events.len) return error.TooManyMarks;
++        if (ep.n == ep.made) {
++            ep.events[ep.made] = try cuda.Event.init(d, true);
++            ep.made += 1;
+         }
+-        try p.events[p.n].record(s);
+-        p.cats[p.n] = c;
+-        p.n += 1;
++        try ep.events[ep.n].record(s);
++        ep.cats[ep.n] = c;
++        ep.n += 1;
+     }
+-    pub fn collect(p: *EvProf, s: Stream) !void {
++    pub fn collect(ep: *EvProf, s: Stream) !void {
+         try s.synchronize();
+-        for (1..p.n) |i| p.totals[@intFromEnum(p.cats[i])] += try cuda.Event.elapsedMs(p.events[i - 1], p.events[i]);
+-        p.n = 0;
+-        p.forwards += 1;
++        for (1..ep.n) |i| ep.totals[@intFromEnum(ep.cats[i])] += try cuda.Event.elapsedMs(ep.events[i - 1], ep.events[i]);
++        ep.n = 0;
++        ep.forwards += 1;
+     }
+ };
+ 
+@@ -272,7 +272,7 @@ pub const Model = struct {
+     }
+ 
+     fn mark(m: *Model, s: Stream, c: Cat) !void {
+-        if (m.ev) |p| try p.mark(m.d, s, c);
++        if (m.ev) |ep| try ep.mark(m.d, s, c);
+     }
+ 
+     pub fn add2(m: *Model, s: Stream, a_: u64, b_: u64, out: u64, n: usize) !void {
+-- 
+2.53.0
+

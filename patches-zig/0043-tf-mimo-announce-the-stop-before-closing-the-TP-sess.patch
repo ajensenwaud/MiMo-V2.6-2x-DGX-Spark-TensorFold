@@ -1,0 +1,29 @@
+From 2bd8b425e67e173c243c42b3a45c3d9e209233d9 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 22:58:33 +1100
+Subject: [PATCH 43/43] tf-mimo: announce the stop before closing the TP
+ session (no fail-fast exit 70 when a rank finishes first)
+
+---
+ zig/src/families/mimo_v2/m1_main.zig | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index 7e0c223e..d4913a47 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -94,7 +94,10 @@ pub fn main(init: std.process.Init) !u8 {
+     var session: tp.Session = undefined;
+     const world: usize = cfg.world;
+     if (world > 1) try session.open(&driver, cfg, @import("tp_kernel").mailbox);
+-    defer if (world > 1) session.close();
++    defer if (world > 1) {
++        session.announceStop(); // a clean stop: the peer exits 0 instead of failing fast (70) when this rank ends first
++        session.close();
++    };
+     const rank: usize = cfg.rank;
+     if (is_follow) return follow(gpa, io, &driver, &session, args[2], args[3]);
+     var s = try cuda.Stream.init(&driver, false);
+-- 
+2.53.0
+

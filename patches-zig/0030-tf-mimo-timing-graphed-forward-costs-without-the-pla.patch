@@ -1,7 +1,7 @@
 From c9e93b74b3b8956dd2ce5e6c45c5957da67da767 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 20:25:06 +1100
-Subject: [PATCH 30/33] tf-mimo timing: graphed forward costs without the plan
+Subject: [PATCH 30/43] tf-mimo timing: graphed forward costs without the plan
  link, drafter off/on
 
 ---

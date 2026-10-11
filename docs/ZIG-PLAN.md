@@ -289,3 +289,25 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
 - Open: draft pass 7.9 ms on RoCE vs 6.5 on NCCL, and 32-row shared windows 165 vs 142 ms: large messages (the
   drafter's head gather, ~2 MB) look slower on the mailbox path; try TF_TP_MAILBOX_MAX_KB (Python: 512) and graphing
   the draft pass (Python: 7.0 -> 6.05 ms). Then the per-row gap to Python (22.4 vs 21.6 ms) and Z6.
+
+### Z7, session 9: the single-stream gap (Anders: "why slower on one stream, code and chat?")
+- Same-night A/B, 3 runs a cell (median tok/s, 1 stream): Python chat 49.4 / code 78.7 / agent 58.9 / report 51.0;
+  Zig lanes rule 46.6 / 66.6 / 55.4 / 47.7; Zig geometric rule 45.4 / 70.7 / 51.4 / 48.4. 4 streams aggregate: Python
+  81.8 / 85.7 / 80.1 / 85.1; Zig lanes 72.2 / 110.2 / 83.4 / 78.3; geometric 80.3 / 106.5 / 89.5 / 83.5.
+  Single runs swing +-15%: compare medians only. The older Python baseline (code 83.0, chat 52.9) was a different night.
+- Rounds (logs): Zig drafts deeper than Python (code 5.2 vs 4.0 drafts a round, chat 2.6 vs 1.0) at about equal tokens
+  a round, so it pays more a round. Python's joint_widths rule ported to lanes (`geometric_depth`, TF_MIMO_DEPTH=geometric,
+  lone streams only): **no gain**, kept off.
+- Draft attention rewritten (a block per row and KV head, keys and values shared by the group): draft pass at position
+  9,000 9.75 -> 6.26 ms (4 streams 24.4 -> 12.1); drafts 99.97% equal to Python, drafted replies 8/8. Kept. Served
+  short-prompt cells unchanged (the old kernel was cheap at low positions).
+- **The cause is the forward itself:** Python 3.0 pack (`results/zig-z7/python-profile-3.0.log`, torch.profiler): 1 row
+  wall 21.8 ms with 24.3 ms of kernels (2.5 ms overlapped), 8 rows 59.0. Zig graphed: 1 row 22.4-24.5, 8 rows 61.0.
+  Zig eager breakdown, 1 row: dense 9.2, experts 10.1, comm 1.5, attention 1.4, head 1.4, router 1.1, norm 0.6, add 0.4;
+  8 rows: experts 42.7 vs Python 43.4, dense + head 11.4 vs 12.7. Kernels match; at 1 row Python overlaps ~2.5 ms
+  (its RoCE gather runs alongside compute) and Zig runs everything in order.
+- nsys records no CUDA trace for the Zig binaries (dynamically linked, driver by dlopen; Python traces fine): open.
+- Fixed: tf-mimo announces the stop before closing the TP session (no exit 70 when a rank ends first).
+
+**Next:** get a graphed per-kernel timeline of the Zig forward (fix nsys injection, or event nodes in the graph), find
+where Python overlaps at 1 row, mirror it (likely the RoCE gather's launch/stream arrangement in roce.py).
