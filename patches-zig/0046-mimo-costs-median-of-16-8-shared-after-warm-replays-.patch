@@ -1,0 +1,88 @@
+From f2f1d7910fec90f1c2e6d404b613ece087574acc Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 06:16:22 +1100
+Subject: [PATCH 46/46] mimo costs: median of 16 (8 shared) after warm replays;
+ draft median of 16 (a mean of 6 swung 24.6-27.7 ms a row between starts)
+
+---
+ zig/src/families/mimo_v2/native.zig | 37 +++++++++++++++++++----------
+ 1 file changed, 24 insertions(+), 13 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index 3b855613..3ab3d17e 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -259,7 +259,7 @@ pub const Lanes = struct {
+         const e = l.e;
+         const B: usize = if (e.dr) |dr| dr.block else 1;
+         var rows: [32]fwd.Row = undefined;
+-        const reps = 6;
++        const reps = 16; // windows; shared rows below take 8
+         var rng = std.Random.DefaultPrng.init(0x31A0);
+         const V = e.w.full.vocab;
+         for (1..B + 1) |w| {
+@@ -270,38 +270,49 @@ pub const Lanes = struct {
+         const S = e.model.slots;
+         for (2..33) |n| {
+             for (0..n) |j| rows[j] = .{ .slot = @intCast(j % S), .pos = @intCast(64 + j / S), .token = 0 };
+-            l.shared[l.nshared] = .{ .width = @intCast(n), .ms = try l.time(io, rows[0..n], reps, &rng, V) };
++            l.shared[l.nshared] = .{ .width = @intCast(n), .ms = try l.time(io, rows[0..n], 8, &rng, V) };
+             l.nshared += 1;
+         }
+         if (e.dr != null) {
+             var out: [16]i32 = undefined;
+-            try e.draft(&.{1000}, &.{64}, &.{0}, &out);
+-            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+-            for (0..reps) |i| try e.draft(&.{@intCast(1000 + 7919 * i)}, &.{64}, &.{0}, &out);
+-            l.draft_ms = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6 / reps;
++            for (0..3) |_| try e.draft(&.{1000}, &.{64}, &.{0}, &out);
++            var dms: [16]f64 = undefined;
++            for (&dms, 0..) |*m, i| {
++                const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++                try e.draft(&.{@intCast(1000 + 7919 * i)}, &.{64}, &.{0}, &out);
++                m.* = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6;
++            }
++            std.mem.sort(f64, &dms, {}, std.sort.asc(f64));
++            l.draft_ms = dms[8];
+         }
+         std.log.info("mimo costs (distinct tokens): window ms {d:.2} .. {d:.2} (1 .. {d} rows), shared 8 / 16 / 32 rows {d:.2} / {d:.2} / {d:.2}, draft {d:.2}", .{ l.costs[0].ms, l.costs[B - 1].ms, B, l.shared[6].ms, l.shared[14].ms, l.shared[l.nshared - 1].ms, l.draft_ms });
+     }
+ 
+-    /// Mean ms of `reps` graphed forwards of `rows` (positions and slots fixed), each with fresh pseudo-random tokens.
++    /// Median ms of `reps` graphed forwards of `rows` (positions and slots fixed), each with fresh pseudo-random
++    /// tokens, after two warm replays: a mean of 6 swung 24.6 .. 27.7 ms for one row between starts (22.7 timed in
++    /// isolation), and the depth rule reads the table's slope.
+     fn time(l: *Lanes, io: std.Io, rows: []fwd.Row, reps: usize, rng: *std.Random.DefaultPrng, V: usize) !f64 {
+         const fill = struct {
+             fn f(rs: []fwd.Row, r: *std.Random.DefaultPrng, v: usize) void {
+                 for (rs) |*x| x.token = @intCast(1000 + r.random().uintLessThan(usize, v - 2000));
+             }
+         }.f;
+-        fill(rows, rng, V);
+-        try l.e.forward(rows, .ids); // capture
++        for (0..3) |_| { // capture, then warm
++            fill(rows, rng, V);
++            try l.e.forward(rows, .ids);
++        }
+         try l.e.s.synchronize();
+-        var total: i96 = 0;
+-        for (0..reps) |_| {
++        var ms: [32]f64 = undefined;
++        const n = @min(reps, ms.len);
++        for (0..n) |i| {
+             fill(rows, rng, V);
+             const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+             try l.e.forward(rows, .ids);
+             try l.e.s.synchronize();
+-            total += std.Io.Clock.awake.now(io).toNanoseconds() - t0;
++            ms[i] = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6;
+         }
+-        return @as(f64, @floatFromInt(total)) / 1e6 / @as(f64, @floatFromInt(reps));
++        std.mem.sort(f64, ms[0..n], {}, std.sort.asc(f64));
++        return ms[n / 2];
+     }
+ 
+     fn take(l: *Lanes, token: u32) u64 {
+-- 
+2.53.0
+

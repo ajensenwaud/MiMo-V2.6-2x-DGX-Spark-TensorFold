@@ -1,0 +1,25 @@
+From 08c5474781ae54e5c733268cc16659cedf7abae0 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 05:57:53 +1100
+Subject: [PATCH 45/46] tf-mimo timing: TF_MIMO_TIMING_CONTEXT
+
+---
+ zig/src/families/mimo_v2/m1_main.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index d4913a47..fa9ef108 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !u8 {
+     }
+     const gpa = init.gpa;
+     const io = init.io;
+-    const context: usize = if (is_timing) 32768 else if (is_m1 and args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096; // timing: graphs-3.0.json's context
++    const context: usize = if (is_timing) (if (std.c.getenv("TF_MIMO_TIMING_CONTEXT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 32768) else if (is_m1 and args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096; // timing: graphs-3.0.json's context
+     const rows_max: usize = if (is_m1) 1 else 128;
+     const slots: usize = if (is_m1) 1 else 4;
+     const cfg = try tp.Config.fromEnv();
+-- 
+2.53.0
+

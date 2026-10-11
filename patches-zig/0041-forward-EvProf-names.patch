@@ -1,7 +1,7 @@
 From ac88a13a0dbf3371c4842566d8eb44ec19bf5a03 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 22:52:46 +1100
-Subject: [PATCH 41/43] forward: EvProf names
+Subject: [PATCH 41/46] forward: EvProf names
 
 ---
  zig/src/families/mimo_v2/forward.zig | 26 +++++++++++++-------------

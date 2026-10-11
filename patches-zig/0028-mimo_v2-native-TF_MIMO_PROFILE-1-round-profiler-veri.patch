@@ -1,7 +1,7 @@
 From df723542dc7fae3d3d9e87e4ff5771a7212133b5 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 20:01:00 +1100
-Subject: [PATCH 28/43] mimo_v2 native: TF_MIMO_PROFILE=1 round profiler
+Subject: [PATCH 28/46] mimo_v2 native: TF_MIMO_PROFILE=1 round profiler
  (verify / forward / draft / outside)
 
 ---

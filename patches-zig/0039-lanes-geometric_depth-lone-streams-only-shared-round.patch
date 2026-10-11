@@ -1,7 +1,7 @@
 From 8df841234f97fa7f88986f95d9b9ba18e8d291a8 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 22:27:17 +1100
-Subject: [PATCH 39/43] lanes geometric_depth: lone streams only (shared rounds
+Subject: [PATCH 39/46] lanes geometric_depth: lone streams only (shared rounds
  keep the per-depth rule), its own acceptance
 
 ---

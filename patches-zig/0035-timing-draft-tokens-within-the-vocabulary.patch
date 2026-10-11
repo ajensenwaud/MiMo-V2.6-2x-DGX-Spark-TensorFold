@@ -1,7 +1,7 @@
 From 5564675c4fefdd23b7c0f34d78368cc0364a712b Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 21:17:59 +1100
-Subject: [PATCH 35/43] timing: draft tokens within the vocabulary
+Subject: [PATCH 35/46] timing: draft tokens within the vocabulary
 
 ---
  zig/src/families/mimo_v2/m1_main.zig | 2 +-

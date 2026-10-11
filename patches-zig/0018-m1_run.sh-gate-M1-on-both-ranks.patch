@@ -1,7 +1,7 @@
 From 2d5c3cb47bea1a4d2f84b35c1faa7ecbefed221a Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 15:42:56 +1100
-Subject: [PATCH 18/43] m1_run.sh: gate M1 on both ranks
+Subject: [PATCH 18/46] m1_run.sh: gate M1 on both ranks
 
 ---
  zig/src/families/mimo_v2/m1_run.sh | 20 ++++++++++++++++++++
