@@ -1,7 +1,7 @@
 From 490f92152f7cddeb312db9187766cb3f1a4940db Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 13:34:31 +1100
-Subject: [PATCH 06/12] mimo_v2: sync.py generates the EXL3 kernel sources from
+Subject: [PATCH 06/14] mimo_v2: sync.py generates the EXL3 kernel sources from
  the Python engine's
 
 ---

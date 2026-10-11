@@ -1,0 +1,11 @@
+roce-host: PASS roce-host: 1000 gathers of 1 B to 256 KiB bit-exact over verbs EXIT rank 0 rc 0 at 1791689935.746139546 
+suite-roce: SUMMARY rank 0: 378 passed, 0 failed EXIT rank 0 rc 0 at 1791689941.415563941 
+suite-nccl: SUMMARY rank 0: 189 passed, 0 failed EXIT rank 0 rc 0 at 1791689946.093873148 
+ff-roce-fatal-0: INJECT fatal rank 0 at 1791689947.838176 EXIT rank 0 rc 70 at 1791689949.280841230 
+ff-roce-fatal-1: EXIT rank 0 rc 70 at 1791689952.590419586 
+ff-roce-kill-0: INJECT kill rank 0 at 1791689954.290351 EXIT rank 0 rc 137 at 1791689955.363749809 
+ff-roce-kill-1: EXIT rank 0 rc 70 at 1791689958.928876407 
+ff-nccl-fatal-0: INJECT fatal rank 0 at 1791689960.820774 EXIT rank 0 rc 70 at 1791689962.229728284 
+ff-nccl-fatal-1: EXIT rank 0 rc 70 at 1791689965.529113370 
+ff-nccl-kill-0: INJECT kill rank 0 at 1791689967.362224 EXIT rank 0 rc 137 at 1791689968.291743849 
+ff-nccl-kill-1: EXIT rank 0 rc 70 at 1791689971.963209290 

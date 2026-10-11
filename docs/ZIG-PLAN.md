@@ -152,5 +152,17 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
 - GPU check built, not yet run: `tf-cuda-test mimo-exl3 <shard> <prefix>`: dequant (stored) and unpack (strips)
   bit-equal to `core/exl3_format.zig`, linear M=1/4/8/16 against the fp64 reference.
 
-**Next GPU window (serve down ~1 h):** Z0B.2 two-node linktest; `mimo-exl3` on q_proj (K2 10), a dense gate (K2 8),
-an expert gate/down (K2 6); Z1 oracle capture. **Next (no GPU):** Z2.1 family skeleton (config, pack loader).
+### 2026-10-11 (session 1, GPU window ~35 min; serve stopped idle, restarted and answering)
+- **Z0B.3 passed.** `mimo-exl3` on the 3.0 pack: dequant (stored) and unpack (strips) bit-equal to
+  `core/exl3_format.zig` at K2 6 / 8 / 10 (expert gate and down, dense gate, q_proj); linear M=1/4/8/16 within
+  1.6-2.5e-4 relative L2 of fp64. `mimo-exl3-fixtures`: **67 of 67 cases byte-equal to the Python engine**: q, o,
+  dense gate/down at rank-0 TP cuts x fp16/bf16 inputs x fp16/bf16/f32 outputs x M 1/4/8/16, and routed experts
+  (layer 1, 256 experts, 8 slots, R 1/4/16). Answer key: `zig/tests/cuda/oracle/mimo_exl3_fixtures.py` run in the
+  release image (the serve's own extension build).
+- **Z0B.2 passed** between gx10 and gx11 over the CX7 link: roce-host 1000 gathers bit-exact; RoCE GPU suite 378/378;
+  NCCL suite 189/189; fail-fast 8/8 for each backend (survivor exits 70 within 1.1-3.6 s). Needs `-Dtp-nvcc` at build
+  time (else `NoKernel`).
+- Logs: `results/zig-z0b/`.
+
+**Next (no GPU):** Z1.1 capture script (per-layer residuals, router picks, logits, 256 greedy tokens at TP=2);
+Z1.3 Triton AOT fill for MiMo's 11 kernels; Z2.1 family skeleton. **Next GPU window:** Z1.1 capture + Z1.3.
