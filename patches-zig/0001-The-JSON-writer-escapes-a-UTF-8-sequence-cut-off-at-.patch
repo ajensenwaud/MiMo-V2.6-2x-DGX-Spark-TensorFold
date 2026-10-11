@@ -1,0 +1,46 @@
+From b1f5b6485fdf3a8eef1f9ea09ac81a5d7c08ed8c Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:24:31 +0700
+Subject: [PATCH 1/8] The JSON writer escapes a UTF-8 sequence cut off at a
+ string's end as U+FFFD instead of slicing past it.
+
+(cherry picked from commit 4284048d1aca2799e543a7400b3f07519befb515)
+---
+ zig/src/server/json_write.zig | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/server/json_write.zig b/zig/src/server/json_write.zig
+index 0e12ecd8..8cf6f46b 100644
+--- a/zig/src/server/json_write.zig
++++ b/zig/src/server/json_write.zig
+@@ -68,8 +68,10 @@ pub fn writeString(w: *Writer, s: []const u8, o: Options) Writer.Error!void {
+             try w.print("\\u{x:0>4}", .{c});
+             i += 1;
+         } else {
+-            const n = std.unicode.utf8ByteSequenceLength(c) catch 1;
+-            const code = decodeWtf8(s[i..@min(s.len, i + n)]);
++            // a sequence cut short at the string's end is U+FFFD and consumes only the bytes that are there
++            const full = std.unicode.utf8ByteSequenceLength(c) catch 1;
++            const n = @min(full, s.len - i);
++            const code = if (n < full) 0xfffd else decodeWtf8(s[i .. i + n]);
+             if (code >= 0x10000) {
+                 const v = code - 0x10000;
+                 try w.print("\\u{x:0>4}\\u{x:0>4}", .{ 0xd800 + (v >> 10), 0xdc00 + (v & 0x3ff) });
+@@ -168,3 +170,14 @@ test "dumps" {
+     try std.testing.expectEqualStrings("{\"a\": [1, 2.5, \"\\u00e9\\n\\ud83d\\ude00\\u007f\"], \"b\": {}, \"c\": 0}", try json.stringify(a, r.ok, .{}));
+     try std.testing.expectEqualStrings("{\"a\":[1,2.5,\"\xc3\xa9\\n\xf0\x9f\x98\x80\x7f\"],\"b\":{},\"c\":0}", try json.stringify(a, r.ok, .{ .ascii = false, .compact = true }));
+ }
++
++test "a UTF-8 sequence cut short at the string's end is U+FFFD, not a slice past it" {
++    var buf: [64]u8 = undefined;
++    for ([_]struct { []const u8, []const u8 }{
++        .{ "ab\xE2", "\"ab\\ufffd\"" }, .{ "ab\xE2\x82", "\"ab\\ufffd\"" }, .{ "\xF0\x9F\x98", "\"\\ufffd\"" }, .{ "x\xE2\x82\xAC", "\"x\\u20ac\"" },
++    }) |c| {
++        var w: Writer = .fixed(&buf);
++        try writeString(&w, c[0], .{});
++        try std.testing.expectEqualStrings(c[1], w.buffered());
++    }
++}
+-- 
+2.53.0
+

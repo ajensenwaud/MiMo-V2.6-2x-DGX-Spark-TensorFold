@@ -1,0 +1,884 @@
+From 884b2bb6dea723a5c87619ee340f2c77f7b2bb2c Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:28:21 +0700
+Subject: [PATCH 2/8] CUDA keyed graph cache and device arena, both off until a
+ family installs them.
+
+graph_cache.Cache captures one executable graph per caller-named key and replays it when the key comes back; ranks agree on every capture, eviction and fallback through an Agree hook, and a memory floor turns misses eager.
+arena.Arena sub-allocates DeviceBuffer.alloc from a few large chunks (VMM or plain cuMemAlloc) through memory.setHook; borrowed spans and pointers it does not own are freed as before.
+
+(cherry picked from commit 986c996041e25e8b4a0341a8b54524a9d2248c12)
+---
+ zig/src/cuda/abi.zig         |   2 +
+ zig/src/cuda/arena.zig       | 331 +++++++++++++++++++++++++++++
+ zig/src/cuda/graph_cache.zig | 392 +++++++++++++++++++++++++++++++++++
+ zig/src/cuda/memory.zig      |  52 ++++-
+ zig/src/cuda/root.zig        |   5 +
+ 5 files changed, 779 insertions(+), 3 deletions(-)
+ create mode 100644 zig/src/cuda/arena.zig
+ create mode 100644 zig/src/cuda/graph_cache.zig
+
+diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig
+index a608fd61..95c9291d 100644
+--- a/zig/src/cuda/abi.zig
++++ b/zig/src/cuda/abi.zig
+@@ -39,6 +39,8 @@ pub const DeviceAttribute = enum(c_int) {
+     compute_capability_minor = 76,
+     max_shared_memory_per_multiprocessor = 81,
+     max_shared_memory_per_block_optin = 97,
++    virtual_memory_management_supported = 102,
++    gpu_direct_rdma_with_cuda_vmm_supported = 126,
+ };
+ 
+ pub const FunctionAttribute = enum(c_int) {
+diff --git a/zig/src/cuda/arena.zig b/zig/src/cuda/arena.zig
+new file mode 100644
+index 00000000..2c80b758
+--- /dev/null
++++ b/zig/src/cuda/arena.zig
+@@ -0,0 +1,331 @@
++//! A device sub-allocator under DeviceBuffer.alloc: buffers carved from a few large chunks, not one cuMemAlloc each.
++
++const std = @import("std");
++const abi = @import("abi.zig");
++const Driver = @import("driver.zig").Driver;
++const memory = @import("memory.zig");
++
++pub const Error = error{ DriverUnavailable, MissingSymbol, Unsupported, CudaFailed, OutOfMemory };
++
++/// Where chunks come from: `chunk` maps `len` bytes (a multiple of `granularity`), `release` gives a chunk back.
++pub const Backend = struct {
++    ctx: *anyopaque,
++    granularity: usize,
++    chunk: *const fn (ctx: *anyopaque, len: usize) ?u64,
++    release: *const fn (ctx: *anyopaque, base: u64, len: usize) void,
++    name: []const u8,
++};
++
++pub const Options = struct {
++    small_max: usize = 4 << 20, // requests up to this many bytes share chunks
++    small_chunk: usize = 64 << 20, // a shared chunk's bytes, rounded up to the granularity
++    alignment: usize = 512, // every range starts at a multiple of this
++};
++
++pub const Stats = struct { small: u64 = 0, large: u64 = 0, reused: u64 = 0, fallback: u64 = 0, chunk_bytes: u64 = 0 };
++
++/// Small requests bump 512-byte aligned through shared chunks and are reused by size; large ones get their own chunk.
++pub const Arena = struct {
++    gpa: std.mem.Allocator,
++    be: Backend,
++    o: Options,
++    mutex: std.atomic.Mutex = .unlocked,
++    small: std.ArrayList([2]u64) = .empty, // shared chunks (base, len)
++    cursor: u64 = 0, // the current shared chunk's next free byte
++    limit: u64 = 0,
++    free_small: std.AutoHashMapUnmanaged(u64, std.ArrayList(u64)) = .empty, // freed small ranges by rounded size
++    live: std.AutoHashMapUnmanaged(u64, u64) = .empty, // live small ranges: address to rounded size
++    large: std.AutoHashMapUnmanaged(u64, u64) = .empty, // large chunks: address to mapped size
++    stats: Stats = .{},
++
++    pub fn init(gpa: std.mem.Allocator, be: Backend, o: Options) Arena {
++        return .{ .gpa = gpa, .be = be, .o = o };
++    }
++
++    pub fn deinit(a: *Arena) void {
++        var it = a.large.iterator();
++        while (it.next()) |e| a.be.release(a.be.ctx, e.key_ptr.*, e.value_ptr.*);
++        for (a.small.items) |c| a.be.release(a.be.ctx, c[0], c[1]);
++        var f = a.free_small.valueIterator();
++        while (f.next()) |l| l.deinit(a.gpa);
++        a.free_small.deinit(a.gpa);
++        a.live.deinit(a.gpa);
++        a.large.deinit(a.gpa);
++        a.small.deinit(a.gpa);
++        a.* = undefined;
++    }
++
++    fn lock(a: *Arena) void {
++        while (!a.mutex.tryLock()) std.Thread.yield() catch {};
++    }
++
++    fn roundUp(x: usize, m: usize) usize {
++        return std.mem.alignForward(usize, x, m);
++    }
++
++    /// An address for `len` bytes, or null (the caller then allocates as before).
++    pub fn alloc(a: *Arena, len: usize) ?u64 {
++        if (len == 0) return null;
++        a.lock();
++        defer a.mutex.unlock();
++        return a.allocLocked(len) catch null;
++    }
++
++    fn allocLocked(a: *Arena, len: usize) !?u64 {
++        if (len > a.o.small_max) {
++            const n = roundUp(len, a.be.granularity);
++            const p = a.be.chunk(a.be.ctx, n) orelse {
++                a.stats.fallback += 1;
++                return null;
++            };
++            errdefer a.be.release(a.be.ctx, p, n);
++            try a.large.put(a.gpa, p, n);
++            a.stats.large += 1;
++            a.stats.chunk_bytes += n;
++            return p;
++        }
++        const n: u64 = roundUp(len, a.o.alignment);
++        if (a.free_small.getPtr(n)) |l| if (l.pop()) |p| {
++            try a.live.put(a.gpa, p, n);
++            a.stats.reused += 1;
++            return p;
++        };
++        if (a.limit - a.cursor < n) {
++            const cl = roundUp(@max(a.o.small_chunk, n), a.be.granularity);
++            const base = a.be.chunk(a.be.ctx, cl) orelse {
++                a.stats.fallback += 1;
++                return null;
++            };
++            errdefer a.be.release(a.be.ctx, base, cl);
++            try a.small.append(a.gpa, .{ base, cl });
++            a.cursor = base;
++            a.limit = base + cl;
++            a.stats.chunk_bytes += cl;
++        }
++        const p = a.cursor;
++        try a.live.put(a.gpa, p, n);
++        a.cursor += n;
++        a.stats.small += 1;
++        return p;
++    }
++
++    /// True when `p` was the arena's (and is now free); false: not ours, the caller frees it as before.
++    pub fn free(a: *Arena, p: u64) bool {
++        a.lock();
++        defer a.mutex.unlock();
++        if (a.large.fetchRemove(p)) |e| {
++            a.be.release(a.be.ctx, p, e.value);
++            return true;
++        }
++        const e = a.live.fetchRemove(p) orelse return false;
++        const g = a.free_small.getOrPut(a.gpa, e.value) catch return true; // leaked range, still ours
++        if (!g.found_existing) g.value_ptr.* = .empty;
++        g.value_ptr.append(a.gpa, p) catch {};
++        return true;
++    }
++
++    // -- memory.zig's hook ----------------------------------------------------------------------------------------
++
++    fn hookAlloc(ctx: *anyopaque, len: usize) ?u64 {
++        const a: *Arena = @ptrCast(@alignCast(ctx));
++        return a.alloc(len);
++    }
++
++    fn hookFree(ctx: *anyopaque, p: u64) bool {
++        const a: *Arena = @ptrCast(@alignCast(ctx));
++        return a.free(p);
++    }
++
++    /// Every later DeviceBuffer.alloc comes from the arena, which must outlive its buffers; only addresses change.
++    pub fn install(a: *Arena) void {
++        memory.setHook(.{ .ctx = a, .alloc = hookAlloc, .free = hookFree });
++    }
++};
++
++// -- backends ---------------------------------------------------------------------------------------------------------
++
++/// One cuMemAlloc a chunk (the driver's own 2 MiB-aligned allocations).
++pub const Plain = struct {
++    d: *const Driver,
++
++    pub fn backend(p: *Plain) Backend {
++        return .{ .ctx = p, .granularity = 2 << 20, .chunk = chunk, .release = release, .name = "plain" };
++    }
++
++    fn chunk(ctx: *anyopaque, len: usize) ?u64 {
++        const p: *Plain = @ptrCast(@alignCast(ctx));
++        var q: abi.DevicePtr = 0;
++        if (p.d.api.cuMemAlloc_v2(&q, len) != abi.success) return null;
++        return q;
++    }
++
++    fn release(ctx: *anyopaque, base: u64, _: usize) void {
++        const p: *Plain = @ptrCast(@alignCast(ctx));
++        _ = p.d.api.cuMemFree_v2(base);
++    }
++};
++
++/// CUDA's virtual memory management: one reserved virtual range, chunks of the recommended granularity mapped in order.
++pub const Vmm = struct {
++    lib: std.DynLib,
++    device: abi.Device,
++    prop: Prop,
++    granularity: usize,
++    va: u64 = 0,
++    va_len: usize = 0,
++    next: u64 = 0,
++    api: Api,
++
++    const Api = struct {
++        reserve: *const fn (*u64, usize, usize, u64, c_ulonglong) callconv(.c) abi.Result,
++        addressFree: *const fn (u64, usize) callconv(.c) abi.Result,
++        create: *const fn (*u64, usize, *const Prop, c_ulonglong) callconv(.c) abi.Result,
++        release: *const fn (u64) callconv(.c) abi.Result,
++        map: *const fn (u64, usize, usize, u64, c_ulonglong) callconv(.c) abi.Result,
++        unmap: *const fn (u64, usize) callconv(.c) abi.Result,
++        setAccess: *const fn (u64, usize, *const AccessDesc, usize) callconv(.c) abi.Result,
++        granularity: *const fn (*usize, *const Prop, c_int) callconv(.c) abi.Result,
++    };
++
++    pub const Prop = extern struct { // CUmemAllocationProp
++        type: c_int = 1, // CU_MEM_ALLOCATION_TYPE_PINNED
++        handle_types: c_int = 0,
++        loc_type: c_int = 1, // CU_MEM_LOCATION_TYPE_DEVICE
++        loc_id: c_int = 0,
++        win32: ?*anyopaque = null,
++        compression: u8 = 0,
++        rdma: u8 = 0,
++        usage: u16 = 0,
++        reserved: [4]u8 = .{ 0, 0, 0, 0 },
++    };
++    const AccessDesc = extern struct { loc_type: c_int = 1, loc_id: c_int, flags: c_int = 3 }; // CUmemAccessDesc, read-write
++
++    comptime {
++        std.debug.assert(@sizeOf(Prop) == 32 and @offsetOf(Prop, "compression") == 24 and @sizeOf(AccessDesc) == 12);
++    }
++
++    /// `va_bytes` of virtual addresses reserved (cheap: no memory behind them until a chunk maps).
++    pub fn open(d: *const Driver, device: abi.Device, va_bytes: usize) Error!Vmm {
++        var vmm_ok: c_int = 0;
++        if (d.api.cuDeviceGetAttribute(&vmm_ok, .virtual_memory_management_supported, device) != abi.success or vmm_ok == 0) return error.Unsupported; // VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
++        var lib = std.DynLib.open("libcuda.so.1") catch return error.DriverUnavailable;
++        errdefer lib.close();
++        var api: Api = undefined;
++        const names = .{ .{ "reserve", "cuMemAddressReserve" }, .{ "addressFree", "cuMemAddressFree" }, .{ "create", "cuMemCreate" }, .{ "release", "cuMemRelease" }, .{ "map", "cuMemMap" }, .{ "unmap", "cuMemUnmap" }, .{ "setAccess", "cuMemSetAccess" }, .{ "granularity", "cuMemGetAllocationGranularity" } };
++        inline for (names) |n| @field(api, n[0]) = lib.lookup(@FieldType(Api, n[0]), n[1]) orelse return error.MissingSymbol;
++        var prop: Prop = .{ .loc_id = device };
++        var rdma: c_int = 0; // GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED: keep the memory registrable as cuMemAlloc's is
++        if (d.api.cuDeviceGetAttribute(&rdma, .gpu_direct_rdma_with_cuda_vmm_supported, device) == abi.success and rdma != 0) prop.rdma = 1;
++        var g: usize = 0;
++        if (api.granularity(&g, &prop, 1) != abi.success or g == 0) return error.Unsupported; // RECOMMENDED
++        g = @max(g, 2 << 20);
++        const len = std.mem.alignForward(usize, va_bytes, g);
++        var va: u64 = 0;
++        if (api.reserve(&va, len, g, 0, 0) != abi.success) return error.CudaFailed;
++        return .{ .lib = lib, .device = device, .prop = prop, .granularity = g, .va = va, .va_len = len, .next = va, .api = api };
++    }
++
++    pub fn close(v: *Vmm) void {
++        _ = v.api.addressFree(v.va, v.va_len);
++        v.lib.close();
++    }
++
++    pub fn backend(v: *Vmm) Backend {
++        return .{ .ctx = v, .granularity = v.granularity, .chunk = chunk, .release = release, .name = "vmm" };
++    }
++
++    fn chunk(ctx: *anyopaque, len: usize) ?u64 {
++        const v: *Vmm = @ptrCast(@alignCast(ctx));
++        if (v.va + v.va_len - v.next < len) return null;
++        var h: u64 = 0;
++        if (v.api.create(&h, len, &v.prop, 0) != abi.success) return null;
++        defer _ = v.api.release(h); // the mapping holds the memory until it is unmapped
++        const at = v.next;
++        if (v.api.map(at, len, 0, h, 0) != abi.success) return null;
++        const desc: AccessDesc = .{ .loc_id = v.device };
++        if (v.api.setAccess(at, len, &desc, 1) != abi.success) {
++            _ = v.api.unmap(at, len);
++            return null;
++        }
++        v.next += len;
++        return at;
++    }
++
++    fn release(ctx: *anyopaque, base: u64, len: usize) void {
++        const v: *Vmm = @ptrCast(@alignCast(ctx));
++        _ = v.api.unmap(base, len); // the virtual range is not reused: the reservation is sized for the process
++    }
++};
++
++// -- tests (a fake backend: addresses only) ---------------------------------------------------------------------------
++
++const Fake = struct {
++    next: u64 = 1 << 40,
++    chunks: u32 = 0,
++    released: u32 = 0,
++    fail: bool = false,
++
++    fn backend(f: *Fake, g: usize) Backend {
++        return .{ .ctx = f, .granularity = g, .chunk = chunk, .release = release, .name = "fake" };
++    }
++    fn chunk(ctx: *anyopaque, len: usize) ?u64 {
++        const f: *Fake = @ptrCast(@alignCast(ctx));
++        if (f.fail) return null;
++        const p = f.next;
++        f.next += len;
++        f.chunks += 1;
++        return p;
++    }
++    fn release(ctx: *anyopaque, _: u64, _: usize) void {
++        const f: *Fake = @ptrCast(@alignCast(ctx));
++        f.released += 1;
++    }
++};
++
++test "arena: small requests pack 512-aligned into shared chunks, are reused by size, large ones get their own" {
++    const t = std.testing;
++    var f: Fake = .{};
++    var a = Arena.init(t.allocator, f.backend(2 << 20), .{ .small_max = 1 << 20, .small_chunk = 4 << 20 });
++    defer a.deinit();
++    const p1 = a.alloc(20480).?; // a norm weight
++    const p2 = a.alloc(983040).?; // an mHC fn16
++    const p3 = a.alloc(100).?;
++    try t.expectEqual(p1 + 20480, p2);
++    try t.expectEqual(p2 + 983040, p3);
++    for ([_]u64{ p1, p2, p3 }) |p| try t.expectEqual(@as(u64, 0), p % 512);
++    try t.expectEqual(@as(u32, 1), f.chunks);
++    // a freed range comes back for the same rounded size
++    try t.expect(a.free(p3));
++    try t.expectEqual(p3, a.alloc(17).?);
++    try t.expectEqual(@as(u64, 1), a.stats.reused);
++    // three more 1 MiB ranges fit the 4 MiB chunk, the fourth opens a new shared chunk
++    for (0..3) |_| _ = a.alloc(1 << 20).?;
++    try t.expectEqual(@as(u32, 1), f.chunks);
++    _ = a.alloc(1 << 20).?;
++    try t.expectEqual(@as(u32, 2), f.chunks);
++    // large: its own chunk, rounded to the granularity, released when freed
++    const big = a.alloc(5 << 20).?;
++    try t.expectEqual(@as(u32, 3), f.chunks);
++    try t.expectEqual(@as(u64, 6 << 20), a.large.get(big).?);
++    try t.expect(a.free(big));
++    try t.expectEqual(@as(u32, 1), f.released);
++    // not ours
++    try t.expect(!a.free(12345));
++    // a backend that cannot map: null, the caller allocates as before
++    f.fail = true;
++    try t.expectEqual(@as(?u64, null), a.alloc(64 << 20));
++    try t.expectEqual(@as(u64, 1), a.stats.fallback);
++}
++
++test "arena: under DeviceBuffer.alloc through memory.setHook" {
++    const t = std.testing;
++    var f: Fake = .{};
++    var a = Arena.init(t.allocator, f.backend(2 << 20), .{});
++    defer a.deinit();
++    a.install();
++    defer memory.setHook(null);
++    const h = memory.currentHook().?;
++    const p = h.alloc(h.ctx, 4096).?;
++    try t.expect(h.free(h.ctx, p));
++    try t.expect(!h.free(h.ctx, 7));
++}
+diff --git a/zig/src/cuda/graph_cache.zig b/zig/src/cuda/graph_cache.zig
+new file mode 100644
+index 00000000..a2fb8e18
+--- /dev/null
++++ b/zig/src/cuda/graph_cache.zig
+@@ -0,0 +1,392 @@
++//! Keyed CUDA graphs for any family: one captured executable per key, launched again when the key comes back.
++
++const std = @import("std");
++const graph = @import("graph.zig");
++const Driver = @import("driver.zig").Driver;
++const Stream = @import("stream.zig").Stream;
++const quiet = @import("builtin").is_test; // a test's stderr is the build runner's channel
++
++/// One step's launches on `stream`; it must not synchronize, allocate device memory or read the device on the host.
++pub const Body = struct {
++    ctx: *anyopaque,
++    run: *const fn (ctx: *anyopaque, stream: Stream) anyerror!void,
++};
++
++/// Every rank's verdict AND-ed, so ranks capture, evict and fall back at the same steps; never called in a capture.
++pub const Agree = struct {
++    ctx: *anyopaque,
++    all: *const fn (ctx: *anyopaque, ok: bool) anyerror!bool,
++};
++
++/// Capture a body into an executable graph, launch it, free it: a fake engine runs the policy in host tests.
++pub const Engine = struct {
++    ctx: *anyopaque,
++    capture: *const fn (ctx: *anyopaque, stream: Stream, body: Body) anyerror!*anyopaque,
++    launch: *const fn (ctx: *anyopaque, exec: *anyopaque, stream: Stream) anyerror!void,
++    free: *const fn (ctx: *anyopaque, exec: *anyopaque) void,
++};
++
++pub const Settings = struct {
++    on: bool = true, // off: every step runs eagerly
++    max: u32 = 48, // graphs held at most
++    min_keep: u32 = 8, // under the memory floor the cache evicts down to this many, then stops capturing
++    hold: bool = false, // under the floor a miss runs eagerly with no eviction: held graphs cost next to no memory
++};
++
++pub const Outcome = enum { replayed, captured, eager };
++
++pub fn Cache(comptime Key: type) type {
++    return struct {
++        const Self = @This();
++        const Entry = struct { exec: *anyopaque, used: u64 };
++
++        gpa: std.mem.Allocator,
++        engine: Engine,
++        settings: Settings,
++        agree: ?Agree = null,
++        room: ?*const fn () bool = null, // false when this rank is below its memory floor; null: always room
++        entries: std.AutoArrayHashMapUnmanaged(Key, Entry) = .empty,
++        cap: u32,
++        tick: u64 = 0,
++        fingerprint: ?u64 = null,
++        failed: bool = false, // a capture failed on some rank: eager from here on
++        stats: struct { replayed: u64 = 0, captured: u64 = 0, eager: u64 = 0, evicted: u64 = 0, dropped: u64 = 0, floor_hits: u64 = 0 } = .{},
++
++        pub fn init(gpa: std.mem.Allocator, engine: Engine, settings: Settings) Self {
++            return .{ .gpa = gpa, .engine = engine, .settings = settings, .cap = settings.max };
++        }
++
++        pub fn deinit(c: *Self) void {
++            c.dropAll();
++            c.entries.deinit(c.gpa);
++        }
++
++        pub fn count(c: *const Self) usize {
++            return c.entries.count();
++        }
++
++        pub fn has(c: *const Self, key: Key) bool {
++            return c.entries.contains(key);
++        }
++
++        /// Every graph freed (a fingerprint change, a shutdown).
++        pub fn dropAll(c: *Self) void {
++            for (c.entries.values()) |e| c.engine.free(c.engine.ctx, e.exec);
++            c.stats.dropped += c.entries.count();
++            c.entries.clearRetainingCapacity();
++        }
++
++        fn agreed(c: *Self, ok: bool) !bool {
++            const a = c.agree orelse return ok;
++            return a.all(a.ctx, ok);
++        }
++
++        fn evictOldest(c: *Self) void {
++            var at: ?usize = null;
++            for (c.entries.values(), 0..) |e, i| {
++                if (at == null or e.used < c.entries.values()[at.?].used) at = i;
++            }
++            const i = at orelse return;
++            c.engine.free(c.engine.ctx, c.entries.values()[i].exec);
++            c.entries.swapRemoveAt(i);
++            c.stats.evicted += 1;
++        }
++
++        fn eager(c: *Self, stream: Stream, body: Body) !Outcome {
++            try body.run(body.ctx, stream);
++            c.stats.eager += 1;
++            return .eager;
++        }
++
++        /// One step: the key's graph launched, captured first on a miss; a new `fingerprint` drops every graph first.
++        pub fn run(c: *Self, key: Key, stream: Stream, fingerprint: u64, body: Body) !Outcome {
++            if (!c.settings.on or c.failed) return c.eager(stream, body);
++            if (c.fingerprint != null and c.fingerprint.? != fingerprint) c.dropAll();
++            c.fingerprint = fingerprint;
++            c.tick += 1;
++            if (c.entries.getPtr(key)) |e| {
++                e.used = c.tick;
++                try c.engine.launch(c.engine.ctx, e.exec, stream);
++                c.stats.replayed += 1;
++                return .replayed;
++            }
++            // a miss: room on every rank, else shed the least recent quarter and lower the cap (once below it, eager)
++            const room_here = if (c.room) |f| f() else true;
++            if (!try c.agreed(room_here and c.cap > 0)) {
++                if (c.settings.hold) {
++                    if (!quiet and c.stats.floor_hits == 0) std.log.warn("graph cache: under the memory floor on {s} rank: this key eager, {d} graphs held (hold)", .{ if (room_here) "another" else "this", c.entries.count() });
++                    c.stats.floor_hits += 1;
++                    return c.eager(stream, body);
++                }
++                if (c.entries.count() > c.settings.min_keep) {
++                    const drop = @max(1, c.entries.count() / 4);
++                    for (0..drop) |_| if (c.entries.count() > c.settings.min_keep) c.evictOldest();
++                }
++                const was = c.cap;
++                c.cap = @intCast(@max(c.entries.count(), c.settings.min_keep));
++                c.stats.floor_hits += 1;
++                if (!quiet and c.cap != was) std.log.warn("graph cache: under the memory floor on {s} rank: cap {d} -> {d} ({d} held, {d} evicted, {d} eager so far)", .{ if (room_here) "another" else "this", was, c.cap, c.entries.count(), c.stats.evicted, c.stats.eager + 1 });
++                return c.eager(stream, body);
++            }
++            if (c.cap < c.settings.max) {
++                if (!quiet) std.log.info("graph cache: room again on every rank: cap {d} -> {d}", .{ c.cap, c.settings.max });
++                c.cap = c.settings.max;
++            }
++            while (c.entries.count() >= c.cap) c.evictOldest();
++            const exec = c.engine.capture(c.engine.ctx, stream, body) catch |err| blk: {
++                // the only trace of why graphs went off (the step then runs eagerly, which may fail the same way)
++                if (!quiet) std.log.warn("graph capture failed: {s} (key {any}, {d} graphs held)", .{ @errorName(err), key, c.entries.count() });
++                break :blk null;
++            };
++            if (!try c.agreed(exec != null)) {
++                if (exec) |x| c.engine.free(c.engine.ctx, x);
++                c.failed = true;
++                c.dropAll();
++                return c.eager(stream, body);
++            }
++            try c.entries.put(c.gpa, key, .{ .exec = exec.?, .used = c.tick });
++            try c.engine.launch(c.engine.ctx, exec.?, stream);
++            c.stats.captured += 1;
++            return .captured;
++        }
++    };
++}
++
++/// The driver's engine: thread-local stream capture (other threads' CUDA calls stay out), instantiate, upload, launch.
++pub const CudaEngine = struct {
++    d: *const Driver,
++
++    pub fn engine(e: *CudaEngine) Engine {
++        return .{ .ctx = e, .capture = capture, .launch = launch, .free = free };
++    }
++
++    const Held = struct { exec: graph.Exec };
++
++    fn capture(ctx: *anyopaque, stream: Stream, body: Body) anyerror!*anyopaque {
++        const e: *CudaEngine = @ptrCast(@alignCast(ctx));
++        try graph.beginCapture(stream, .thread_local);
++        body.run(body.ctx, stream) catch |err| {
++            // end the capture so the stream is usable again; the partial graph is dropped
++            if (graph.endCapture(stream)) |g| {
++                var gg = g;
++                gg.deinit();
++            } else |_| {}
++            return err;
++        };
++        var g = try graph.endCapture(stream);
++        defer g.deinit();
++        const h = try std.heap.c_allocator.create(Held);
++        errdefer std.heap.c_allocator.destroy(h);
++        h.exec = try g.instantiate();
++        errdefer h.exec.deinit();
++        try h.exec.upload(stream);
++        _ = e;
++        return h;
++    }
++
++    fn launch(_: *anyopaque, exec: *anyopaque, stream: Stream) anyerror!void {
++        const h: *Held = @ptrCast(@alignCast(exec));
++        try h.exec.launchOn(stream);
++    }
++
++    fn free(_: *anyopaque, exec: *anyopaque) void {
++        const h: *Held = @ptrCast(@alignCast(exec));
++        h.exec.deinit();
++        std.heap.c_allocator.destroy(h);
++    }
++};
++
++/// FNV-1a over the addresses a body captures (buffer bases, sizes): the fingerprint `run` compares.
++pub fn fingerprintOf(words: []const u64) u64 {
++    var h: u64 = 0xcbf29ce484222325;
++    for (words) |w| {
++        var x = w;
++        for (0..8) |_| {
++            h = (h ^ (x & 0xff)) *% 0x100000001b3;
++            x >>= 8;
++        }
++    }
++    return h;
++}
++
++// -- host tests: the policy with a fake engine --------------------------------------------------------------------
++
++const Fake = struct {
++    captures: u32 = 0,
++    launches: u32 = 0,
++    live: u32 = 0,
++    fail_capture: bool = false,
++    slots: [64]u8 = undefined,
++
++    fn engine(f: *Fake) Engine {
++        return .{ .ctx = f, .capture = cap, .launch = lau, .free = fre };
++    }
++    fn cap(ctx: *anyopaque, stream: Stream, body: Body) anyerror!*anyopaque {
++        const f: *Fake = @ptrCast(@alignCast(ctx));
++        if (f.fail_capture) return error.CaptureFailed;
++        _ = stream;
++        _ = body; // a capture records the body; nothing runs
++        f.captures += 1;
++        f.live += 1;
++        return &f.slots[f.captures % f.slots.len];
++    }
++    fn lau(ctx: *anyopaque, _: *anyopaque, _: Stream) anyerror!void {
++        const f: *Fake = @ptrCast(@alignCast(ctx));
++        f.launches += 1;
++    }
++    fn fre(ctx: *anyopaque, _: *anyopaque) void {
++        const f: *Fake = @ptrCast(@alignCast(ctx));
++        f.live -= 1;
++    }
++};
++
++const Ran = struct {
++    n: u32 = 0,
++    fn body(r: *Ran) Body {
++        return .{ .ctx = r, .run = go };
++    }
++    fn go(ctx: *anyopaque, _: Stream) anyerror!void {
++        const r: *Ran = @ptrCast(@alignCast(ctx));
++        r.n += 1;
++    }
++};
++
++const no_stream: Stream = .{ .d = undefined, .handle = null };
++
++test "graph cache: capture on first use, replay after, LRU at the cap" {
++    var f: Fake = .{};
++    var r: Ran = .{};
++    var c = Cache(u32).init(std.testing.allocator, f.engine(), .{ .max = 2 });
++    defer c.deinit();
++    try std.testing.expectEqual(Outcome.captured, try c.run(1, no_stream, 7, r.body()));
++    try std.testing.expectEqual(Outcome.replayed, try c.run(1, no_stream, 7, r.body()));
++    try std.testing.expectEqual(Outcome.captured, try c.run(2, no_stream, 7, r.body()));
++    _ = try c.run(1, no_stream, 7, r.body()); // 1 is now the most recent
++    try std.testing.expectEqual(Outcome.captured, try c.run(3, no_stream, 7, r.body())); // evicts 2
++    try std.testing.expect(c.has(1) and c.has(3) and !c.has(2));
++    try std.testing.expectEqual(@as(u32, 0), r.n); // the body never ran eagerly
++    try std.testing.expectEqual(@as(u32, 2), f.live);
++    try std.testing.expectEqual(@as(u32, 5), f.launches);
++}
++
++test "graph cache: a new fingerprint drops every graph" {
++    var f: Fake = .{};
++    var r: Ran = .{};
++    var c = Cache(u32).init(std.testing.allocator, f.engine(), .{});
++    defer c.deinit();
++    _ = try c.run(1, no_stream, 7, r.body());
++    _ = try c.run(2, no_stream, 7, r.body());
++    try std.testing.expectEqual(Outcome.captured, try c.run(1, no_stream, 8, r.body()));
++    try std.testing.expectEqual(@as(usize, 1), c.count());
++    try std.testing.expectEqual(@as(u32, 1), f.live);
++}
++
++const Peer = struct {
++    theirs: []const bool, // the other rank's verdicts, in call order
++    at: usize = 0,
++    fn agree(p: *Peer) Agree {
++        return .{ .ctx = p, .all = all };
++    }
++    fn all(ctx: *anyopaque, ok: bool) anyerror!bool {
++        const p: *Peer = @ptrCast(@alignCast(ctx));
++        const t = p.theirs[p.at];
++        p.at += 1;
++        return ok and t;
++    }
++};
++
++test "graph cache: a capture failing on another rank turns graphs off here too" {
++    var f: Fake = .{};
++    var r: Ran = .{};
++    // per miss: room, then the capture's verdict; the peer's capture fails on the second key
++    var peer: Peer = .{ .theirs = &.{ true, true, true, false } };
++    var c = Cache(u32).init(std.testing.allocator, f.engine(), .{});
++    c.agree = peer.agree();
++    defer c.deinit();
++    try std.testing.expectEqual(Outcome.captured, try c.run(1, no_stream, 7, r.body()));
++    try std.testing.expectEqual(Outcome.eager, try c.run(2, no_stream, 7, r.body()));
++    try std.testing.expect(c.failed);
++    try std.testing.expectEqual(@as(u32, 0), f.live); // this rank's good graphs are freed as well
++    try std.testing.expectEqual(Outcome.eager, try c.run(1, no_stream, 7, r.body()));
++    try std.testing.expectEqual(@as(u32, 2), r.n);
++}
++
++var room_flag = true;
++fn roomFn() bool {
++    return room_flag;
++}
++
++test "graph cache: below the memory floor the least recent quarter goes, the cap follows, the step runs eagerly" {
++    var f: Fake = .{};
++    var r: Ran = .{};
++    var c = Cache(u32).init(std.testing.allocator, f.engine(), .{ .max = 48, .min_keep = 2 });
++    c.room = roomFn;
++    defer c.deinit();
++    room_flag = true;
++    for (0..8) |k| _ = try c.run(@intCast(k), no_stream, 7, r.body());
++    room_flag = false;
++    try std.testing.expectEqual(Outcome.eager, try c.run(100, no_stream, 7, r.body()));
++    try std.testing.expectEqual(@as(usize, 6), c.count());
++    try std.testing.expectEqual(@as(u32, 6), c.cap);
++    try std.testing.expect(!c.has(0) and !c.has(1) and c.has(7));
++    room_flag = true;
++    // room again: the cap is back to max, the miss captures without evicting
++    try std.testing.expectEqual(Outcome.captured, try c.run(100, no_stream, 7, r.body()));
++    try std.testing.expectEqual(@as(usize, 7), c.count());
++    try std.testing.expectEqual(@as(u32, 48), c.cap);
++    try std.testing.expect(c.has(7) and c.has(2));
++    try std.testing.expectEqual(@as(u64, 1), c.stats.floor_hits);
++}
++
++test "graph cache: a dip under the floor does not leave later keys churning once memory is back" {
++    var f: Fake = .{};
++    var r: Ran = .{};
++    var c = Cache(u32).init(std.testing.allocator, f.engine(), .{ .max = 16, .min_keep = 2 });
++    c.room = roomFn;
++    defer c.deinit();
++    room_flag = true;
++    for (0..12) |k| _ = try c.run(@intCast(k), no_stream, 7, r.body());
++    room_flag = false; // a long prompt's workspace held
++    _ = try c.run(200, no_stream, 7, r.body());
++    room_flag = true; // freed: the decode after it meets 12 new keys (a new context bucket), then replays them
++    const before = c.stats.evicted;
++    for (0..12) |k| _ = try c.run(@intCast(300 + k), no_stream, 7, r.body());
++    for (0..12) |k| try std.testing.expectEqual(Outcome.replayed, try c.run(@intCast(300 + k), no_stream, 7, r.body()));
++    try std.testing.expectEqual(@as(u32, 16), c.cap);
++    // only what the cap of 16 forces: 9 left after the dip + 12 new = 21 -> 5 evictions, none during the replays
++    try std.testing.expectEqual(before + 5, c.stats.evicted);
++}
++
++test "graph cache: hold - below the floor a miss runs eagerly, nothing is evicted, the held keys replay" {
++    var f: Fake = .{};
++    var r: Ran = .{};
++    var c = Cache(u32).init(std.testing.allocator, f.engine(), .{ .max = 48, .min_keep = 2, .hold = true });
++    c.room = roomFn;
++    defer c.deinit();
++    room_flag = true;
++    for (0..8) |k| _ = try c.run(@intCast(k), no_stream, 7, r.body());
++    room_flag = false;
++    try std.testing.expectEqual(Outcome.eager, try c.run(100, no_stream, 7, r.body()));
++    try std.testing.expectEqual(Outcome.eager, try c.run(101, no_stream, 7, r.body()));
++    try std.testing.expectEqual(@as(usize, 8), c.count());
++    try std.testing.expectEqual(@as(u32, 48), c.cap);
++    for (0..8) |k| try std.testing.expectEqual(Outcome.replayed, try c.run(@intCast(k), no_stream, 7, r.body()));
++    try std.testing.expectEqual(@as(u64, 0), c.stats.evicted);
++    try std.testing.expectEqual(@as(u64, 2), c.stats.floor_hits);
++    room_flag = true;
++    try std.testing.expectEqual(Outcome.captured, try c.run(100, no_stream, 7, r.body()));
++    try std.testing.expectEqual(@as(usize, 9), c.count());
++}
++
++test "graph cache: off runs every step eagerly" {
++    var f: Fake = .{};
++    var r: Ran = .{};
++    var c = Cache(u32).init(std.testing.allocator, f.engine(), .{ .on = false });
++    defer c.deinit();
++    try std.testing.expectEqual(Outcome.eager, try c.run(1, no_stream, 7, r.body()));
++    try std.testing.expectEqual(@as(u32, 0), f.captures);
++}
++
++test "graph cache: fingerprint" {
++    try std.testing.expect(fingerprintOf(&.{ 1, 2 }) != fingerprintOf(&.{ 2, 1 }));
++}
+diff --git a/zig/src/cuda/memory.zig b/zig/src/cuda/memory.zig
+index 2c469bae..6d802980 100644
+--- a/zig/src/cuda/memory.zig
++++ b/zig/src/cuda/memory.zig
+@@ -49,16 +49,37 @@ fn lockCounts() void {
+     while (!counts_mutex.tryLock()) std.Thread.yield() catch {};
+ }
+ 
++/// A sub-allocator under DeviceBuffer (arena.zig): `alloc` gives an address or null for cuMemAlloc, `free` owns it.
++pub const Hook = struct {
++    ctx: *anyopaque,
++    alloc: *const fn (ctx: *anyopaque, len: usize) ?abi.DevicePtr,
++    free: *const fn (ctx: *anyopaque, p: abi.DevicePtr) bool, // true when the address was the hook's
++};
++
++var alloc_hook: ?Hook = null;
++
++/// Installs, or with null removes, the sub-allocator: once at boot, before the buffers it should hold.
++pub fn setHook(h: ?Hook) void {
++    alloc_hook = h;
++}
++
++pub fn currentHook() ?Hook {
++    return alloc_hook;
++}
++
+ pub const DeviceBuffer = struct {
+     d: *const Driver,
+     ptr: abi.DevicePtr,
+     len: usize,
+     borrowed: bool = false, // a span of memory another value owns (a carveout's): free leaves it alone
+ 
+-    /// `len` bytes, 256-byte aligned by the driver; zero bytes allocate nothing and hold address 0.
++    /// `len` bytes, 256-byte aligned (512 from an installed arena); zero bytes allocate nothing and hold address 0.
+     pub fn alloc(d: *const Driver, len: usize) Error!DeviceBuffer {
+         var p: abi.DevicePtr = 0;
+-        if (len > 0) try d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc");
++        if (len > 0) {
++            if (alloc_hook) |h| p = h.alloc(h.ctx, len) orelse 0;
++            if (p == 0) try d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc");
++        }
+         held(&device_bytes, len);
+         return .{ .d = d, .ptr = p, .len = len };
+     }
+@@ -73,7 +94,10 @@ pub const DeviceBuffer = struct {
+ 
+     pub fn free(self: *DeviceBuffer) void {
+         if (!self.borrowed) {
+-            if (self.ptr != 0) _ = self.d.api.cuMemFree_v2(self.ptr);
++            if (self.ptr != 0) {
++                const mine = if (alloc_hook) |h| h.free(h.ctx, self.ptr) else false;
++                if (!mine) _ = self.d.api.cuMemFree_v2(self.ptr);
++            }
+             freed(&device_bytes, self.len);
+         }
+         self.* = undefined;
+@@ -209,6 +233,28 @@ test "freeing a borrowed span leaves the driver and the counts alone" {
+     try std.testing.expectEqual(before.device, usage(false).device);
+ }
+ 
++test "a buffer the hook owns is freed by the hook, never by the driver" {
++    const Owner = struct {
++        var frees: u32 = 0;
++        fn alloc(_: *anyopaque, _: usize) ?abi.DevicePtr {
++            return null;
++        }
++        fn free(_: *anyopaque, p: abi.DevicePtr) bool {
++            frees += 1;
++            return p == 0x2000;
++        }
++    };
++    var ctx: u8 = 0;
++    setHook(.{ .ctx = &ctx, .alloc = Owner.alloc, .free = Owner.free });
++    defer setHook(null);
++    held(&device_bytes, 4096);
++    var b: DeviceBuffer = .{ .d = undefined, .ptr = 0x2000, .len = 4096 };
++    b.free();
++    var c: DeviceBuffer = .{ .d = undefined, .ptr = 0x3000, .len = 64, .borrowed = true };
++    c.free();
++    try std.testing.expectEqual(@as(u32, 1), Owner.frees);
++}
++
+ test "peak reset preserves an allocation between its read and store" {
+     const before = usage(true);
+     held(&device_bytes, 100);
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index 6ee5648c..1f35de68 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -6,6 +6,7 @@ pub const Error = @import("driver.zig").Error;
+ pub const Context = @import("context.zig").Context;
+ pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
+ pub const HostBuffer = @import("memory.zig").HostBuffer;
++pub const memory = @import("memory.zig");
+ pub const usage = @import("memory.zig").usage;
+ pub const Usage = @import("memory.zig").Usage;
+ pub const carveout = @import("carveout.zig");
+@@ -28,6 +29,8 @@ pub const fp8 = @import("fp8.zig");
+ pub const segments = @import("segments.zig");
+ pub const grouped = @import("grouped.zig");
+ pub const qlinear = @import("qlinear.zig");
++pub const graph_cache = @import("graph_cache.zig");
++pub const arena = @import("arena.zig");
+ 
+ test {
+     _ = @import("memory.zig");
+@@ -39,4 +42,6 @@ test {
+     _ = segments;
+     _ = @import("fp8.zig");
+     _ = carveout;
++    _ = graph_cache;
++    _ = arena;
+ }
+-- 
+2.53.0
+

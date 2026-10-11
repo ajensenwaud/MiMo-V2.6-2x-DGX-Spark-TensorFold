@@ -1,0 +1,16 @@
+# Build image for the MiMo Zig port: the recipe's pinned TensorFold CUDA base (nvcc 13.3.73, ptxas 13.3,
+# Triton 3.7.1, PyTorch 2.13 nv26.07) plus Zig 0.17.0, the version TensorFold v1.0.5 pins in .zig-version.
+# Container only: nothing is installed on the hosts.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG ZIG_VERSION=0.17.0
+ARG ZIG_SHA256=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
+RUN curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
+ && echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - \
+ && mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
+ && rm /tmp/zig.tar.xz && /opt/zig/zig version
+ENV PATH=/opt/zig:${PATH} \
+    ZIG_GLOBAL_CACHE_DIR=/work/.zig-cache-global
+WORKDIR /work
+ENTRYPOINT []
