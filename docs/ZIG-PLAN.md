@@ -311,3 +311,25 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
 
 **Next:** get a graphed per-kernel timeline of the Zig forward (fix nsys injection, or event nodes in the graph), find
 where Python overlaps at 1 row, mirror it (likely the RoCE gather's launch/stream arrangement in roce.py).
+
+### Z7, session 10: single stream, measured on fixed texts
+- nsys: hardware CUDA trace records nothing on these GB10s (Python or Zig); `--trace=cuda-sw` works (m1_run.sh NSYS=).
+  Eager 1-row kernels, Zig vs Python (torch.profiler): linear 9.23 / 9.15, grouped experts 8.84 / 8.73, the rest
+  within 0.1 ms; Zig adds mimo_add2 0.11. 8 rows: experts 40.1 / 41.2, linear 9.9 / 10.2. **Kernels are level.**
+- Correction to session 9: Python's "2.5 ms overlap" was its profiler (wall timed without it, kernels with it).
+- Verify cost curve, position 9,000, pseudo-random tokens (Python `mimo_profile.py --widths --random`, Zig timing):
+  1 / 4 / 8 rows Python 22.5 / 40.8 / 57.8 ms, Zig 22.7 / 42.6 / 60.8. Real text costs Python the same (+-2%).
+  Serving context (608,256) adds 0.3 ms to Zig's 1-row step. Served Zig steps (plan link, drafter update, position
+  64) time 24.4-24.7 ms a row at load.
+- `tools/mimo_fixed_decode.py` + `tools/zig_fixed.sh`: spark-bench's decode texts with fixed tags, greedy, 3 a
+  workload. Zig's texts repeat exactly across arms; they differ from Python's (prompt rows via the decode path, Z6),
+  so Zig-vs-Python per request is approximate. Mean tok/s (chat / code / agent / report):
+  Python 48.0 / 71.2 / 60.8 / 52.4; Zig lanes 48.4 / 68.4 / 54.8 / 48.8; geometric depth 43.1 / 63.1 / 54.2 / 44.1
+  (rejected); plan link pinned 47.6 / 67.5 / 55.7 / 47.9 and rdma+pinned 49.7 / 69.1 / 54.1 / 48.7 (no gain,
+  off); median cost table (two starts) 48.3 / 66.8 / 55.4 / 48.1 and 48.5 / 69.2 / 55.6 / 50.1 (kept for stability,
+  no speed change). Code cells depend on the text: Python 65.9-74.9 across three fixed tags.
+- Rounds: Python stops drafting in chat (1.5 tokens, 31 ms a round), Zig drafts (2.2 tokens, 46 ms): same speed.
+  In agent Zig drafts ~4.8 rows a round at ~50% acceptance against Python's 2.4 rows.
+- Remaining gap: agent -10%, report -7%, code -4%, chat level. Next: Z6 (prompt kernels), which makes Zig's texts
+  equal Python's so policies compare request for request, then tune depth on matched texts and the 4-5% on
+  multi-row verifies.

@@ -48,6 +48,8 @@ def main() -> None:
     ap.add_argument("--prompt", type=int, default=9000)
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--json")
+    ap.add_argument("--random", action="store_true", help="--widths: fresh pseudo-random tokens each forward "
+                    "(as tf-mimo timing) instead of the prompt's text")
     ap.add_argument("--widths", default="", help="timing only: comma-separated window widths (e.g. 1,2,4,8,16)")
     ap.add_argument("--grid", default="", help="timing only: STREAMS:WIDTHS, e.g. 1,2,4:1,2,3,4,6,8 (a different text "
                                                "a stream)")
@@ -140,14 +142,20 @@ def main() -> None:
     report = {"tp": a.tp, "position": p}
     if a.widths:                                           # verification cost curve: wall ms a window of w rows
         curve = {}
+        rng = torch.Generator().manual_seed(0x31A0)
+
+        def window(wdt):
+            if a.random:
+                return [Chain(0, p, torch.randint(1000, 141000, (wdt,), generator=rng).tolist())]
+            return [Chain(0, p, prompt[200:200 + wdt])]
+
         for wdt in [int(x) for x in a.widths.split(",")]:
-            chains = [Chain(0, p, prompt[200:200 + wdt])]
             for _ in range(3):
-                graphs.forward(chains)
+                graphs.forward(window(wdt))
             torch.cuda.synchronize()
             t = time.perf_counter()
             for _ in range(a.steps):
-                graphs.forward(chains)
+                graphs.forward(window(wdt))
             torch.cuda.synchronize()
             curve[wdt] = round((time.perf_counter() - t) / a.steps * 1e3, 3)
         base = curve.get(1)

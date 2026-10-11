@@ -1,0 +1,31 @@
+{
+ "forwards": 19,
+ "kernels": [
+  1204,
+  50,
+  1,
+  34622
+ ],
+ "kernel_ms": 58.956,
+ "span_ms": 60.765,
+ "by_kernel_ms": {
+  "grouped_kernel": 40.117,
+  "linear_kernel": 9.888,
+  "tp_roce": 3.225,
+  "_rows": 1.111,
+  "rot_in_kernel": 0.907,
+  "group_kernel": 0.792,
+  "_router": 0.752,
+  "gateup_epilogue_kernel": 0.51,
+  "down_combine_kernel": 0.414,
+  "_add_rms": 0.302,
+  "ncclDevKernel_AllGather_RING_LL": 0.228,
+  "_merge": 0.213,
+  "_topk": 0.183,
+  "_qkv": 0.176,
+  "mimo_add2_f32": 0.121,
+  "mimo_embed_f32": 0.011,
+  "_rms": 0.005,
+  "_silu_mul": 0.003
+ }
+}
