@@ -171,7 +171,7 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
   attention outputs at the first full (0) and first sliding (1) layer. On gx10 `~/mimo/oracle/rank0.safetensors`
   (sha256 ce588994042b5a13...) and `peer/rank1.safetensors` (117297532cfeb30b...). Checks
   (`tools/mimo_oracle_check.py`): run 1 == run 2 on 6,144 tensors; rank 0 == rank 1 on all 6,112 rank-shared tensors;
-  argmax equal on both ranks at every step.
+  argmax equal on both ranks at every step. (Correction: 1,905 decode steps in all, prompts included, not 1,329.)
 - **Z1.3 done for the decode path.** Triton launches recorded with upstream's `tools/zig/triton_aot_manifest.py`,
   packed with `aot_pack.py`: 13 specialisations of 8 functions (_rms, _add_rms, _qkv x2, _rows x3, _merge x3,
   _router, _topk, _silu_mul), identical on both ranks. Kernel set: gx10 `~/mimo/oracle/aot-sm121/` (aot.json
@@ -180,6 +180,15 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
 - Build containers now run as uid 1000 (`--user 1000:1000 -e ZIG_GLOBAL_CACHE_DIR=/mimo/.zig-global`); outputs of
   root containers are handed back with `docker run ... chown`, not sudo.
 
-**Next (no GPU):** Z2.1 pack loader (EXL3 strips, stacked experts, norms, router, embeddings, sinks); Z2.2-Z2.4
-layer forward (attention via the AOT set, router/top-k via AOT, EXL3 via cuda/exl3.zig); Z2.5 TP sums over the fabric;
-Z2.6 greedy loop against the answer key. **Next GPU window:** first layer-by-layer comparison once Z2.4 builds.
+### 2026-10-11 (session 3; serve down ~7 min while idle, restarted)
+- **Z2 / gate M1 passed on the first run.** `zig/src/families/mimo_v2/`: `load.zig` (weights.load: strips EXL3,
+  stored-layout experts with pointer tables, fp32 norms, router fp16(bf16(stored)), fp32 sinks, bf16 embeddings;
+  56.1 GiB a rank, 155 s), `forward.zig` (Model.forward decode rows: 13 captured Triton cubins, EXL3 via
+  cuda/exl3.zig, `glue.cu` for torch's embed / rank-order add / fp64 rope tables, TP sums by all-gather + add),
+  `m1_main.zig` (`tf-mimo m1`), `m1_run.sh`. Against the answer key on both ranks, TP=2 over the CX7 link (NCCL):
+  **argmax 1,905/1,905 steps, fp32 logits byte-equal 128/128, 3,136 layer captures byte-equal** (residual after
+  every layer's attention and MLP at steps 0-3, attention outputs at layers 0 and 1). Logs: `results/zig-m1/`.
+- Known nit: rank 1 exits 70 through fail-fast when rank 0 finishes first (no stop announcement yet).
+
+**Next:** Z3 (decode windows up to 4 streams, keyed graphs, graphs == eager; prompt path), then Z4 (DFlash). The
+plan's fallback for Z2 (numeric gate) is not needed.

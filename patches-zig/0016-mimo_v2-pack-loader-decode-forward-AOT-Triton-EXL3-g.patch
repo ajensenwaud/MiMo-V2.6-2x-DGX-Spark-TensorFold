@@ -1,0 +1,1020 @@
+From a668297ad9da36e2b0b916c244db4699ee9945f3 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 15:32:34 +1100
+Subject: [PATCH 16/18] mimo_v2: pack loader, decode forward (AOT Triton + EXL3
+ + glue, TP sums), tf-mimo m1 gate
+
+---
+ zig/build/cuda.zig                   |  14 ++
+ zig/kernels/cuda/mimo_v2/glue.cu     |  36 +++
+ zig/src/cuda/kernels.zig             |   1 +
+ zig/src/families/mimo_v2/forward.zig | 361 +++++++++++++++++++++++++++
+ zig/src/families/mimo_v2/load.zig    | 354 ++++++++++++++++++++++++++
+ zig/src/families/mimo_v2/m1_main.zig | 154 ++++++++++++
+ zig/src/families/mimo_v2/root.zig    |   4 +
+ 7 files changed, 924 insertions(+)
+ create mode 100644 zig/kernels/cuda/mimo_v2/glue.cu
+ create mode 100644 zig/src/families/mimo_v2/forward.zig
+ create mode 100644 zig/src/families/mimo_v2/load.zig
+ create mode 100644 zig/src/families/mimo_v2/m1_main.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index a879349a..1e460a5a 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -40,6 +40,7 @@ const kernels = [_]Kernel{
+     .{ .name = "mimo_exl3_linear", .src = "mimo_v2/exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // tensorfold_exl3_linear_v3
+     .{ .name = "mimo_exl3_experts", .src = "mimo_v2/exl3_experts", .flags = &.{ "-O3", "-lineinfo" } }, // tensorfold_exl3_experts_v1
+     .{ .name = "mimo_exl3_experts_cb2", .src = "mimo_v2/exl3_experts_cb2", .flags = &.{ "-O3", "-lineinfo" } },
++    .{ .name = "mimo_glue", .src = "mimo_v2/glue", .flags = glue }, // ours: torch's embed / add / rope_tables, bit for bit
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+@@ -124,6 +125,18 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     runner.addImport("nemotron", mods.nemotron);
+     runner.addImport("core", mods.core);
+     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
++    // MiMo-V2 on the Zig engine: `tf-mimo m1` (gate Z2.6, one TP rank)
++    const tp_mod = @import("tp.zig").module(b, target, optimize, cuda);
++    const mimo_mod = b.createModule(.{ .root_source_file = b.path("zig/src/families/mimo_v2/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    mimo_mod.addImport("cuda", cuda);
++    mimo_mod.addImport("core", mods.core);
++    mimo_mod.addImport("tp", tp_mod);
++    const mimo_exe = b.createModule(.{ .root_source_file = b.path("zig/src/families/mimo_v2/m1_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    mimo_exe.addImport("cuda", cuda);
++    mimo_exe.addImport("core", mods.core);
++    mimo_exe.addImport("tp", tp_mod);
++    mimo_exe.addImport("mimo_v2", mimo_mod);
++    b.installArtifact(b.addExecutable(.{ .name = "tf-mimo", .root_module = mimo_exe }));
+     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true).root_module.strip = strip;
+ }
+ 
+@@ -193,6 +206,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     const mimo = b.createModule(.{ .root_source_file = b.path("zig/src/families/mimo_v2/root.zig"), .target = host, .optimize = .debug, .link_libc = true });
+     mimo.addImport("cuda", cuda);
+     mimo.addImport("core", mods.core);
++    mimo.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+     const mimo_test = b.addRunArtifact(b.addTest(.{ .root_module = mimo }));
+     step.dependOn(&mimo_test.step);
+     b.step("test-mimo", "MiMo-V2 family host tests").dependOn(&mimo_test.step);
+diff --git a/zig/kernels/cuda/mimo_v2/glue.cu b/zig/kernels/cuda/mimo_v2/glue.cu
+new file mode 100644
+index 00000000..0d48398f
+--- /dev/null
++++ b/zig/kernels/cuda/mimo_v2/glue.cu
+@@ -0,0 +1,36 @@
++// MiMo-V2's torch glue on the decode path, as the Python family's torch ops compute it (each bit-identical):
++//   embed:  w.embed[ids].float()                      bf16 row -> fp32 (exact)
++//   add2:   recv[0].float() + recv[1].float()          the ranks' fp32 partials summed in rank order (forward._sum)
++//   rope:   attention.rope_tables: inv = 1 / theta ** (arange(0, RD, 2, f64) / RD); ang = arange(ctx, f64) * inv;
++//           cos, sin in fp64, then .float()          (torch's CUDA pow / reciprocal / cos / sin are libdevice's)
++// Built with the glue flags (no contraction, IEEE division): see zig/build/cuda.zig.
++
++#include <cstdint>
++
++extern "C" __global__ void mimo_embed_f32(const uint16_t* __restrict__ table, const int64_t* __restrict__ ids,
++                                          float* __restrict__ out, int D) {
++    const int64_t r = blockIdx.x;
++    const uint16_t* row = table + ids[r] * (int64_t)D;
++    for (int d = threadIdx.x; d < D; d += blockDim.x) out[r * D + d] = __uint_as_float(((uint32_t)row[d]) << 16);
++}
++
++extern "C" __global__ void mimo_add2_f32(const float* __restrict__ a, const float* __restrict__ b,
++                                         float* __restrict__ out, int64_t n) {
++    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x)
++        out[i] = a[i] + b[i];
++}
++
++extern "C" __global__ void mimo_rope_tables(float* __restrict__ cos_out, float* __restrict__ sin_out, int context,
++                                            double theta, int rope_dim) {
++    const int half = rope_dim / 2;
++    const int64_t n = (int64_t)context * half;
++    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
++        const int j = (int)(i % half);
++        const int64_t p = i / half;
++        const double e = (double)(2 * j) / (double)rope_dim;   // arange(0, RD, 2, f64) / RD
++        const double inv = 1.0 / pow(theta, e);                // 1.0 / theta ** t (torch: reciprocal, then * 1.0)
++        const double ang = (double)p * inv;                    // arange(ctx, f64)[:, None] * inv[None, :]
++        cos_out[i] = __double2float_rn(cos(ang));
++        sin_out[i] = __double2float_rn(sin(ang));
++    }
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 8972bb67..2d909aad 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -34,6 +34,7 @@ pub const torch_nemotron_constants: []const u8 = if (available) &Blob("fatbin_to
+ pub const mimo_exl3_linear: []const u8 = if (available) &Blob("fatbin_mimo_exl3_linear").bytes else &.{};
+ pub const mimo_exl3_experts: []const u8 = if (available) &Blob("fatbin_mimo_exl3_experts").bytes else &.{};
+ pub const mimo_exl3_experts_cb2: []const u8 = if (available) &Blob("fatbin_mimo_exl3_experts_cb2").bytes else &.{};
++pub const mimo_glue: []const u8 = if (available) &Blob("fatbin_mimo_glue").bytes else &.{};
+ pub const nemotron_norms: []const u8 = if (available) &Blob("fatbin_nemotron_norms").bytes else &.{};
+ pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_route").bytes else &.{};
+ pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};
+diff --git a/zig/src/families/mimo_v2/forward.zig b/zig/src/families/mimo_v2/forward.zig
+new file mode 100644
+index 00000000..c2ef8c9b
+--- /dev/null
++++ b/zig/src/families/mimo_v2/forward.zig
+@@ -0,0 +1,361 @@
++//! MiMo-V2's decode forward on the Zig engine: forward.Model.forward(prompt=False) of the Python family (f3a8c11),
++//! launch for launch. Triton kernels come from the captured set (aot.json: the Python engine's own cubins), EXL3 from
++//! cuda/exl3.zig (the Python engine's SASS), torch's glue from glue.cu; TP sums gather the ranks' fp32 partials and
++//! add them in rank order. Eager, one stream (slot 0); decode rows of that stream at consecutive positions.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const tp = @import("tp");
++const load_ = @import("load.zig");
++const exl3 = cuda.exl3;
++const aot = cuda.aot;
++const Weights = load_.Weights;
++const Stream = cuda.Stream;
++
++pub const CK = 256; // attention.CK: keys a decode chunk
++pub const BN = 64;
++pub const GP = 16;
++pub const PROMPT_CHUNK = 16384; // forward.PROMPT_CHUNK: sizes the sliding ring
++
++/// attention.ring_size
++pub fn ringSize(rows: usize, window: usize) usize {
++    return (rows + window + BN - 1) / BN * BN;
++}
++
++fn pow2(x: usize) usize {
++    return std.math.ceilPowerOfTwo(usize, x) catch unreachable;
++}
++
++const p = aot.ptr;
++fn ci(name: []const u8, v: usize) aot.Const {
++    return aot.ci(name, @intCast(v));
++}
++fn ii(name: []const u8, v: usize) aot.Arg {
++    return aot.int(name, @intCast(v));
++}
++fn u(x: usize) u32 {
++    return @intCast(x);
++}
++
++/// Device scratch for up to `rows` decode rows.
++const Bufs = struct {
++    ids: u64, // i64 [R]
++    pos: u64, // i32 [R]
++    slot: u64, // i32 [R]
++    res: u64, // f32 [R, D]
++    x: u64, // f16 [R, D]
++    q: u64, // f16 [R, H * 192]
++    k: u64, // f16 [R, HK * 192]
++    v: u64,
++    qo: u64, // f16 [R, H, 192]
++    att: u64, // f16 [R, H, 128]
++    po: u64, // f32 [R * NCH * H * 128]
++    pm: u64,
++    pl: u64,
++    xh: u64, // f16 rot_in scratch [R, max K]
++    z: u64, // f32 split partials
++    part: u64, // f32 [R, D]
++    recv: u64, // f32 [2, R, max(D, Vr)]
++    sum: u64, // f32 [R, D]
++    logits: u64, // f32 [R, E]
++    pick: u64, // i32 [R, 8]
++    wts: u64, // f32 [R, 8]
++    g: u64, // f16 [R, ND]
++    up: u64,
++    h: u64,
++    head: u64, // f32 [R, Vr]
++    sc: exl3.Scratch,
++};
++
++pub const Model = struct {
++    w: *const Weights,
++    d: *const cuda.Driver,
++    set: *const aot.Set,
++    k3: *const exl3.Kernels,
++    glue: cuda.Module,
++    f_embed: cuda.Function,
++    f_add2: cuda.Function,
++    comm: ?tp.Collective,
++    context: usize,
++    ring: usize,
++    rows: usize,
++    nch_max: usize,
++    kc: []u64,
++    vc: []u64,
++    cos_full: u64,
++    sin_full: u64,
++    cos_swa: u64,
++    sin_swa: u64,
++    scale: f32,
++    b: Bufs,
++    arena: load_.Arena,
++    gpa: std.mem.Allocator,
++
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const Weights, set: *const aot.Set, k3: *const exl3.Kernels, comm: ?tp.Collective, context: usize, rows: usize, s: Stream) !Model {
++        const cfg = w.cfg;
++        var m: Model = undefined;
++        m.w = w;
++        m.d = d;
++        m.set = set;
++        m.k3 = k3;
++        m.comm = if (w.world > 1) comm orelse return error.NeedComm else null;
++        m.context = context;
++        m.ring = ringSize(PROMPT_CHUNK, cfg.window);
++        m.rows = rows;
++        m.nch_max = context / CK + 1;
++        m.gpa = gpa;
++        m.arena = .{ .d = d, .gpa = gpa };
++        errdefer m.arena.deinit();
++        m.glue = try cuda.Module.load(d, cuda.kernels.mimo_glue);
++        m.f_embed = try m.glue.function("mimo_embed_f32");
++        m.f_add2 = try m.glue.function("mimo_add2_f32");
++        const ar = &m.arena;
++        // caches: keys [1, LEN, HK, 192], values [1, LEN, HK, 128], zeroed (forward.Model.__init__)
++        m.kc = try gpa.alloc(u64, cfg.layers);
++        m.vc = try gpa.alloc(u64, cfg.layers);
++        for (0..cfg.layers) |i| {
++            const n = if (cfg.full[i]) context else m.ring;
++            m.kc[i] = try ar.zeros(n * cfg.kvHeads(i) * 192 * 2);
++            m.vc[i] = try ar.zeros(n * cfg.kvHeads(i) * 128 * 2);
++        }
++        // rope tables per theta: cos, sin [context, rope_dim / 2] fp32
++        const half = cfg.rope_dim / 2;
++        const rope = try m.glue.function("mimo_rope_tables");
++        inline for (.{ .{ "cos_full", "sin_full", cfg.theta_full }, .{ "cos_swa", "sin_swa", cfg.theta_swa } }) |t| {
++            @field(m, t[0]) = try ar.alloc(context * half * 4);
++            @field(m, t[1]) = try ar.alloc(context * half * 4);
++            var a: cuda.Args = .{};
++            a.add(@field(m, t[0]));
++            a.add(@field(m, t[1]));
++            a.add(@as(c_int, @intCast(context)));
++            a.add(@as(f64, t[2]));
++            a.add(@as(c_int, @intCast(cfg.rope_dim)));
++            try cuda.launch.launch(rope, .{ .grid = .{ .x = 256, .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
++        }
++        // qk_dim ** -0.5 as Python's float(), then fp32
++        m.scale = @floatCast(std.math.pow(f64, @floatFromInt(cfg.qk_dim), -0.5));
++        // scratch
++        const R = rows;
++        const D = cfg.hidden;
++        const H = cfg.heads;
++        const hk_max = @max(cfg.kv_full, cfg.kv_swa);
++        const vr = w.head.n;
++        const nd = cfg.dense_width / w.world;
++        var max_k: usize = @max(D, H * 128);
++        max_k = @max(max_k, nd);
++        var max_z: usize = 0;
++        for (w.layers) |L| {
++            inline for (.{ "q", "k", "v", "o" }) |f| max_z = @max(max_z, zBytes(@field(L, f), R));
++            if (L.gate) |g| max_z = @max(max_z, zBytes(g, R));
++            if (L.up) |g| max_z = @max(max_z, zBytes(g, R));
++            if (L.down) |g| max_z = @max(max_z, zBytes(g, R));
++        }
++        max_z = @max(max_z, zBytes(w.head, R));
++        var b: Bufs = undefined;
++        b.ids = try ar.zeros(R * 8);
++        b.pos = try ar.zeros(R * 4);
++        b.slot = try ar.zeros(R * 4);
++        b.res = try ar.zeros(R * D * 4);
++        b.x = try ar.zeros(R * D * 2);
++        b.q = try ar.zeros(R * H * 192 * 2);
++        b.k = try ar.zeros(R * hk_max * 192 * 2);
++        b.v = try ar.zeros(R * hk_max * 192 * 2);
++        b.qo = try ar.zeros(R * H * 192 * 2);
++        b.att = try ar.zeros(R * H * 128 * 2);
++        b.po = try ar.zeros(R * m.nch_max * H * 128 * 4);
++        b.pm = try ar.zeros(R * m.nch_max * H * 4);
++        b.pl = try ar.zeros(R * m.nch_max * H * 4);
++        b.xh = try ar.zeros(R * max_k * 2);
++        b.z = try ar.zeros(@max(max_z, 4));
++        b.part = try ar.zeros(R * D * 4);
++        b.recv = try ar.zeros(2 * R * @max(D, vr) * 4);
++        b.sum = try ar.zeros(R * D * 4);
++        b.logits = try ar.zeros(R * cfg.experts * 4);
++        b.pick = try ar.zeros(R * cfg.top_k * 4);
++        b.wts = try ar.zeros(R * cfg.top_k * 4);
++        b.g = try ar.zeros(R * nd * 2);
++        b.up = try ar.zeros(R * nd * 2);
++        b.h = try ar.zeros(R * nd * 2);
++        b.head = try ar.zeros(R * vr * 4);
++        // experts.Scratch(ex, WINDOW, top_k): the decode path's (rows only size it)
++        const first = for (w.layers) |L| {
++            if (L.experts) |e| break e;
++        } else return error.NoMoE;
++        const cfg_gu = try exl3.defaultConfig(first.dims, first.width, true);
++        const cfg_d = try exl3.defaultConfig(first.width, first.dims, false);
++        const sz = exl3.Scratch.bytes(first, R, cfg.top_k, cfg_gu, cfg_d);
++        b.sc = .{ .xg = try ar.zeros(sz.xg), .xu = try ar.zeros(sz.xg), .xd = try ar.zeros(sz.xd), .z = try ar.zeros(sz.z), .y = try ar.zeros(sz.y), .ids = try ar.zeros(sz.ids), .count = try ar.zeros(4), .members = try ar.alloc(sz.members), .rows = R, .slots = cfg.top_k, .cfg_gu = cfg_gu, .cfg_d = cfg_d };
++        try d.check(d.api.cuMemsetD32_v2(b.sc.members, 0xFFFF_FFFF, sz.members / 4), "members -1");
++        m.b = b;
++        try s.synchronize();
++        return m;
++    }
++
++    fn zBytes(l: exl3.Linear, R: usize) usize {
++        return if (l.split[0] > 1) l.split[0] * R * l.n * 4 else 0;
++    }
++
++    pub fn deinit(m: *Model) void {
++        m.gpa.free(m.kc);
++        m.gpa.free(m.vc);
++        m.glue.unload();
++        m.arena.deinit();
++    }
++
++    /// The fp32 residual (or partial) of `n` rows summed over the ranks in rank order (forward._sum).
++    fn sum(m: *Model, s: Stream, part: u64, n: usize) !u64 {
++        const c = m.comm orelse return part;
++        const D = m.w.cfg.hidden;
++        try c.allGather(part, m.b.recv, n * D, .f32, s.handle);
++        try m.add2(s, m.b.recv, m.b.recv + n * D * 4, m.b.sum, n * D);
++        return m.b.sum;
++    }
++
++    fn add2(m: *Model, s: Stream, a_: u64, b_: u64, out: u64, n: usize) !void {
++        var a: cuda.Args = .{};
++        a.add(a_);
++        a.add(b_);
++        a.add(out);
++        a.add(@as(i64, @intCast(n)));
++        try cuda.launch.launch(m.f_add2, .{ .grid = .{ .x = u(@min((n + 255) / 256, 1024)), .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
++    }
++
++    fn rms(m: *Model, s: Stream, x: u64, w: u64, out: u64, n: usize) !void {
++        const D = m.w.cfg.hidden;
++        try m.set.run(s, "_rms", .{ u(n), 1, 1 }, &.{ p("X", "*fp32", x), p("W", "*fp32", w), p("OUT", "*fp16", out) }, &.{ ci("N", D), aot.cf("EPS", @floatCast(m.w.cfg.eps)), ci("BLOCK", pow2(D)) });
++    }
++
++    fn addRms(m: *Model, s: Stream, x: u64, w: u64, out: u64, n: usize) !void {
++        const D = m.w.cfg.hidden;
++        try m.set.run(s, "_add_rms", .{ u(n), 1, 1 }, &.{ p("X", "*fp32", x), p("RES", "*fp32", m.b.res), p("W", "*fp32", w), p("OUT", "*fp16", out) }, &.{ ci("N", D), aot.cf("EPS", @floatCast(m.w.cfg.eps)), ci("BLOCK", pow2(D)) });
++    }
++
++    /// ops.Proj on the decode path: Exl3Linear(x [n, K] fp16) -> out [n, N] (fp16, or fp32 for o / down / head).
++    fn proj(m: *Model, s: Stream, l: exl3.Linear, x: u64, out: u64, out_f32: bool, n: usize) !void {
++        if (n > 128) return error.DecodeRows;
++        try m.k3.linear(s, l, x, .f16, m.b.xh, out, if (out_f32) .f32 else .f16, if (l.split[0] > 1) m.b.z else 0, n);
++    }
++
++    pub const Tap = enum { attn, mlp, att };
++    pub const Capture = struct {
++        hook: ?*const fn (ctx: *anyopaque, what: Tap, layer: usize, dev: u64, bytes: usize) anyerror!void = null,
++        ctx: *anyopaque = undefined,
++    };
++
++    /// Decode rows `tokens` at positions p0.. of slot 0: fp32 logits of every row, gathered over the ranks into
++    /// `out` [n, V] on the host. `cap` (debug): called with the residual after each layer's attention and MLP.
++    pub fn forward(m: *Model, s: Stream, tokens: []const i64, p0: usize, out: []f32, cap: ?Capture) !void {
++        const cfg = m.w.cfg;
++        const n = tokens.len;
++        if (n > m.rows) return error.WindowTooWide;
++        if (p0 + n > m.context) return error.PastContext;
++        if (n > m.ring - cfg.window) return error.RingOverrun;
++        const D = cfg.hidden;
++        const H = cfg.heads;
++        var pos: [128]i32 = undefined;
++        var slot: [128]i32 = @splat(0);
++        for (0..n) |i| pos[i] = @intCast(p0 + i);
++        try upload(m.d, m.b.ids, std.mem.sliceAsBytes(tokens));
++        try upload(m.d, m.b.pos, std.mem.sliceAsBytes(pos[0..n]));
++        try upload(m.d, m.b.slot, std.mem.sliceAsBytes(slot[0..n]));
++        const chunks = (p0 + n - 1) / CK + 1; // max(pos) // CK + 1
++        // res = embed[ids].float()
++        {
++            var a: cuda.Args = .{};
++            a.add(m.w.embed);
++            a.add(m.b.ids);
++            a.add(m.b.res);
++            a.add(@as(c_int, @intCast(D)));
++            try cuda.launch.launch(m.f_embed, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
++        }
++        try m.rms(s, m.b.res, m.w.layers[0].input_norm, m.b.x, n);
++        for (m.w.layers, 0..) |L, i| {
++            const hk = cfg.kvHeads(i);
++            try m.proj(s, L.q, m.b.x, m.b.q, false, n);
++            try m.proj(s, L.k, m.b.x, m.b.k, false, n);
++            try m.proj(s, L.v, m.b.x, m.b.v, false, n);
++            const full = cfg.full[i];
++            const len = if (full) m.context else m.ring;
++            try m.set.run(s, "_qkv", .{ u(n), u(H + 2 * hk), 1 }, &.{
++                p("Q", "*fp16", m.b.q),       p("K", "*fp16", m.b.k),         p("V", "*fp16", m.b.v),
++                p("COS", "*fp32", if (full) m.cos_full else m.cos_swa), p("SIN", "*fp32", if (full) m.sin_full else m.sin_swa),
++                p("POS", "*i32", m.b.pos),    p("SLOT", "*i32", m.b.slot),    p("QO", "*fp16", m.b.qo),
++                p("KC", "*fp16", m.kc[i]),    p("VC", "*fp16", m.vc[i]),      ii("LEN", len),
++            }, &.{ ci("H", H), ci("HK", hk), ci("RD", cfg.rope_dim) });
++            // attention.rows: sliding layers (window, 2 chunks, sinks), full layers (chunks from 0, no sinks)
++            const win: usize = if (full) 0 else cfg.window;
++            const nch: usize = if (full) chunks else (cfg.window + CK - 1) / CK + 1;
++            if (nch > m.nch_max) return error.TooManyChunks;
++            const g = H / hk;
++            try m.set.run(s, "_rows", .{ u(n), u(hk), u(nch) }, &.{
++                p("Q", "*fp16", m.b.qo),   p("KC", "*fp16", m.kc[i]), p("VC", "*fp16", m.vc[i]),
++                p("POS", "*i32", m.b.pos), p("SLOT", "*i32", m.b.slot), p("PO", "*fp32", m.b.po),
++                p("PM", "*fp32", m.b.pm),  p("PL", "*fp32", m.b.pl),   ii("LEN", len),
++                ii("NCH", nch),
++            }, &.{ ci("H", H), ci("HK", hk), ci("G", g), ci("WIN", win), aot.cf("SCALE", m.scale), ci("CK", CK), ci("BN", BN), ci("GP", GP) });
++            const sinks = if (full) 0 else L.sinks;
++            try m.set.run(s, "_merge", .{ u(n), u(H), 1 }, &.{
++                p("PO", "*fp32", m.b.po),                       p("PM", "*fp32", m.b.pm), p("PL", "*fp32", m.b.pl),
++                p("SINKS", "*fp32", if (sinks != 0) sinks else m.b.pm), p("OUT", "*fp16", m.b.att), ii("NCH", nch),
++            }, &.{ ci("H", H), ci("HAS_SINK", @intFromBool(sinks != 0)) });
++            if (cap) |c| if (c.hook) |h| try h(c.ctx, .att, i, m.b.att, n * H * 128 * 2);
++            try m.proj(s, L.o, m.b.att, m.b.part, true, n);
++            try m.addRms(s, try m.sum(s, m.b.part, n), L.post_norm, m.b.x, n);
++            if (cap) |c| if (c.hook) |h| try h(c.ctx, .attn, i, m.b.res, n * D * 4);
++            if (L.experts) |e| {
++                // moe.MoE: router logits, top 8 (sigmoid + bias), routed experts (decode: the grouped kernel)
++                const be: usize, const bk: usize = .{ 32, 256 }; // _tile(n) == 16 for n <= 16
++                if (n > 16) return error.RouterTile;
++                try m.set.run(s, "_router", .{ u((n + 15) / 16), u((cfg.experts + be - 1) / be), 1 }, &.{
++                    p("X", "*fp16", m.b.x), p("W", "*fp16", L.router), p("OUT", "*fp32", m.b.logits), ii("M", n), ii("x_stride", D),
++                }, &.{ ci("D", D), ci("NE", cfg.experts), ci("BM", 16), ci("BLOCK_E", be), ci("BK", bk) });
++                try m.set.run(s, "_topk", .{ u(n), 1, 1 }, &.{
++                    p("L", "*fp32", m.b.logits), p("BIAS", "*fp32", L.bias), p("PICK", "*i32", m.b.pick), p("WTS", "*fp32", m.b.wts), aot.float("SCALE", L.route_scale),
++                }, &.{ ci("NE", cfg.experts), ci("TOPK", cfg.top_k), ci("BLOCK", pow2(cfg.experts)), ci("KP", pow2(cfg.top_k)) });
++                try m.k3.routed(s, m.b.x, false, D, m.b.pick, m.b.wts, e, m.b.sc, m.b.part, n, std.math.inf(f32), 1, true);
++            } else {
++                try m.proj(s, L.gate.?, m.b.x, m.b.g, false, n);
++                try m.proj(s, L.up.?, m.b.x, m.b.up, false, n);
++                const nd = L.gate.?.n;
++                try m.set.run(s, "_silu_mul", .{ u(n), u(nd / 1024), 1 }, &.{ p("G", "*fp16", m.b.g), p("U", "*fp16", m.b.up), p("OUT", "*fp16", m.b.h) }, &.{ ci("N", nd), ci("BLOCK", 1024) });
++                try m.proj(s, L.down.?, m.b.h, m.b.part, true, n);
++            }
++            const after = if (i + 1 < m.w.layers.len) m.w.layers[i + 1].input_norm else m.w.norm;
++            try m.addRms(s, try m.sum(s, m.b.part, n), after, m.b.x, n);
++            if (cap) |c| if (c.hook) |h| try h(c.ctx, .mlp, i, m.b.res, n * D * 4);
++        }
++        // _head / _logits: this rank's vocab slice, gathered: row r = [rank 0's slice, rank 1's slice]
++        const vr = m.w.head.n;
++        try m.proj(s, m.w.head, m.b.x, m.b.head, true, n);
++        if (m.comm) |c| {
++            try c.allGather(m.b.head, m.b.recv, n * vr, .f32, s.handle);
++            try s.synchronize();
++            for (0..n) |r| for (0..m.w.world) |k| {
++                try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(out[(r * m.w.world + k) * vr ..].ptr), m.b.recv + ((k * n + r) * vr) * 4, vr * 4), "logits");
++            };
++        } else {
++            try s.synchronize();
++            try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(out.ptr), m.b.head, n * vr * 4), "logits");
++        }
++    }
++};
++
++fn upload(d: *const cuda.Driver, at: u64, bytes: []const u8) !void {
++    try d.check(d.api.cuMemcpyHtoD_v2(at, bytes.ptr, bytes.len), "upload");
++}
++
++/// torch.argmax of fp32 logits: the first index of the largest value (NaN counts as largest).
++pub fn argmax(xs: []const f32) usize {
++    var best: usize = 0;
++    for (xs, 0..) |x, i| {
++        const b = xs[best];
++        if (std.math.isNan(b)) return best;
++        if (std.math.isNan(x) or x > b) best = i;
++    }
++    return best;
++}
++
++test "ring size and argmax" {
++    try std.testing.expectEqual(@as(usize, 16512), ringSize(16384, 128));
++    try std.testing.expectEqual(@as(usize, 1), argmax(&.{ 1.0, 3.0, 3.0, 2.0 }));
++}
+diff --git a/zig/src/families/mimo_v2/load.zig b/zig/src/families/mimo_v2/load.zig
+new file mode 100644
+index 00000000..d527ce48
+--- /dev/null
++++ b/zig/src/families/mimo_v2/load.zig
+@@ -0,0 +1,354 @@
++//! A rank's share of a MiMo-V2 EXL3 pack on the GPU, as weights.load (f3a8c11) builds it: EXL3 projections in the
++//! strips layout (Exl3Linear's default), each layer's routed experts in the stored layout with their pointer and
++//! width tables (experts.prepare), norms as fp32, the router fp16(bf16(stored)), sinks fp32, embeddings bf16.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const config = @import("config.zig");
++const exl3 = cuda.exl3;
++const fmt = core.exl3_format;
++const Config = config.Config;
++
++/// Device memory in large blocks, handed out 256-byte aligned (one cuMemAlloc per block, not per tensor).
++pub const Arena = struct {
++    d: *const cuda.Driver,
++    gpa: std.mem.Allocator,
++    blocks: std.ArrayList(cuda.DeviceBuffer) = .empty,
++    used: usize = 0,
++    total: usize = 0,
++    pub const block_bytes: usize = 1 << 30;
++
++    pub fn alloc(a: *Arena, bytes: usize) !u64 {
++        const n = std.mem.alignForward(usize, @max(bytes, 1), 256);
++        if (a.blocks.items.len == 0 or a.used + n > a.blocks.items[a.blocks.items.len - 1].len) {
++            try a.blocks.append(a.gpa, try cuda.DeviceBuffer.alloc(a.d, @max(block_bytes, n)));
++            a.used = 0;
++        }
++        const b = a.blocks.items[a.blocks.items.len - 1];
++        const at = b.ptr + a.used;
++        a.used += n;
++        a.total += n;
++        return at;
++    }
++    pub fn upload(a: *Arena, bytes: []const u8) !u64 {
++        const at = try a.alloc(bytes.len);
++        try check(a.d, a.d.api.cuMemcpyHtoD_v2(at, bytes.ptr, bytes.len));
++        return at;
++    }
++    pub fn zeros(a: *Arena, bytes: usize) !u64 {
++        const at = try a.alloc(bytes);
++        try check(a.d, a.d.api.cuMemsetD8_v2(at, 0, std.mem.alignForward(usize, @max(bytes, 1), 256)));
++        return at;
++    }
++    pub fn deinit(a: *Arena) void {
++        for (a.blocks.items) |*b| b.free();
++        a.blocks.deinit(a.gpa);
++    }
++};
++
++fn check(d: *const cuda.Driver, r: anytype) !void {
++    try d.check(r, "mimo_v2 load");
++}
++
++/// An EXL3 matrix on the host: trellis int16 [tk, tn, 8 * k2], suh fp16 [K], svh fp16 [N].
++pub const Mat = struct {
++    trellis: []i16,
++    suh: []f16,
++    svh: []f16,
++    tk: usize,
++    tn: usize,
++    k2: u32,
++
++    pub fn deinit(m: Mat, a: std.mem.Allocator) void {
++        a.free(m.trellis);
++        a.free(m.suh);
++        a.free(m.svh);
++    }
++    pub fn k(m: Mat) usize {
++        return m.tk * 16;
++    }
++    pub fn n(m: Mat) usize {
++        return m.tn * 16;
++    }
++};
++
++pub fn readMat(a: std.mem.Allocator, ck: *core.Checkpoint, prefix: []const u8) !Mat {
++    var nb: [256]u8 = undefined;
++    if ((ck.get(try std.fmt.bufPrint(&nb, "{s}.mul1", .{prefix})) catch null) == null) return error.NotMul1;
++    const t = try ck.get(try std.fmt.bufPrint(&nb, "{s}.trellis", .{prefix}));
++    if (t.dtype != .i16 or t.rank != 3 or t.shape[2] % 8 != 0) return error.BadTrellis;
++    const tr = try a.alloc(i16, t.numel());
++    errdefer a.free(tr);
++    @memcpy(std.mem.sliceAsBytes(tr), t.bytes);
++    const suh = try scales(a, ck, prefix, "suh", t.shape[0] * 16);
++    errdefer a.free(suh);
++    return .{ .trellis = tr, .suh = suh, .svh = try scales(a, ck, prefix, "svh", t.shape[1] * 16), .tk = t.shape[0], .tn = t.shape[1], .k2 = @intCast(t.shape[2] / 8) };
++}
++
++fn scales(a: std.mem.Allocator, ck: *core.Checkpoint, prefix: []const u8, part: []const u8, size: usize) ![]f16 {
++    var nb: [256]u8 = undefined;
++    const t = try ck.get(try std.fmt.bufPrint(&nb, "{s}.{s}", .{ prefix, part }));
++    const out = try a.alloc(f16, size);
++    errdefer a.free(out);
++    if (t.dtype == .f16 and t.numel() == size) {
++        @memcpy(std.mem.sliceAsBytes(out), t.bytes);
++    } else if (t.dtype == .i16 and t.numel() * 16 == size) {
++        const w = try a.alloc(i16, t.numel());
++        defer a.free(w);
++        @memcpy(std.mem.sliceAsBytes(w), t.bytes);
++        fmt.unpackSigns(w, out);
++    } else return error.BadScales;
++    return out;
++}
++
++/// weights.py cut(): outputs [lo, hi) (trellis columns, svh) or inputs [lo, hi) (trellis rows, suh); `m` is freed.
++pub fn cut(a: std.mem.Allocator, m: Mat, c: config.Cut) !Mat {
++    if (c.axis == .whole) return m;
++    defer m.deinit(a);
++    const w = 8 * @as(usize, m.k2);
++    if (c.lo % 128 != 0 or c.hi % 128 != 0) return error.CutNotOnBlock;
++    if (c.axis == .n) {
++        const tn = (c.hi - c.lo) / 16;
++        const tr = try a.alloc(i16, m.tk * tn * w);
++        for (0..m.tk) |kt| @memcpy(tr[kt * tn * w ..][0 .. tn * w], m.trellis[(kt * m.tn + c.lo / 16) * w ..][0 .. tn * w]);
++        return .{ .trellis = tr, .suh = try a.dupe(f16, m.suh), .svh = try a.dupe(f16, m.svh[c.lo..c.hi]), .tk = m.tk, .tn = tn, .k2 = m.k2 };
++    }
++    const tk = (c.hi - c.lo) / 16;
++    return .{ .trellis = try a.dupe(i16, m.trellis[(c.lo / 16) * m.tn * w ..][0 .. tk * m.tn * w]), .suh = try a.dupe(f16, m.suh[c.lo..c.hi]), .svh = try a.dupe(f16, m.svh), .tk = tk, .tn = m.tn, .k2 = m.k2 };
++}
++
++/// linear.strips: trellis int32 words [K/16, N/16, W] -> [N/128, K/16, 8, W].
++pub fn strips(a: std.mem.Allocator, m: Mat) ![]u32 {
++    const w32 = 4 * @as(usize, m.k2);
++    const words: []align(2) const u32 = std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(m.trellis));
++    const out = try a.alloc(u32, words.len);
++    for (0..m.tk) |kt| for (0..m.tn / 8) |nb8| for (0..8) |j| {
++        @memcpy(out[((nb8 * m.tk + kt) * 8 + j) * w32 ..][0..w32], words[((kt * m.tn) + nb8 * 8 + j) * w32 ..][0..w32]);
++    };
++    return out;
++}
++
++/// Exl3Linear.from_tensors (strips) on the device, with its zeroed split counters.
++pub fn linear(a: std.mem.Allocator, ar: *Arena, m: Mat) !exl3.Linear {
++    if (m.k() % 128 != 0 or m.n() % 128 != 0) return error.NotBlocked;
++    const st = try strips(a, m);
++    defer a.free(st);
++    return .{
++        .words = try ar.upload(std.mem.sliceAsBytes(st)),
++        .suh = try ar.upload(std.mem.sliceAsBytes(m.suh)),
++        .svh = try ar.upload(std.mem.sliceAsBytes(m.svh)),
++        .counters = try ar.zeros(8 * (m.n() / 128) * 4),
++        .k = m.k(),
++        .n = m.n(),
++        .k2 = m.k2,
++        .split = exl3.plan(m.k(), m.n()),
++    };
++}
++
++/// torch's float -> bfloat16 (round to nearest even; NaN kept quiet).
++pub fn bf16Round(x: f32) f32 {
++    const u: u32 = @bitCast(x);
++    if (std.math.isNan(x)) return @bitCast((u | 0x0040_0000) & 0xFFFF_0000);
++    const r = u + 0x7FFF + ((u >> 16) & 1);
++    return @bitCast(r & 0xFFFF_0000);
++}
++
++/// A tensor as fp32 (`.float()`): bf16, fp16 or fp32 storage.
++pub fn asF32(a: std.mem.Allocator, t: core.safetensors.Tensor) ![]f32 {
++    const n = t.numel();
++    const out = try a.alloc(f32, n);
++    switch (t.dtype) {
++        .f32 => @memcpy(std.mem.sliceAsBytes(out), t.bytes),
++        .bf16 => for (out, 0..) |*o, i| {
++            o.* = @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16);
++        },
++        .f16 => for (out, 0..) |*o, i| {
++            o.* = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little))));
++        },
++        else => return error.BadDType,
++    }
++    return out;
++}
++
++pub const Layer = struct {
++    input_norm: u64, // fp32 [D]
++    post_norm: u64,
++    q: exl3.Linear,
++    k: exl3.Linear,
++    v: exl3.Linear, // 192 a head: V + 64 pad
++    o: exl3.Linear, // a rank's input columns: partial outputs under TP
++    sinks: u64 = 0, // fp32 [H] of this rank's heads, or 0
++    experts: ?exl3.Experts = null,
++    router: u64 = 0, // fp16 [E, D]
++    bias: u64 = 0, // fp32 [E]
++    route_scale: f32 = 1.0,
++    gate: ?exl3.Linear = null, // the dense MLP (layer 0)
++    up: ?exl3.Linear = null,
++    down: ?exl3.Linear = null,
++};
++
++pub const Weights = struct {
++    full: Config,
++    cfg: Config, // this rank's view
++    rank: usize,
++    world: usize,
++    embed: u64, // bf16 [V, D], every rank whole
++    layers: []Layer,
++    norm: u64,
++    head: exl3.Linear, // a rank's V / world rows
++    arena: Arena,
++    gpa: std.mem.Allocator,
++
++    pub fn deinit(w: *Weights) void {
++        w.gpa.free(w.layers);
++        w.arena.deinit();
++    }
++};
++
++pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, model_dir: []const u8, rank: usize, world: usize, log: bool) !Weights {
++    const cfg_text = try readFile(gpa, io, model_dir, "config.json");
++    defer gpa.free(cfg_text);
++    const gen_text = readFile(gpa, io, model_dir, "generation_config.json") catch null;
++    defer if (gen_text) |g| gpa.free(g);
++    const full = try Config.parse(gpa, cfg_text, gen_text);
++    const view = try full.rankView(world);
++    var ck = try core.Checkpoint.openModel(gpa, io, model_dir);
++    defer ck.close();
++    var w: Weights = .{ .full = full, .cfg = view, .rank = rank, .world = world, .embed = 0, .layers = try gpa.alloc(Layer, full.layers), .norm = 0, .head = undefined, .arena = .{ .d = d, .gpa = gpa }, .gpa = gpa };
++    errdefer w.deinit();
++    const ar = &w.arena;
++    const emb = try ck.get("model.embed_tokens.weight");
++    if (emb.dtype != .bf16) return error.EmbedNotBf16; // weights.py: .to(bfloat16) of bf16 storage is the identity
++    w.embed = try ar.upload(emb.bytes);
++
++    var names: std.ArrayList(u8) = .empty;
++    defer names.deinit(gpa);
++    try names.ensureTotalCapacity(gpa, 1 << 20);
++    var cuts: std.ArrayList(config.Cut) = .empty;
++    defer cuts.deinit(gpa);
++    var nb: [256]u8 = undefined;
++    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++    for (0..full.layers) |i| {
++        names.clearRetainingCapacity();
++        cuts.clearRetainingCapacity();
++        try config.layerCuts(full, i, rank, world, &names, gpa, &cuts);
++        const L = &w.layers[i];
++        L.* = .{ .input_norm = 0, .post_norm = 0, .q = undefined, .k = undefined, .v = undefined, .o = undefined };
++        L.input_norm = try f32Upload(gpa, ar, try ck.get(try std.fmt.bufPrint(&nb, "model.layers.{d}.input_layernorm.weight", .{i})));
++        L.post_norm = try f32Upload(gpa, ar, try ck.get(try std.fmt.bufPrint(&nb, "model.layers.{d}.post_attention_layernorm.weight", .{i})));
++        inline for (.{ "q", "k", "v", "o" }, 0..) |f, j| @field(L, f) = try linear(gpa, ar, try cut(gpa, try readMat(gpa, &ck, cuts.items[j].prefix), cuts.items[j]));
++        if (if (full.full[i]) full.sinks_full else full.sinks_swa) {
++            const s = try asF32(gpa, try ck.get(try std.fmt.bufPrint(&nb, "model.layers.{d}.self_attn.attention_sink_bias", .{i})));
++            defer gpa.free(s);
++            L.sinks = try ar.upload(std.mem.sliceAsBytes(s[rank * view.heads .. (rank + 1) * view.heads]));
++        }
++        if (full.moe[i]) {
++            L.experts = try experts(gpa, ar, &ck, full, cuts.items[4..]);
++            const r = try ck.get(try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.gate.weight", .{i}));
++            const rf = try asF32(gpa, r);
++            defer gpa.free(rf);
++            const r16 = try gpa.alloc(f16, rf.len); // .to(bfloat16) then .to(fp16 ACT); weights.py checks it is exact
++            defer gpa.free(r16);
++            for (rf, r16) |x, *o| {
++                const b = bf16Round(x);
++                o.* = @floatCast(b);
++                if (@as(f32, @floatCast(o.*)) != b) return error.RouterNotExact;
++            }
++            L.router = try ar.upload(std.mem.sliceAsBytes(r16));
++            L.bias = try f32Upload(gpa, ar, try ck.get(try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.gate.e_score_correction_bias", .{i})));
++            L.route_scale = if (i == config.interm_div_layer) config.interm_div else 1.0;
++        } else {
++            L.gate = try linear(gpa, ar, try cut(gpa, try readMat(gpa, &ck, cuts.items[4].prefix), cuts.items[4]));
++            L.up = try linear(gpa, ar, try cut(gpa, try readMat(gpa, &ck, cuts.items[5].prefix), cuts.items[5]));
++            L.down = try linear(gpa, ar, try cut(gpa, try readMat(gpa, &ck, cuts.items[6].prefix), cuts.items[6]));
++        }
++        if (log and (i % 8 == 7 or i == full.layers - 1)) {
++            const s = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9;
++            std.debug.print("[tensorfold] mimo_v2 (zig): {d}/{d} layers in {d:.0}s, {d:.1} GiB\n", .{ i + 1, full.layers, s, @as(f64, @floatFromInt(ar.total)) / (1 << 30) });
++        }
++    }
++    w.norm = try f32Upload(gpa, ar, try ck.get("model.norm.weight"));
++    const hc = config.headCut(full, rank, world);
++    w.head = try linear(gpa, ar, try cut(gpa, try readMat(gpa, &ck, hc.prefix), hc));
++    return w;
++}
++
++fn f32Upload(gpa: std.mem.Allocator, ar: *Arena, t: core.safetensors.Tensor) !u64 {
++    const f = try asF32(gpa, t);
++    defer gpa.free(f);
++    return ar.upload(std.mem.sliceAsBytes(f));
++}
++
++/// experts.prepare: per expert (gate, up, down) cut trellises in the stored layout, referenced by pointer tables.
++fn experts(gpa: std.mem.Allocator, ar: *Arena, ck: *core.Checkpoint, full: Config, cuts: []const config.Cut) !exl3.Experts {
++    const E = full.experts;
++    if (cuts.len != 3 * E) return error.ExpertCuts;
++    const ptrs = try gpa.alloc(u64, 3 * E);
++    defer gpa.free(ptrs);
++    const k2s = try gpa.alloc(i32, 3 * E);
++    defer gpa.free(k2s);
++    var st: [6]std.ArrayList(f16) = @splat(.empty); // suh_g, suh_u, svh_g, svh_u, suh_d, svh_d
++    defer for (&st) |*l| l.deinit(gpa);
++    var lo: [2]u32 = .{ 99, 99 };
++    var hi: [2]u32 = .{ 0, 0 };
++    var dims: usize = 0;
++    var width: usize = 0;
++    for (0..E) |e| for (0..3) |j| {
++        const m = try cut(gpa, try readMat(gpa, ck, cuts[3 * e + j].prefix), cuts[3 * e + j]);
++        defer m.deinit(gpa);
++        ptrs[j * E + e] = try ar.upload(std.mem.sliceAsBytes(m.trellis));
++        k2s[j * E + e] = @intCast(m.k2);
++        const g: usize = if (j == 2) 1 else 0;
++        lo[g] = @min(lo[g], m.k2);
++        hi[g] = @max(hi[g], m.k2);
++        switch (j) {
++            0 => {
++                dims = m.k();
++                width = m.n();
++                try st[0].appendSlice(gpa, m.suh);
++                try st[2].appendSlice(gpa, m.svh);
++            },
++            1 => {
++                try st[1].appendSlice(gpa, m.suh);
++                try st[3].appendSlice(gpa, m.svh);
++            },
++            else => {
++                try st[4].appendSlice(gpa, m.suh);
++                try st[5].appendSlice(gpa, m.svh);
++            },
++        }
++    };
++    return .{
++        .gate_ptr = try ar.upload(std.mem.sliceAsBytes(ptrs[0..E])),
++        .up_ptr = try ar.upload(std.mem.sliceAsBytes(ptrs[E .. 2 * E])),
++        .down_ptr = try ar.upload(std.mem.sliceAsBytes(ptrs[2 * E ..])),
++        .gate_k2 = try ar.upload(std.mem.sliceAsBytes(k2s[0..E])),
++        .up_k2 = try ar.upload(std.mem.sliceAsBytes(k2s[E .. 2 * E])),
++        .down_k2 = try ar.upload(std.mem.sliceAsBytes(k2s[2 * E ..])),
++        .suh_g = try ar.upload(std.mem.sliceAsBytes(st[0].items)),
++        .suh_u = try ar.upload(std.mem.sliceAsBytes(st[1].items)),
++        .svh_g = try ar.upload(std.mem.sliceAsBytes(st[2].items)),
++        .svh_u = try ar.upload(std.mem.sliceAsBytes(st[3].items)),
++        .suh_d = try ar.upload(std.mem.sliceAsBytes(st[4].items)),
++        .svh_d = try ar.upload(std.mem.sliceAsBytes(st[5].items)),
++        .count = E,
++        .dims = dims,
++        .width = width,
++        .k2_gu = .{ lo[0], hi[0] },
++        .k2_d = .{ lo[1], hi[1] },
++    };
++}
++
++fn readFile(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![]u8 {
++    const path = try std.fs.path.join(gpa, &.{ dir, name });
++    defer gpa.free(path);
++    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
++}
++
++test "bf16 rounding is torch's" {
++    try std.testing.expectEqual(@as(u32, 0x3F80_0000), @as(u32, @bitCast(bf16Round(1.0))));
++    try std.testing.expectEqual(@as(u32, 0x3F80_0000), @as(u32, @bitCast(bf16Round(@bitCast(@as(u32, 0x3F80_8000)))))); // tie to even
++    try std.testing.expectEqual(@as(u32, 0x3F82_0000), @as(u32, @bitCast(bf16Round(@bitCast(@as(u32, 0x3F81_8000)))))); // tie to even (up)
++    try std.testing.expectEqual(@as(u32, 0x3F81_0000), @as(u32, @bitCast(bf16Round(@bitCast(@as(u32, 0x3F80_8001))))));
++}
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+new file mode 100644
+index 00000000..9f4e5783
+--- /dev/null
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -0,0 +1,154 @@
++//! `tf-mimo m1 MODEL ORACLE AOT [CONTEXT]`: gate M1 (ZIG-PLAN Z2.6) on one TP rank. Runs the answer key's prompts
++//! (tools/mimo_zig_capture.py: one decode row a step, the prompt then the Python engine's greedy tokens) through the
++//! Zig MiMo-V2 decode forward and compares, byte for byte with this rank's oracle file: the residual after every
++//! layer's attention and MLP at the first steps, the fp32 logits at the first 16 steps, and the argmax at every step.
++//! Ranks come from TF_TP_* (TF_TP_RANK, TF_TP_MASTER, TF_TP_PORT; TF_COMM_BACKEND=nccl).
++
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const tp = @import("tp");
++const mimo = @import("mimo_v2");
++
++const prompts = [_][]const u8{ "en_story", "zh_explain", "code_py", "math", "tool_json", "edit", "list", "short" };
++
++const Cmp = struct {
++    gpa: std.mem.Allocator,
++    d: *const cuda.Driver,
++    s: cuda.Stream,
++    ora: *const core.safetensors.File,
++    name: []const u8,
++    step: usize,
++    rank: usize,
++    first_fail: ?[]const u8 = null,
++    checked: usize = 0,
++    host: []u8,
++};
++
++fn hook(ctx: *anyopaque, what: mimo.forward.Model.Tap, layer: usize, dev: u64, bytes: usize) anyerror!void {
++    const c: *Cmp = @ptrCast(@alignCast(ctx));
++    var nb: [128]u8 = undefined;
++    const key = switch (what) {
++        .attn => try std.fmt.bufPrint(&nb, "{s}.s{d}.attn.{d}", .{ c.name, c.step, layer }),
++        .mlp => try std.fmt.bufPrint(&nb, "{s}.s{d}.res.{d}", .{ c.name, c.step, layer }),
++        .att => try std.fmt.bufPrint(&nb, "{s}.s{d}.att.{d}", .{ c.name, c.step, layer }),
++    };
++    const want = c.ora.get(key) orelse return; // attention outputs exist only at two layers
++    try c.s.synchronize();
++    if (want.bytes.len != bytes) {
++        std.debug.print("FAIL {s}: {d} bytes, oracle {d}\n", .{ key, bytes, want.bytes.len });
++        return error.Shape;
++    }
++    try c.d.check(c.d.api.cuMemcpyDtoH_v2(@ptrCast(c.host.ptr), dev, bytes), "capture");
++    c.checked += 1;
++    if (std.mem.eql(u8, c.host[0..bytes], want.bytes)) return;
++    if (c.first_fail == null) {
++        c.first_fail = try c.gpa.dupe(u8, key);
++        report(key, c.host[0..bytes], want.bytes, what == .att);
++    }
++}
++
++fn report(key: []const u8, got: []const u8, want: []const u8, half: bool) void {
++    var diff: usize = 0;
++    var worst: f64 = 0;
++    var first: ?usize = null;
++    const n = if (half) got.len / 2 else got.len / 4;
++    for (0..n) |i| {
++        const g: f64, const w: f64 = if (half) .{ @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, got[2 * i ..][0..2], .little)))), @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, want[2 * i ..][0..2], .little)))) } else .{ @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, got[4 * i ..][0..4], .little)))), @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, want[4 * i ..][0..4], .little)))) };
++        if (g != w) {
++            diff += 1;
++            if (first == null) first = i;
++            worst = @max(worst, @abs(g - w) / @max(@abs(w), 1e-6));
++        }
++    }
++    std.debug.print("FIRST DIFF {s}: {d} of {d} values differ (first at {?d}), worst relative {e}\n", .{ key, diff, n, first, worst });
++}
++
++pub fn main(init: std.process.Init) !u8 {
++    const args = try init.minimal.args.toSlice(init.arena.allocator());
++    if (args.len < 5 or !std.mem.eql(u8, args[1], "m1")) {
++        std.debug.print("usage: tf-mimo m1 MODEL ORACLE(rank<R>.safetensors) AOT_DIR [CONTEXT]\n", .{});
++        return 2;
++    }
++    const gpa = init.gpa;
++    const io = init.io;
++    const context: usize = if (args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096;
++    const cfg = try tp.Config.fromEnv();
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, @intCast(cfg.device));
++    defer ctx.deinit();
++    var session: tp.Session = undefined;
++    const world: usize = cfg.world;
++    if (world > 1) try session.open(&driver, cfg, "");
++    defer if (world > 1) session.close();
++    const rank: usize = cfg.rank;
++    var s = try cuda.Stream.init(&driver, false);
++    defer s.deinit();
++
++    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++    var w = try mimo.load.load(gpa, io, &driver, args[2], rank, world, rank == 0);
++    defer w.deinit();
++    var k3 = try cuda.exl3.Kernels.load(&driver);
++    defer k3.deinit();
++    var set = try cuda.aot.Set.load(gpa, io, &driver, ctx.device, args[4]);
++    defer set.deinit();
++    var model = try mimo.forward.Model.init(gpa, &driver, &w, &set, &k3, if (world > 1) session.comm() else null, context, 1, s);
++    defer model.deinit();
++    std.debug.print("[m1] rank {d}: loaded in {d:.0}s ({d:.1} GiB weights)\n", .{ rank, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(w.arena.total)) / (1 << 30) });
++
++    var ora = try core.safetensors.File.open(gpa, io, args[3]);
++    defer ora.close(io);
++    const V = w.full.vocab;
++    const logits = try gpa.alloc(f32, V);
++    defer gpa.free(logits);
++    const host = try gpa.alloc(u8, 1 << 20);
++    defer gpa.free(host);
++    var cmp: Cmp = .{ .gpa = gpa, .d = &driver, .s = s, .ora = &ora, .name = "", .step = 0, .rank = rank, .host = host };
++    var total_steps: usize = 0;
++    var argmax_ok: usize = 0;
++    var logits_ok: usize = 0;
++    var logits_n: usize = 0;
++    var all_ok = true;
++    var nb: [128]u8 = undefined;
++    for (prompts) |name| {
++        const ids_t = ora.get(try std.fmt.bufPrint(&nb, "{s}.ids", .{name})) orelse return error.NoIds;
++        const greedy_t = ora.get(try std.fmt.bufPrint(&nb, "{s}.greedy", .{name})) orelse return error.NoGreedy;
++        const am_t = ora.get(try std.fmt.bufPrint(&nb, "{s}.argmax", .{name})) orelse return error.NoArgmax;
++        const lg_t = ora.get(try std.fmt.bufPrint(&nb, "{s}.logits", .{name})) orelse return error.NoLogits;
++        const ids = std.mem.bytesAsSlice(i32, @as([]align(1) const u8, ids_t.bytes));
++        const greedy = std.mem.bytesAsSlice(i32, @as([]align(1) const u8, greedy_t.bytes));
++        const am = std.mem.bytesAsSlice(i32, @as([]align(1) const u8, am_t.bytes));
++        // the sequence the capture fed: the prompt, then each greedy token that was not EOS
++        var seq: std.ArrayList(i64) = .empty;
++        defer seq.deinit(gpa);
++        for (ids) |t| try seq.append(gpa, t);
++        for (greedy) |t| if (!w.full.isEos(@intCast(t))) try seq.append(gpa, t);
++        var ok_here: usize = 0;
++        var first_bad: ?usize = null;
++        cmp.name = name;
++        const nsteps = am.len;
++        for (0..nsteps) |step| {
++            cmp.step = step;
++            const deep = step < 4;
++            try model.forward(s, seq.items[step .. step + 1], step, logits, if (deep) .{ .hook = &hook, .ctx = &cmp } else null);
++            const got = mimo.forward.argmax(logits);
++            if (got == am[step]) ok_here += 1 else if (first_bad == null) first_bad = step;
++            if (step < lg_t.shape[0]) {
++                logits_n += 1;
++                const want = lg_t.bytes[step * V * 4 ..][0 .. V * 4];
++                if (std.mem.eql(u8, std.mem.sliceAsBytes(logits), want)) logits_ok += 1 else if (cmp.first_fail == null) {
++                    cmp.first_fail = try std.fmt.allocPrint(gpa, "{s}.logits[{d}]", .{ name, step });
++                    report(cmp.first_fail.?, std.mem.sliceAsBytes(logits), want, false);
++                }
++            }
++        }
++        total_steps += nsteps;
++        argmax_ok += ok_here;
++        if (first_bad != null) all_ok = false;
++        std.debug.print("[m1] rank {d} {s}: {d} steps, argmax equal at {d}{s}\n", .{ rank, name, nsteps, ok_here, if (first_bad) |b| try std.fmt.bufPrint(&nb, " (first difference at step {d})", .{b}) else "" });
++    }
++    const exact = all_ok and cmp.first_fail == null and logits_ok == logits_n;
++    std.debug.print("{s} m1 rank {d}: argmax {d}/{d} steps; logits byte-equal {d}/{d}; {d} layer captures checked{s}{s}\n", .{ if (exact) "PASS" else "FAIL", rank, argmax_ok, total_steps, logits_ok, logits_n, cmp.checked, if (cmp.first_fail) |f| "; first difference " else "", cmp.first_fail orelse "" });
++    return if (exact) 0 else 1;
++}
+diff --git a/zig/src/families/mimo_v2/root.zig b/zig/src/families/mimo_v2/root.zig
+index 341ea5ff..b182ae25 100644
+--- a/zig/src/families/mimo_v2/root.zig
++++ b/zig/src/families/mimo_v2/root.zig
+@@ -2,8 +2,12 @@
+ //! MiMo recipe's patches) ported launch for launch, after Jay Leaton's DeepSeek-V4.1 port. ZIG-PLAN.md gate Z2.
+ 
+ pub const config = @import("config.zig");
++pub const load = @import("load.zig");
++pub const forward = @import("forward.zig");
+ pub const Config = config.Config;
+ 
+ test {
+     _ = config;
++    _ = load;
++    _ = forward;
+ }
+-- 
+2.53.0
+

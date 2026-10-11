@@ -1,0 +1,39 @@
+From 2d5c3cb47bea1a4d2f84b35c1faa7ecbefed221a Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 15:42:56 +1100
+Subject: [PATCH 18/18] m1_run.sh: gate M1 on both ranks
+
+---
+ zig/src/families/mimo_v2/m1_run.sh | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+ create mode 100644 zig/src/families/mimo_v2/m1_run.sh
+
+diff --git a/zig/src/families/mimo_v2/m1_run.sh b/zig/src/families/mimo_v2/m1_run.sh
+new file mode 100644
+index 00000000..dc4640d2
+--- /dev/null
++++ b/zig/src/families/mimo_v2/m1_run.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++# Gate M1 (ZIG-PLAN Z2.6): tf-mimo m1 on both ranks (rank 1 on gx11 over the CX7 link, rank 0 here) against the
++# answer key. Run on gx10 with the serve stopped. Logs: ~/mimo/m1/m1-r{0,1}.log on each node.
++set -u
++WORKER=aj@10.100.128.2
++PORT=${PORT:-29620}
++args() {   # RANK ORACLE
++  echo "--rm --name mimo-m1 --gpus all --ipc=host --network host --shm-size 16g --device /dev/infiniband" \
++       "--cap-add IPC_LOCK --ulimit memlock=-1 --ulimit stack=67108864" \
++       "-e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 -e NCCL_IB_GID_INDEX=3" \
++       "-e TF_TP_WORLD=2 -e TF_TP_RANK=$1 -e TF_TP_MASTER=10.100.128.1 -e TF_TP_PORT=$PORT -e TF_COMM_BACKEND=nccl" \
++       "-v $HOME/models/mimo-v2.6/MiMo-V2.6-Flash-RL-exl3-3.0bpw:/model:ro -v $HOME/mimo:/mimo" \
++       "--entrypoint /mimo/m1/tf-mimo mimo-tf:latest m1 /model $2 /mimo/oracle/aot-sm121 ${CONTEXT:-4096}"
++}
++ssh -n "$WORKER" "docker rm -f mimo-m1 >/dev/null 2>&1; docker run $(args 1 /mimo/oracle/rank1.safetensors) > \$HOME/mimo/m1/m1-r1.log 2>&1" </dev/null &
++docker rm -f mimo-m1 >/dev/null 2>&1
++docker run $(args 0 /mimo/oracle/rank0.safetensors) > "$HOME/mimo/m1/m1-r0.log" 2>&1
++rc=$?
++wait
++echo "rank 0 rc $rc"
+-- 
+2.53.0
+

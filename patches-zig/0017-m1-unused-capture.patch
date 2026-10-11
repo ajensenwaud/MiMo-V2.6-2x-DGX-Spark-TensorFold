@@ -1,0 +1,24 @@
+From a5b0a6c2e4e13610627fbefa029614d8202efe36 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 15:34:46 +1100
+Subject: [PATCH 17/18] m1: unused capture
+
+---
+ zig/src/families/mimo_v2/m1_main.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index 9f4e5783..c8fd285d 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -149,6 +149,6 @@ pub fn main(init: std.process.Init) !u8 {
+         std.debug.print("[m1] rank {d} {s}: {d} steps, argmax equal at {d}{s}\n", .{ rank, name, nsteps, ok_here, if (first_bad) |b| try std.fmt.bufPrint(&nb, " (first difference at step {d})", .{b}) else "" });
+     }
+     const exact = all_ok and cmp.first_fail == null and logits_ok == logits_n;
+-    std.debug.print("{s} m1 rank {d}: argmax {d}/{d} steps; logits byte-equal {d}/{d}; {d} layer captures checked{s}{s}\n", .{ if (exact) "PASS" else "FAIL", rank, argmax_ok, total_steps, logits_ok, logits_n, cmp.checked, if (cmp.first_fail) |f| "; first difference " else "", cmp.first_fail orelse "" });
++    std.debug.print("{s} m1 rank {d}: argmax {d}/{d} steps; logits byte-equal {d}/{d}; {d} layer captures checked{s}{s}\n", .{ if (exact) "PASS" else "FAIL", rank, argmax_ok, total_steps, logits_ok, logits_n, cmp.checked, if (cmp.first_fail != null) "; first difference " else "", cmp.first_fail orelse "" });
+     return if (exact) 0 else 1;
+ }
+-- 
+2.53.0
+
