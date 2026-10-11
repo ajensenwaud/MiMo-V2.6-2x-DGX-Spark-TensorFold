@@ -1,7 +1,7 @@
 From f07a5e669fa6c4e5a2d331e431b891b52ab525be Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Sat, 10 Oct 2026 14:24:56 +0700
-Subject: [PATCH 05/27] TP tests: a drain on rank 0 then its clean stop ends
+Subject: [PATCH 05/33] TP tests: a drain on rank 0 then its clean stop ends
  rank 1's loop at the stop word with no fail-fast exit; a rank killed
  mid-drain still fails the other fast.
 

@@ -1,0 +1,25 @@
+From 368d6c903537726feed8ecfb95d80da982064432 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 20:36:23 +1100
+Subject: [PATCH 33/33] m1_run.sh: COMM, EXTRA_ENV
+
+---
+ zig/src/families/mimo_v2/m1_run.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/mimo_v2/m1_run.sh b/zig/src/families/mimo_v2/m1_run.sh
+index 60acd561..fe16c76b 100644
+--- a/zig/src/families/mimo_v2/m1_run.sh
++++ b/zig/src/families/mimo_v2/m1_run.sh
+@@ -8,7 +8,7 @@ args() {   # RANK ORACLE
+   echo "--rm --name mimo-m1 --gpus all --ipc=host --network host --shm-size 16g --device /dev/infiniband" \
+        "--cap-add IPC_LOCK --ulimit memlock=-1 --ulimit stack=67108864" \
+        "-e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 -e NCCL_IB_GID_INDEX=3" \
+-       "-e TF_TP_WORLD=2 -e TF_TP_RANK=$1 -e TF_TP_MASTER=10.100.128.1 -e TF_TP_PORT=$PORT -e TF_COMM_BACKEND=nccl" \
++       "-e TF_TP_WORLD=2 -e TF_TP_RANK=$1 -e TF_TP_MASTER=10.100.128.1 -e TF_TP_PORT=$PORT -e TF_COMM_BACKEND=${COMM:-nccl} -e TF_TP_ROCE_HCA=rocep1s0f0,roceP2p1s0f0 ${EXTRA_ENV:-}" \
+        "-v $HOME/models/mimo-v2.6/MiMo-V2.6-Flash-RL-exl3-3.0bpw:/model:ro -v $HOME/mimo:/mimo" \
+        "--entrypoint ${BIN:-/mimo/m1}/tf-mimo mimo-tf:latest ${MODE:-m1} /model $2 /mimo/oracle/${AOT:-aot2-sm121}" \
+        "$(case ${MODE:-m1} in windows|dflash) echo /mimo/oracle/${MODE}-r$1.json;; timing) echo;; *) echo ${CONTEXT:-4096};; esac)"
+-- 
+2.53.0
+

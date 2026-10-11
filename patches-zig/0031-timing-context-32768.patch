@@ -1,0 +1,27 @@
+From 83950ea5d250faa2cbe86e2a8bb4fc3880ec1e1d Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 20:26:23 +1100
+Subject: [PATCH 31/33] timing: context 32768
+
+---
+ zig/src/families/mimo_v2/m1_main.zig | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index a9c6d963..54fb7ad9 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -83,9 +83,8 @@ pub fn main(init: std.process.Init) !u8 {
+     }
+     const gpa = init.gpa;
+     const io = init.io;
+-    const context: usize = if (is_m1 and args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096;
++    const context: usize = if (is_timing) 32768 else if (is_m1 and args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096; // timing: graphs-3.0.json's context
+     const rows_max: usize = if (is_m1) 1 else 128;
+-    _ = is_timing;
+     const slots: usize = if (is_m1) 1 else 4;
+     const cfg = try tp.Config.fromEnv();
+     var driver = try cuda.Driver.open();
+-- 
+2.53.0
+

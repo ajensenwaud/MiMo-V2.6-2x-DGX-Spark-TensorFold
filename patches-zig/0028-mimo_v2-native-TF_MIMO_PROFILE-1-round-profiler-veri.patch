@@ -1,0 +1,105 @@
+From df723542dc7fae3d3d9e87e4ff5771a7212133b5 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 20:01:00 +1100
+Subject: [PATCH 28/33] mimo_v2 native: TF_MIMO_PROFILE=1 round profiler
+ (verify / forward / draft / outside)
+
+---
+ zig/src/families/mimo_v2/native.zig | 52 +++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index c4b6face..f48a34d9 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -190,6 +190,34 @@ pub const Lanes = struct {
+     shared: [32]lanes.config.Cost = undefined,
+     nshared: usize = 0,
+     draft_ms: f64 = 0,
++    prof: ?Prof = null, // TF_MIMO_PROFILE=1: where each round's wall time goes, logged every 200 verifies
++
++    const Prof = struct {
++        io: std.Io,
++        last_end: i96 = 0, // when the previous backend call returned
++        verify_ns: u64 = 0,
++        draft_ns: u64 = 0,
++        outside_ns: u64 = 0, // between backend calls: the lane core, HTTP, scheduling
++        fwd_ns: u64 = 0, // inside verify: Engine.forward (plan send + graph + argmax + copies)
++        verifies: u64 = 0,
++        drafts: u64 = 0,
++        rows: u64 = 0,
++        drafted: u64 = 0,
++
++        fn now(p: *Prof) i96 {
++            return std.Io.Clock.awake.now(p.io).toNanoseconds();
++        }
++        fn enter(p: *Prof) i96 {
++            const t = p.now();
++            if (p.last_end != 0 and t - p.last_end < 50_000_000) p.outside_ns += @intCast(t - p.last_end); // idle gaps excluded
++            return t;
++        }
++        fn report(p: *Prof) void {
++            const v: f64 = @floatFromInt(@max(p.verifies, 1));
++            std.log.info("mimo profile ({d} verifies): verify {d:.2} ms (forward {d:.2}), draft {d:.2} ms ({d} drafts), outside {d:.2} ms a round; {d:.2} rows and {d:.2} drafted rows a verify", .{ p.verifies, @as(f64, @floatFromInt(p.verify_ns)) / v / 1e6, @as(f64, @floatFromInt(p.fwd_ns)) / v / 1e6, @as(f64, @floatFromInt(p.draft_ns)) / v / 1e6, p.drafts, @as(f64, @floatFromInt(p.outside_ns)) / v / 1e6, @as(f64, @floatFromInt(p.rows)) / v, @as(f64, @floatFromInt(p.drafted)) / v });
++            p.* = .{ .io = p.io };
++        }
++    };
+ 
+     fn of(p: *anyopaque) *Lanes {
+         return @ptrCast(@alignCast(p));
+@@ -330,6 +358,18 @@ pub const Lanes = struct {
+     /// Every window's rows in one forward; each row drawn with its stream's sampling at its keyed position.
+     fn verifyFn(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
+         const l = of(p);
++        const t0: i96 = if (l.prof) |*pr| pr.enter() else 0;
++        defer if (l.prof) |*pr| {
++            const t1 = pr.now();
++            pr.verify_ns += @intCast(t1 - t0);
++            pr.verifies += 1;
++            pr.last_end = t1;
++            for (windows) |w| {
++                pr.rows += w.rows();
++                pr.drafted += w.rows() - 1;
++            }
++            if (pr.verifies == 200) pr.report();
++        };
+         var rows: [fwd.DECODE_ROWS]fwd.Row = undefined;
+         var n: usize = 0;
+         for (windows) |w| {
+@@ -347,7 +387,9 @@ pub const Lanes = struct {
+         for (windows) |w| if (w.stream.sampling) |sm| if (sm.temperature > 0) {
+             all_greedy = false;
+         };
++        const tf: i96 = if (l.prof) |*pr| pr.now() else 0;
+         try l.e.forward(rows[0..n], if (all_greedy) .ids else .logits);
++        if (l.prof) |*pr| pr.fwd_ns += @intCast(pr.now() - tf);
+         var r0: usize = 0;
+         for (windows, out) |w, *o| {
+             const lane = l.lanes.getPtr(w.stream).?;
+@@ -367,6 +409,13 @@ pub const Lanes = struct {
+     /// One draft pass for every request that asks for drafts (their contexts are fed already).
+     fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
+         const l = of(p);
++        const t0: i96 = if (l.prof) |*pr| pr.enter() else 0;
++        defer if (l.prof) |*pr| {
++            const t1 = pr.now();
++            pr.draft_ns += @intCast(t1 - t0);
++            pr.drafts += 1;
++            pr.last_end = t1;
++        };
+         const dr = l.e.dr orelse return error.NoDraftHead;
+         var toks: [16]i64 = undefined;
+         var pos0: [16]u32 = undefined;
+@@ -469,6 +518,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     errdefer gpa.destroy(own);
+     own.* = .{ .gpa = gpa, .e = e, .l = .{ .gpa = gpa, .e = e, .free = if (slots == 32) ~@as(u32, 0) else (@as(u32, 1) << @intCast(slots)) - 1 }, .session = session };
+     try own.l.measure(io);
++    if (env("TF_MIMO_PROFILE")) |v| if (v.len > 0 and v[0] == '1') {
++        own.l.prof = .{ .io = io };
++    };
+     return .{
+         .backend = own.l.backend(),
+         .facts = own.l.facts(),
+-- 
+2.53.0
+

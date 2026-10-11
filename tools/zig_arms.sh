@@ -6,7 +6,7 @@ T=$HOME/mimo/recipe/tools
 arm() {   # NAME, then env for zig_serve.sh
   local name=$1; shift
   echo "=== $name ($*)"
-  env "$@" CONTEXT=608256 bash $T/zig_serve.sh || { echo "$name: no serve"; bash $T/zig_serve.sh stop; return; }
+  env "$@" CONTEXT=608256 BIN=/mimo/zig-out-z7 bash $T/zig_serve.sh || { echo "$name: no serve"; bash $T/zig_serve.sh stop; return; }
   docker logs mimo-zig 2>&1 | grep "mimo costs"
   docker run --rm --network host --user 1000:1000 -v $HOME/mimo:/mimo --entrypoint python3 mimo-tf:latest \
     /mimo/recipe/tools/mimo_zig_replies.py http://localhost:8892 /mimo/oracle/rank0.safetensors 2>&1 | tail -1
@@ -16,7 +16,7 @@ arm() {   # NAME, then env for zig_serve.sh
   docker logs mimo-zig > $HOME/mimo/logs/z7-$name-serve.log 2>&1
   bash $T/zig_serve.sh stop
 }
-arm device-argmax BIN=/mimo/zig-out-z7 COMM=nccl
-arm device-argmax-roce BIN=/mimo/zig-out-z7 COMM=roce
+# usage: zig_arms.sh NAME [VAR=value ...]   (one arm a call; the Python serve restarts at the end)
+arm "$@"
 cd $HOME/mimo/recipe && ./start.sh 2>&1 | tail -1
 echo "=== done"

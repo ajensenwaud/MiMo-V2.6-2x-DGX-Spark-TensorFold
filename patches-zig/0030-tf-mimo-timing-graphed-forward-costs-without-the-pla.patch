@@ -1,0 +1,105 @@
+From c9e93b74b3b8956dd2ce5e6c45c5957da67da767 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 20:25:06 +1100
+Subject: [PATCH 30/33] tf-mimo timing: graphed forward costs without the plan
+ link, drafter off/on
+
+---
+ zig/src/families/mimo_v2/m1_main.zig | 44 ++++++++++++++++++++++++++--
+ zig/src/families/mimo_v2/m1_run.sh   |  4 +--
+ 2 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index d52f666c..a9c6d963 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -71,18 +71,21 @@ pub fn main(init: std.process.Init) !u8 {
+     const is_dfl = args.len >= 6 and std.mem.eql(u8, args[1], "dflash");
+     const is_drafted = args.len >= 5 and std.mem.eql(u8, args[1], "drafted");
+     const is_follow = args.len >= 4 and std.mem.eql(u8, args[1], "follow");
+-    if (!is_m1 and !is_win and !is_dfl and !is_drafted and !is_follow) {
++    const is_timing = args.len >= 5 and std.mem.eql(u8, args[1], "timing");
++    if (!is_m1 and !is_win and !is_dfl and !is_drafted and !is_follow and !is_timing) {
+         std.debug.print("usage: tf-mimo m1 MODEL ORACLE(rank<R>.safetensors) AOT_DIR [CONTEXT]\n" ++
+             "       tf-mimo windows MODEL ORACLE AOT_DIR WINDOWS_JSON(windows-r<R>.json)\n" ++
+             "       tf-mimo dflash MODEL ORACLE AOT_DIR DFLASH_JSON(dflash-r<R>.json)\n" ++
+             "       tf-mimo drafted MODEL ORACLE AOT_DIR\n" ++
+-            "       tf-mimo follow MODEL AOT_DIR   (TP rank 1 behind tensorfold-native serve on rank 0)\n", .{});
++            "       tf-mimo follow MODEL AOT_DIR   (TP rank 1 behind tensorfold-native serve on rank 0)\n" ++
++            "       tf-mimo timing MODEL ORACLE AOT_DIR   (both ranks: graphed forward costs, drafter off then on)\n", .{});
+         return 2;
+     }
+     const gpa = init.gpa;
+     const io = init.io;
+     const context: usize = if (is_m1 and args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096;
+     const rows_max: usize = if (is_m1) 1 else 128;
++    _ = is_timing;
+     const slots: usize = if (is_m1) 1 else 4;
+     const cfg = try tp.Config.fromEnv();
+     var driver = try cuda.Driver.open();
+@@ -112,6 +115,15 @@ pub fn main(init: std.process.Init) !u8 {
+     var ora = try core.safetensors.File.open(gpa, io, args[3]);
+     defer ora.close(io);
+     if (is_win) return windows(gpa, io, &model, s, &ora, args[5], rank);
++    if (std.mem.eql(u8, args[1], "timing")) {
++        try timing(io, &model, s, rank, "drafter off");
++        const ddir = try std.fmt.allocPrint(gpa, "{s}/dflash", .{args[2]});
++        defer gpa.free(ddir);
++        model.dr = try mimo.dflash.Drafter.init(gpa, io, &model, ddir, s);
++        defer model.dr.?.deinit();
++        try timing(io, &model, s, rank, "drafter on");
++        return 0;
++    }
+     if (is_dfl or is_drafted) {
+         const ddir = try std.fmt.allocPrint(gpa, "{s}/dflash", .{args[2]});
+         defer gpa.free(ddir);
+@@ -472,3 +484,31 @@ fn follow(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, session: *t
+     std.debug.print("[follow] stopped after {d} steps\n", .{steps});
+     return 0;
+ }
++
++/// Graphed forward costs with no plan link (both ranks run the same loop): per forward, the whole step (stage +
++/// replay + sync, logits not read) and the device argmax readback, for 1, 4 and 8 rows at position 9,000 with
++/// distinct tokens, after a capture and warm-up.
++fn timing(io: std.Io, model: *mimo.forward.Model, s: cuda.Stream, rank: usize, label: []const u8) !void {
++    var rng = std.Random.DefaultPrng.init(7);
++    var rows: [8]mimo.forward.Row = undefined;
++    var ids: [8]i32 = undefined;
++    const reps = 40;
++    for ([_]usize{ 1, 4, 8 }) |n| {
++        for (0..n) |j| rows[j] = .{ .slot = 0, .pos = @intCast(9000 + j), .token = 1000 };
++        try model.graphed(s, rows[0..n], null);
++        try model.graphed(s, rows[0..n], null);
++        var t_step: i96 = 0;
++        var t_am: i96 = 0;
++        for (0..reps) |_| {
++            for (0..n) |j| rows[j].token = @intCast(1000 + rng.random().uintLessThan(usize, 140000));
++            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++            try model.graphed(s, rows[0..n], null);
++            const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
++            try model.argmaxTo(s, n, ids[0..n]);
++            const t2 = std.Io.Clock.awake.now(io).toNanoseconds();
++            t_step += t1 - t0;
++            t_am += t2 - t1;
++        }
++        std.debug.print("[timing] rank {d} {s}: {d} rows: step {d:.2} ms, argmax readback {d:.3} ms\n", .{ rank, label, n, @as(f64, @floatFromInt(t_step)) / 1e6 / reps, @as(f64, @floatFromInt(t_am)) / 1e6 / reps });
++    }
++}
+diff --git a/zig/src/families/mimo_v2/m1_run.sh b/zig/src/families/mimo_v2/m1_run.sh
+index 9d0bfa60..60acd561 100644
+--- a/zig/src/families/mimo_v2/m1_run.sh
++++ b/zig/src/families/mimo_v2/m1_run.sh
+@@ -10,8 +10,8 @@ args() {   # RANK ORACLE
+        "-e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 -e NCCL_IB_GID_INDEX=3" \
+        "-e TF_TP_WORLD=2 -e TF_TP_RANK=$1 -e TF_TP_MASTER=10.100.128.1 -e TF_TP_PORT=$PORT -e TF_COMM_BACKEND=nccl" \
+        "-v $HOME/models/mimo-v2.6/MiMo-V2.6-Flash-RL-exl3-3.0bpw:/model:ro -v $HOME/mimo:/mimo" \
+-       "--entrypoint /mimo/m1/tf-mimo mimo-tf:latest ${MODE:-m1} /model $2 /mimo/oracle/${AOT:-aot2-sm121}" \
+-       "$(case ${MODE:-m1} in windows|dflash) echo /mimo/oracle/${MODE}-r$1.json;; *) echo ${CONTEXT:-4096};; esac)"
++       "--entrypoint ${BIN:-/mimo/m1}/tf-mimo mimo-tf:latest ${MODE:-m1} /model $2 /mimo/oracle/${AOT:-aot2-sm121}" \
++       "$(case ${MODE:-m1} in windows|dflash) echo /mimo/oracle/${MODE}-r$1.json;; timing) echo;; *) echo ${CONTEXT:-4096};; esac)"
+ }
+ ssh -n "$WORKER" "docker rm -f mimo-m1 >/dev/null 2>&1; docker run $(args 1 /mimo/oracle/rank1.safetensors) > \$HOME/mimo/m1/${MODE:-m1}-r1.log 2>&1" </dev/null &
+ docker rm -f mimo-m1 >/dev/null 2>&1
+-- 
+2.53.0
+

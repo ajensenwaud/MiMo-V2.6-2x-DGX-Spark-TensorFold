@@ -1,0 +1,112 @@
+From 9821b3cbf3660607baad429c599b31911e6050b6 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 20:33:40 +1100
+Subject: [PATCH 32/33] mimo_v2: open TP sessions with the RoCE mailbox kernel
+ (tp_kernel, shared by tf-tp-test); RoCE was falling back to NCCL with
+ NoKernel
+
+---
+ zig/build/cuda.zig                   |  4 ++++
+ zig/build/tp.zig                     | 18 ++++++++++++++----
+ zig/src/families/mimo_v2/m1_main.zig |  2 +-
+ zig/src/families/mimo_v2/native.zig  |  2 +-
+ 4 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 1cf02ea0..05a3e4f9 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -133,7 +133,9 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     mimo_mod.addImport("core", mods.core);
+     mimo_mod.addImport("tp", tp_mod);
+     mimo_mod.addImport("lanes", mods.lanes);
++    mimo_mod.addImport("tp_kernel", @import("tp.zig").mailboxModule(b));
+     const mimo_exe = b.createModule(.{ .root_source_file = b.path("zig/src/families/mimo_v2/m1_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    mimo_exe.addImport("tp_kernel", @import("tp.zig").mailboxModule(b));
+     mimo_exe.addImport("cuda", cuda);
+     mimo_exe.addImport("core", mods.core);
+     mimo_exe.addImport("tp", tp_mod);
+@@ -163,6 +165,7 @@ fn mimoModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
+     m.addImport("core", core);
+     m.addImport("lanes", lanes);
+     m.addImport("tp", @import("tp.zig").module(b, target, optimize, cuda));
++    m.addImport("tp_kernel", @import("tp.zig").mailboxModule(b));
+     return m;
+ }
+ 
+@@ -221,6 +224,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     mimo.addImport("core", mods.core);
+     mimo.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+     mimo.addImport("lanes", mods.lanes);
++    mimo.addImport("tp_kernel", @import("tp.zig").mailboxModule(b));
+     const mimo_test = b.addRunArtifact(b.addTest(.{ .root_module = mimo }));
+     step.dependOn(&mimo_test.step);
+     b.step("test-mimo", "MiMo-V2 family host tests").dependOn(&mimo_test.step);
+diff --git a/zig/build/tp.zig b/zig/build/tp.zig
+index f5dacc46..f325adfa 100644
+--- a/zig/build/tp.zig
++++ b/zig/build/tp.zig
+@@ -39,20 +39,30 @@ fn kernelModule(b: *std.Build, image: ?std.Build.LazyPath) *std.Build.Module {
+     return b.createModule(.{ .root_source_file = wf.add("tp_kernel.zig", "pub const mailbox: []const u8 = \"\";\n") });
+ }
+ 
++var mailbox_module: ?*std.Build.Module = null;
++
++/// `tp_kernel` (the mailbox fatbin from -Dtp-nvcc / -Dtp-fatbin, or empty), declared once and shared by every runner
++/// that opens a TP session with RoCE (tf-tp-test, the MiMo family).
++pub fn mailboxModule(b: *std.Build) *std.Build.Module {
++    if (mailbox_module) |m| return m;
++    const nvcc = b.option([]const u8, "tp-nvcc", "nvcc that builds the TP mailbox kernel");
++    const prebuilt = b.option([]const u8, "tp-fatbin", "absolute path of a prebuilt tp_mailbox.fatbin to embed");
++    const image: ?std.Build.LazyPath = if (prebuilt) |p| b.graph.cwdRelativePath(p) else if (nvcc) |tool| mailboxFatbin(b, tool) else null;
++    mailbox_module = kernelModule(b, image);
++    return mailbox_module.?;
++}
++
+ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, test_step: *std.Build.Step) void {
+     const host = b.graph.host;
+     const tests = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, runtime(b, host, .debug)) }));
+     b.step("test-tp", "Tensor parallelism's host tests: bootstrap, fate channel, in-process ranks (no GPU)").dependOn(&tests.step);
+     test_step.dependOn(&tests.step);
+     if (target.result.os.tag != .linux) return;
+-    const nvcc = b.option([]const u8, "tp-nvcc", "nvcc that builds the TP mailbox kernel");
+-    const prebuilt = b.option([]const u8, "tp-fatbin", "absolute path of a prebuilt tp_mailbox.fatbin to embed");
+-    const image: ?std.Build.LazyPath = if (prebuilt) |p| b.graph.cwdRelativePath(p) else if (nvcc) |tool| mailboxFatbin(b, tool) else null;
+     const cuda = runtime(b, target, optimize);
+     const runner = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/tp/gpu_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     runner.addImport("cuda", cuda);
+     runner.addImport("tp", module(b, target, optimize, cuda));
+-    runner.addImport("tp_kernel", kernelModule(b, image));
++    runner.addImport("tp_kernel", mailboxModule(b));
+     const exe = b.addExecutable(.{ .name = "tf-tp-test", .root_module = runner });
+     b.installArtifact(exe);
+     b.step("tf-tp-test", "TP=2 on two GPUs: bootstrap, every collective bit-exact, graph capture, fail-fast, latency").dependOn(&b.addInstallArtifact(exe, .{}).step);
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index 54fb7ad9..5b21c425 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init) !u8 {
+     defer ctx.deinit();
+     var session: tp.Session = undefined;
+     const world: usize = cfg.world;
+-    if (world > 1) try session.open(&driver, cfg, "");
++    if (world > 1) try session.open(&driver, cfg, @import("tp_kernel").mailbox);
+     defer if (world > 1) session.close();
+     const rank: usize = cfg.rank;
+     if (is_follow) return follow(gpa, io, &driver, &session, args[2], args[3]);
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index 6db34ed8..aec7de40 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -517,7 +517,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         if (c.rank != 0) return error.FollowerServes; // rank 1 runs `tf-mimo follow`
+         const ss = try gpa.create(tp.Session);
+         errdefer gpa.destroy(ss);
+-        try ss.open(ctx.d, c, "");
++        try ss.open(ctx.d, c, @import("tp_kernel").mailbox); // RoCE needs the mailbox kernel (TF_COMM_BACKEND=roce)
+         session = ss;
+         const h = hello(o.context, slots, o.drafts);
+         try ss.plan.send(&h);
+-- 
+2.53.0
+

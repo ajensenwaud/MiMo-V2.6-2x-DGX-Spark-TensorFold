@@ -7,9 +7,9 @@ PORT=${PORT:-8892}
 CONTEXT=${CONTEXT:-65536}
 TP_PORT=${TP_PORT:-29661}
 AOT=${AOT:-/mimo/oracle/aot4-sm121}
-COMM=${COMM:-nccl}           # nccl or roce (identical bytes: all-gathers only move data)
+COMM=${COMM:-roce}           # roce (default: one-shot RoCE, Jay Leaton's mailbox kernel) or nccl; identical bytes
 BIN=${BIN:-/mimo/zig-engine/zig-out}
-EXTRA_ENV=${EXTRA_ENV:-}       # e.g. "-e TF_MIMO_HOST_ARGMAX=1"
+EXTRA_ENV=${EXTRA_ENV:--e TF_TP_ROCE_FAST=1}   # RoCE fast pollers; e.g. add "-e TF_MIMO_HOST_ARGMAX=1"
 MODEL=$HOME/models/mimo-v2.6/MiMo-V2.6-Flash-RL-exl3-3.0bpw
 common() {   # RANK
   echo "--gpus all --ipc=host --network host --shm-size 16g --device /dev/infiniband --cap-add IPC_LOCK" \

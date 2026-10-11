@@ -1,0 +1,90 @@
+From ebd09f201add518f8a9f07a20e6416cfdb6dd816 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 20:10:51 +1100
+Subject: [PATCH 29/33] mimo_v2 native: price windows with distinct tokens per
+ row (identical rows share experts and underprice wide windows)
+
+---
+ zig/src/families/mimo_v2/native.zig | 45 +++++++++++++++++++----------
+ 1 file changed, 30 insertions(+), 15 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index f48a34d9..6db34ed8 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -249,42 +249,57 @@ pub const Lanes = struct {
+     }
+ 
+     /// Forward costs at load (graphed, after a warm-up): one stream's windows of 1 .. block rows, shared windows of
+-    /// 2 .. 32 rows over up to `slots` streams, and a one-stream draft pass. Rows land at positions 64 .. of each slot
+-    /// (every stream's prefill overwrites them).
++    /// 2 .. 32 rows over up to `slots` streams, and a one-stream draft pass. Every row carries a different token
++    /// (a fixed pseudo-random sequence), so rows route to different experts as text does: identical rows share their
++    /// experts and price wide windows far too cheaply (measured: 2.8 ms a row vs 6.5 ms serving). Rows land at
++    /// positions 64 .. of each slot (every stream's prefill overwrites them).
+     pub fn measure(l: *Lanes, io: std.Io) !void {
+         const e = l.e;
+         const B: usize = if (e.dr) |dr| dr.block else 1;
+         var rows: [32]fwd.Row = undefined;
+         const reps = 6;
++        var rng = std.Random.DefaultPrng.init(0x31A0);
++        const V = e.w.full.vocab;
+         for (1..B + 1) |w| {
+-            for (0..w) |j| rows[j] = .{ .slot = 0, .pos = @intCast(64 + j), .token = 1000 };
+-            l.costs[w - 1] = .{ .width = @intCast(w), .ms = try l.time(io, rows[0..w], reps) };
++            for (0..w) |j| rows[j] = .{ .slot = 0, .pos = @intCast(64 + j), .token = 0 };
++            l.costs[w - 1] = .{ .width = @intCast(w), .ms = try l.time(io, rows[0..w], reps, &rng, V) };
+         }
+         l.nshared = 0;
+         const S = e.model.slots;
+         for (2..33) |n| {
+-            for (0..n) |j| rows[j] = .{ .slot = @intCast(j % S), .pos = @intCast(64 + j / S), .token = 1000 };
+-            l.shared[l.nshared] = .{ .width = @intCast(n), .ms = try l.time(io, rows[0..n], reps) };
++            for (0..n) |j| rows[j] = .{ .slot = @intCast(j % S), .pos = @intCast(64 + j / S), .token = 0 };
++            l.shared[l.nshared] = .{ .width = @intCast(n), .ms = try l.time(io, rows[0..n], reps, &rng, V) };
+             l.nshared += 1;
+         }
+-        if (e.dr) |dr| {
++        if (e.dr != null) {
+             var out: [16]i32 = undefined;
+             try e.draft(&.{1000}, &.{64}, &.{0}, &out);
+             const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+-            for (0..reps) |_| try e.draft(&.{1000}, &.{64}, &.{0}, &out);
++            for (0..reps) |i| try e.draft(&.{@intCast(1000 + 7919 * i)}, &.{64}, &.{0}, &out);
+             l.draft_ms = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6 / reps;
+-            _ = dr;
+         }
+-        std.log.info("mimo costs: window ms {d:.2} .. {d:.2} (1 .. {d} rows), shared 32 rows {d:.2}, draft {d:.2}", .{ l.costs[0].ms, l.costs[B - 1].ms, B, l.shared[l.nshared - 1].ms, l.draft_ms });
++        std.log.info("mimo costs (distinct tokens): window ms {d:.2} .. {d:.2} (1 .. {d} rows), shared 8 / 16 / 32 rows {d:.2} / {d:.2} / {d:.2}, draft {d:.2}", .{ l.costs[0].ms, l.costs[B - 1].ms, B, l.shared[6].ms, l.shared[14].ms, l.shared[l.nshared - 1].ms, l.draft_ms });
+     }
+ 
+-    fn time(l: *Lanes, io: std.Io, rows: []const fwd.Row, reps: usize) !f64 {
++    /// Mean ms of `reps` graphed forwards of `rows` (positions and slots fixed), each with fresh pseudo-random tokens.
++    fn time(l: *Lanes, io: std.Io, rows: []fwd.Row, reps: usize, rng: *std.Random.DefaultPrng, V: usize) !f64 {
++        const fill = struct {
++            fn f(rs: []fwd.Row, r: *std.Random.DefaultPrng, v: usize) void {
++                for (rs) |*x| x.token = @intCast(1000 + r.random().uintLessThan(usize, v - 2000));
++            }
++        }.f;
++        fill(rows, rng, V);
+         try l.e.forward(rows, .ids); // capture
+         try l.e.s.synchronize();
+-        const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+-        for (0..reps) |_| try l.e.forward(rows, .ids);
+-        try l.e.s.synchronize();
+-        return @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6 / @as(f64, @floatFromInt(reps));
++        var total: i96 = 0;
++        for (0..reps) |_| {
++            fill(rows, rng, V);
++            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++            try l.e.forward(rows, .ids);
++            try l.e.s.synchronize();
++            total += std.Io.Clock.awake.now(io).toNanoseconds() - t0;
++        }
++        return @as(f64, @floatFromInt(total)) / 1e6 / @as(f64, @floatFromInt(reps));
+     }
+ 
+     fn take(l: *Lanes, token: u32) u64 {
+-- 
+2.53.0
+

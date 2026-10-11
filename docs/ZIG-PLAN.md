@@ -270,6 +270,22 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
 - Python (same preset, earlier night): code 83.0 / 91.4, chat 52.9 / 85.1. Zig now ahead on code and agent at 4
   streams; behind on chat (1 and 4 streams) and on prefill (Z6).
 
-**Next:** Z7 draft-width tuning for MiMo (chat/report acceptance under lanes' rule vs Python's joint_widths), then
-Z6 prompt path.
-
+### Z7, session 8 (Python serve down in short idle windows, restarted after each)
+- Round profiler (`TF_MIMO_PROFILE=1`): no time outside backend calls (0.00 ms a round); serving windows cost more
+  than load-time costs said (2.8-row verify 36.2 ms vs ~29 predicted; 4 streams 16.9 rows 99 ms vs 32 rows 68 ms).
+  Cause: costs were timed with one token in every row, so all rows shared 8 experts. **Fixed: distinct pseudo-random
+  tokens per row** (8 rows 59.7 ms, shared 32 rows 141.8 ms). Served: 2 streams +2 to +10%, 1 and 4 within noise.
+- `tf-mimo timing` (no plan link, both ranks, position 9,000, context 32K): graphed 1 row 23.99 ms (drafter +0.5 ms;
+  argmax readback 0.06 ms) vs the Python engine's 21.6 ms on this pack (results/tp2/graphs-3.0.json: 46.27 tok/s).
+- **The RoCE arm had been NCCL**: sessions opened without the mailbox kernel (`tp roce: device setup failed:
+  NoKernel`, silent fallback). Fixed: `tp_kernel` (the mailbox fatbin, -Dtp-nvcc) shared by tf-tp-test and the MiMo
+  modules. RoCE with fast pollers (TF_TP_ROCE_FAST=1): **1 row 22.43 ms (-6.5%)**. Exactness: windows gate 1,905/1,905
+  on both ranks, replies 8/8.
+- **Kept: RoCE fast pollers by default** (`tools/zig_serve.sh`). Served, tok/s a stream (aggregate) at 1 / 2 / 4:
+  chat 49.9 / 32.0 (61.5) / 21.4 (77.9); code 75.4 / 50.4 (94.6) / 31.8 (119.5); agent 55.0 / 41.2 (74.6) / 23.4
+  (84.7); report 50.5 / 32.0 (61.9) / 22.5 (85.4). Python: chat 52.9 / 85.1 agg, code 83.0 / 91.4, agent 60.6,
+  report 50.2. Zig ahead: code and report at 4 streams (+31%, n/a), report at 1. Behind: chat (-6% / -8%), agent and
+  code at 1 stream.
+- Open: draft pass 7.9 ms on RoCE vs 6.5 on NCCL, and 32-row shared windows 165 vs 142 ms: large messages (the
+  drafter's head gather, ~2 MB) look slower on the mailbox path; try TF_TP_MAILBOX_MAX_KB (Python: 512) and graphing
+  the draft pass (Python: 7.0 -> 6.05 ms). Then the per-row gap to Python (22.4 vs 21.6 ms) and Z6.
