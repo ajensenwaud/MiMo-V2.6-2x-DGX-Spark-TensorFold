@@ -1,0 +1,39 @@
+From 5278f668231a05c737928103f56471ab03fb53de Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 16:21:13 +1100
+Subject: [PATCH 20/20] m1_run.sh: MODE=windows
+
+---
+ zig/src/families/mimo_v2/m1_run.sh | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/m1_run.sh b/zig/src/families/mimo_v2/m1_run.sh
+index dc4640d2..0fea103e 100644
+--- a/zig/src/families/mimo_v2/m1_run.sh
++++ b/zig/src/families/mimo_v2/m1_run.sh
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env bash
+-# Gate M1 (ZIG-PLAN Z2.6): tf-mimo m1 on both ranks (rank 1 on gx11 over the CX7 link, rank 0 here) against the
++# Gates M1 / Z3 (ZIG-PLAN): tf-mimo m1 (default) or MODE=windows on both ranks (rank 1 on gx11 over the CX7 link, rank 0 here) against the
+ # answer key. Run on gx10 with the serve stopped. Logs: ~/mimo/m1/m1-r{0,1}.log on each node.
+ set -u
+ WORKER=aj@10.100.128.2
+@@ -10,11 +10,12 @@ args() {   # RANK ORACLE
+        "-e NCCL_SOCKET_IFNAME=enp1s0f0np0 -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 -e NCCL_IB_GID_INDEX=3" \
+        "-e TF_TP_WORLD=2 -e TF_TP_RANK=$1 -e TF_TP_MASTER=10.100.128.1 -e TF_TP_PORT=$PORT -e TF_COMM_BACKEND=nccl" \
+        "-v $HOME/models/mimo-v2.6/MiMo-V2.6-Flash-RL-exl3-3.0bpw:/model:ro -v $HOME/mimo:/mimo" \
+-       "--entrypoint /mimo/m1/tf-mimo mimo-tf:latest m1 /model $2 /mimo/oracle/aot-sm121 ${CONTEXT:-4096}"
++       "--entrypoint /mimo/m1/tf-mimo mimo-tf:latest ${MODE:-m1} /model $2 /mimo/oracle/${AOT:-aot2-sm121}" \
++       "$([ "${MODE:-m1}" = windows ] && echo /mimo/oracle/windows-r$1.json || echo ${CONTEXT:-4096})"
+ }
+-ssh -n "$WORKER" "docker rm -f mimo-m1 >/dev/null 2>&1; docker run $(args 1 /mimo/oracle/rank1.safetensors) > \$HOME/mimo/m1/m1-r1.log 2>&1" </dev/null &
++ssh -n "$WORKER" "docker rm -f mimo-m1 >/dev/null 2>&1; docker run $(args 1 /mimo/oracle/rank1.safetensors) > \$HOME/mimo/m1/${MODE:-m1}-r1.log 2>&1" </dev/null &
+ docker rm -f mimo-m1 >/dev/null 2>&1
+-docker run $(args 0 /mimo/oracle/rank0.safetensors) > "$HOME/mimo/m1/m1-r0.log" 2>&1
++docker run $(args 0 /mimo/oracle/rank0.safetensors) > "$HOME/mimo/m1/${MODE:-m1}-r0.log" 2>&1
+ rc=$?
+ wait
+ echo "rank 0 rc $rc"
+-- 
+2.53.0
+

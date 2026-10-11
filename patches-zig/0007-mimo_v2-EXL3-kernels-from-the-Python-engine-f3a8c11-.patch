@@ -1,7 +1,7 @@
 From 630ac6d6bcccd46c260fcd78dcf6d5124b910a49 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 13:35:18 +1100
-Subject: [PATCH 07/18] mimo_v2: EXL3 kernels from the Python engine (f3a8c11),
+Subject: [PATCH 07/20] mimo_v2: EXL3 kernels from the Python engine (f3a8c11),
  built as fatbins with its extension flags; SASS check
 
 ---

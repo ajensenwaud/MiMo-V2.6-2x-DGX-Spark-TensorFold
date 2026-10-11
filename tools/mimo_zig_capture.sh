@@ -16,7 +16,7 @@ args() {   # TOOLS_DIR RANK
        "-e NCCL_MIN_NCHANNELS=4 -e NCCL_MAX_NCHANNELS=4 -e TF_ROCE_MAX_KB=512 $rec" \
        "-v $HOME/models/mimo-v2.6/MiMo-V2.6-Flash-RL-exl3-3.0bpw:/model:ro -v $HOME/.cache/mimo-tf:/root/.cache" \
        "-v $OUT:/out -v $1:/tools:ro --entrypoint env mimo-tf:latest -u TORCH_ALLOW_TF32_CUBLAS_OVERRIDE python3" \
-       "/tools/mimo_zig_capture.py /model /out --tp 2 --rank $2 ${EXTRA:-}" \
+       "/tools/${SCRIPT:-mimo_zig_capture.py} /model ${ORACLE_ARG:+/out/rank$2.safetensors} /out --tp 2 --rank $2 ${EXTRA:-}" \
        "$([ "${RECORD:-0}" = 1 ] && echo --tools /zigtools)"
 }
 mkdir -p "$OUT"

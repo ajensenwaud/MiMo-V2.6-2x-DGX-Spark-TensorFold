@@ -1,7 +1,7 @@
 From 619ce26fe58f5a9a179478333a21660985428c2a Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Sat, 10 Oct 2026 14:24:18 +0700
-Subject: [PATCH 03/18] A failed CUDA kernel launch names its kernel and launch
+Subject: [PATCH 03/20] A failed CUDA kernel launch names its kernel and launch
  configuration; CUresult names fall back to a table when the driver cannot
  answer.
 

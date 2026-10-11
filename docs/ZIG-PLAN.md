@@ -190,5 +190,17 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
   every layer's attention and MLP at steps 0-3, attention outputs at layers 0 and 1). Logs: `results/zig-m1/`.
 - Known nit: rank 1 exits 70 through fail-fast when rank 0 finishes first (no stop announcement yet).
 
-**Next:** Z3 (decode windows up to 4 streams, keyed graphs, graphs == eager; prompt path), then Z4 (DFlash). The
-plan's fallback for Z2 (numeric gate) is not needed.
+### 2026-10-11 (session 4; serve down ~12 min in two idle windows, restarted)
+- **Z3 decode windows + graphs passed on the first run.** `forward.zig`: rows of up to 4 slots at their own positions
+  (`Row`), staged inputs, `run` (capture-safe: no host work), `graphed` (graphs.Graphs: key (rows, bucket), warm-up
+  run then stream capture, chains wider than 32 rows eager). Python reference `tools/mimo_zig_windows.py`: 260
+  rounds of 4 streams teacher-forced from the answer key in widths 1-32 a stream (4-64 rows a window), alternating
+  graphed / eager cycles. Python itself: batched == serial (argmax 1,905/1,905, logits hash 128/128), rank 0 == rank 1.
+  **Zig (`tf-mimo windows`, both ranks): logits hash-equal to Python's window 1,905/1,905, argmax equal to the serial
+  answer key 1,905/1,905; 136 graphed rounds = 17 captures + 119 replays, as Python.** Kernel set `aot2-sm121`:
+  23 Triton specialisations (decode 1-row set included). Logs: `results/zig-z3/`.
+- Scope change: Z3.2 (prompt path) moves to Z6. Python serves prompts on its prompt kernels (EXL3 prompt GEMM,
+  full-attention prompt kernel, per-expert prompt GEMM), whose bits differ from decode rows, so an exact Zig prompt
+  path means porting those, not reusing decode windows. Z3.3 (spark-bench arm) needs the server: after Z5.
+
+**Next:** Z4 (DFlash drafter: drafted == plain), Z5 (server on :8892), Z6 (prompt path exact), then speed (Z7/Z8).

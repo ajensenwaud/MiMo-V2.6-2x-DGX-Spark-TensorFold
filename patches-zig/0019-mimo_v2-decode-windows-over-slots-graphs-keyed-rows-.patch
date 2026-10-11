@@ -1,0 +1,403 @@
+From a25e46a0213dcd2283f633bec2c50847e7453ece Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 16:19:24 +1100
+Subject: [PATCH 19/20] mimo_v2: decode windows over slots, graphs keyed (rows,
+ bucket), tf-mimo windows
+
+---
+ zig/src/families/mimo_v2/forward.zig | 161 +++++++++++++++++++++------
+ zig/src/families/mimo_v2/m1_main.zig |  99 +++++++++++++++-
+ 2 files changed, 218 insertions(+), 42 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/forward.zig b/zig/src/families/mimo_v2/forward.zig
+index c2ef8c9b..22612989 100644
+--- a/zig/src/families/mimo_v2/forward.zig
++++ b/zig/src/families/mimo_v2/forward.zig
+@@ -1,7 +1,10 @@
+ //! MiMo-V2's decode forward on the Zig engine: forward.Model.forward(prompt=False) of the Python family (f3a8c11),
+ //! launch for launch. Triton kernels come from the captured set (aot.json: the Python engine's own cubins), EXL3 from
+ //! cuda/exl3.zig (the Python engine's SASS), torch's glue from glue.cu; TP sums gather the ranks' fp32 partials and
+-//! add them in rank order. Eager, one stream (slot 0); decode rows of that stream at consecutive positions.
++//! add them in rank order. Decode windows: rows of up to `slots` streams (each a slot of the caches) at their own
++//! positions, eager (full layers read max(pos) / CK + 1 chunks) or replayed as CUDA graphs keyed like graphs.Graphs
++//! (row count, key bucket: full layers read bucket / CK chunks; chunks past a row's position are skipped in-kernel,
++//! so a replayed row carries the eager row's bits).
+ 
+ const std = @import("std");
+ const cuda = @import("cuda");
+@@ -16,6 +19,12 @@ pub const CK = 256; // attention.CK: keys a decode chunk
+ pub const BN = 64;
+ pub const GP = 16;
+ pub const PROMPT_CHUNK = 16384; // forward.PROMPT_CHUNK: sizes the sliding ring
++pub const DECODE_ROWS = 128; // ops.DECODE_ROWS: the EXL3 GEMV's row limit
++pub const BUCKET = 8192; // graphs.BUCKET
++pub const MAX_GRAPH_ROWS = 32; // graphs.MAX_ROWS: the widest chain graphed
++
++/// One decode row: a stream's cache slot, its position, its input token.
++pub const Row = struct { slot: u32, pos: u32, token: i64 };
+ 
+ /// attention.ring_size
+ pub fn ringSize(rows: usize, window: usize) usize {
+@@ -79,7 +88,11 @@ pub const Model = struct {
+     context: usize,
+     ring: usize,
+     rows: usize,
++    slots: usize,
+     nch_max: usize,
++    graphs: std.AutoHashMapUnmanaged([2]u32, cuda.graph.Exec) = .empty,
++    replays: usize = 0,
++    captures: usize = 0,
+     kc: []u64,
+     vc: []u64,
+     cos_full: u64,
+@@ -91,7 +104,7 @@ pub const Model = struct {
+     arena: load_.Arena,
+     gpa: std.mem.Allocator,
+ 
+-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const Weights, set: *const aot.Set, k3: *const exl3.Kernels, comm: ?tp.Collective, context: usize, rows: usize, s: Stream) !Model {
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const Weights, set: *const aot.Set, k3: *const exl3.Kernels, comm: ?tp.Collective, context: usize, rows: usize, slots: usize, s: Stream) !Model {
+         const cfg = w.cfg;
+         var m: Model = undefined;
+         m.w = w;
+@@ -101,8 +114,13 @@ pub const Model = struct {
+         m.comm = if (w.world > 1) comm orelse return error.NeedComm else null;
+         m.context = context;
+         m.ring = ringSize(PROMPT_CHUNK, cfg.window);
++        if (rows > DECODE_ROWS) return error.TooManyRows;
+         m.rows = rows;
+-        m.nch_max = context / CK + 1;
++        m.slots = slots;
++        m.graphs = .empty;
++        m.replays = 0;
++        m.captures = 0;
++        m.nch_max = (context + CK - 1) / CK; // a graph's bucket / CK at most, and max(pos) / CK + 1 eagerly
+         m.gpa = gpa;
+         m.arena = .{ .d = d, .gpa = gpa };
+         errdefer m.arena.deinit();
+@@ -115,8 +133,8 @@ pub const Model = struct {
+         m.vc = try gpa.alloc(u64, cfg.layers);
+         for (0..cfg.layers) |i| {
+             const n = if (cfg.full[i]) context else m.ring;
+-            m.kc[i] = try ar.zeros(n * cfg.kvHeads(i) * 192 * 2);
+-            m.vc[i] = try ar.zeros(n * cfg.kvHeads(i) * 128 * 2);
++            m.kc[i] = try ar.zeros(slots * n * cfg.kvHeads(i) * 192 * 2);
++            m.vc[i] = try ar.zeros(slots * n * cfg.kvHeads(i) * 128 * 2);
+         }
+         // rope tables per theta: cos, sin [context, rope_dim / 2] fp32
+         const half = cfg.rope_dim / 2;
+@@ -196,6 +214,9 @@ pub const Model = struct {
+     }
+ 
+     pub fn deinit(m: *Model) void {
++        var it = m.graphs.valueIterator();
++        while (it.next()) |e| e.deinit();
++        m.graphs.deinit(m.gpa);
+         m.gpa.free(m.kc);
+         m.gpa.free(m.vc);
+         m.glue.unload();
+@@ -242,23 +263,84 @@ pub const Model = struct {
+         ctx: *anyopaque = undefined,
+     };
+ 
+-    /// Decode rows `tokens` at positions p0.. of slot 0: fp32 logits of every row, gathered over the ranks into
+-    /// `out` [n, V] on the host. `cap` (debug): called with the residual after each layer's attention and MLP.
+-    pub fn forward(m: *Model, s: Stream, tokens: []const i64, p0: usize, out: []f32, cap: ?Capture) !void {
++    /// Rows' tokens, positions and slots into the fixed device inputs (graphs.Staged.refresh).
++    pub fn stage(m: *Model, rows: []const Row) !void {
+         const cfg = m.w.cfg;
+-        const n = tokens.len;
+-        if (n > m.rows) return error.WindowTooWide;
+-        if (p0 + n > m.context) return error.PastContext;
+-        if (n > m.ring - cfg.window) return error.RingOverrun;
+-        const D = cfg.hidden;
+-        const H = cfg.heads;
+-        var pos: [128]i32 = undefined;
+-        var slot: [128]i32 = @splat(0);
+-        for (0..n) |i| pos[i] = @intCast(p0 + i);
+-        try upload(m.d, m.b.ids, std.mem.sliceAsBytes(tokens));
++        if (rows.len == 0 or rows.len > m.rows) return error.WindowTooWide;
++        var ids: [DECODE_ROWS]i64 = undefined;
++        var pos: [DECODE_ROWS]i32 = undefined;
++        var slot: [DECODE_ROWS]i32 = undefined;
++        for (rows, 0..) |r, i| {
++            if (r.slot >= m.slots) return error.BadSlot;
++            if (r.pos >= m.context) return error.PastContext;
++            ids[i] = r.token;
++            pos[i] = @intCast(r.pos);
++            slot[i] = @intCast(r.slot);
++        }
++        // forward.check: a chain's rows must fit the sliding ring before its first row reads the window back
++        var per: [DECODE_ROWS]usize = @splat(0);
++        for (rows) |r| per[r.slot] += 1;
++        for (per[0..m.slots]) |c| if (c > m.ring - cfg.window) return error.RingOverrun;
++        const n = rows.len;
++        try upload(m.d, m.b.ids, std.mem.sliceAsBytes(ids[0..n]));
+         try upload(m.d, m.b.pos, std.mem.sliceAsBytes(pos[0..n]));
+         try upload(m.d, m.b.slot, std.mem.sliceAsBytes(slot[0..n]));
+-        const chunks = (p0 + n - 1) / CK + 1; // max(pos) // CK + 1
++    }
++
++    /// Eager decode window: fp32 logits of every row into `out` [n, V] (Model.forward(prompt=False, rows=all)).
++    pub fn forward(m: *Model, s: Stream, rows: []const Row, out: []f32, cap: ?Capture) !void {
++        try m.stage(rows);
++        var end: usize = 0;
++        for (rows) |r| end = @max(end, r.pos);
++        try m.run(s, rows.len, end / CK + 1, cap);
++        try m.logitsTo(s, rows.len, out);
++    }
++
++    /// graphs.Graphs.forward: a replayed graph per (rows, bucket), captured on first use after a warm-up run;
++    /// windows outside the graphed set (a chain wider than 32 rows) run eagerly.
++    pub fn graphed(m: *Model, s: Stream, rows: []const Row, out: []f32) !void {
++        var per: [DECODE_ROWS]usize = @splat(0);
++        var end: usize = 0;
++        for (rows) |r| {
++            per[r.slot] += 1;
++            end = @max(end, r.pos + 1);
++        }
++        if (std.mem.max(usize, per[0..m.slots]) > MAX_GRAPH_ROWS) return m.forward(s, rows, out, null);
++        const full = (m.context + CK - 1) / CK * CK;
++        const bucket = @min(full, @max(BUCKET, std.math.ceilPowerOfTwo(usize, end) catch unreachable));
++        const key: [2]u32 = .{ @intCast(rows.len), @intCast(bucket) };
++        try m.stage(rows);
++        if (m.graphs.get(key)) |exec| {
++            try exec.launchOn(s);
++            m.replays += 1;
++        } else {
++            try m.run(s, rows.len, bucket / CK, null); // warm-up: writes the same cache rows the replay will
++            try s.synchronize();
++            try cuda.graph.beginCapture(s, .thread_local);
++            m.run(s, rows.len, bucket / CK, null) catch |e| {
++                if (cuda.graph.endCapture(s)) |g| {
++                    var gg = g;
++                    gg.deinit();
++                } else |_| {}
++                return e;
++            };
++            var g = try cuda.graph.endCapture(s);
++            defer g.deinit();
++            const exec = try g.instantiate();
++            try m.graphs.put(m.gpa, key, exec);
++            try exec.launchOn(s);
++            m.captures += 1;
++        }
++        try m.logitsTo(s, rows.len, out);
++    }
++
++    /// The window's kernels on staged inputs: no host work, so a stream capture records exactly these launches.
++    /// `chunks`: key chunks the full layers read (max(pos) / CK + 1 eagerly, bucket / CK in a graph).
++    pub fn run(m: *Model, s: Stream, n: usize, chunks: usize, cap: ?Capture) !void {
++        const cfg = m.w.cfg;
++        const D = cfg.hidden;
++        const H = cfg.heads;
++        if (chunks > m.nch_max) return error.TooManyChunks;
+         // res = embed[ids].float()
+         {
+             var a: cuda.Args = .{};
+@@ -285,7 +367,6 @@ pub const Model = struct {
+             // attention.rows: sliding layers (window, 2 chunks, sinks), full layers (chunks from 0, no sinks)
+             const win: usize = if (full) 0 else cfg.window;
+             const nch: usize = if (full) chunks else (cfg.window + CK - 1) / CK + 1;
+-            if (nch > m.nch_max) return error.TooManyChunks;
+             const g = H / hk;
+             try m.set.run(s, "_rows", .{ u(n), u(hk), u(nch) }, &.{
+                 p("Q", "*fp16", m.b.qo),   p("KC", "*fp16", m.kc[i]), p("VC", "*fp16", m.vc[i]),
+@@ -303,12 +384,12 @@ pub const Model = struct {
+             try m.addRms(s, try m.sum(s, m.b.part, n), L.post_norm, m.b.x, n);
+             if (cap) |c| if (c.hook) |h| try h(c.ctx, .attn, i, m.b.res, n * D * 4);
+             if (L.experts) |e| {
+-                // moe.MoE: router logits, top 8 (sigmoid + bias), routed experts (decode: the grouped kernel)
+-                const be: usize, const bk: usize = .{ 32, 256 }; // _tile(n) == 16 for n <= 16
+-                if (n > 16) return error.RouterTile;
+-                try m.set.run(s, "_router", .{ u((n + 15) / 16), u((cfg.experts + be - 1) / be), 1 }, &.{
++                // moe.MoE: router logits (shared.router's tile by row count), top 8 (sigmoid + bias), routed experts
++                const bm = routerTile(n);
++                const be: usize, const bk: usize = if (bm == 16) .{ 32, 256 } else .{ 64, 64 };
++                try m.set.run(s, "_router", .{ u((n + bm - 1) / bm), u((cfg.experts + be - 1) / be), 1 }, &.{
+                     p("X", "*fp16", m.b.x), p("W", "*fp16", L.router), p("OUT", "*fp32", m.b.logits), ii("M", n), ii("x_stride", D),
+-                }, &.{ ci("D", D), ci("NE", cfg.experts), ci("BM", 16), ci("BLOCK_E", be), ci("BK", bk) });
++                }, &.{ ci("D", D), ci("NE", cfg.experts), ci("BM", bm), ci("BLOCK_E", be), ci("BK", bk) });
+                 try m.set.run(s, "_topk", .{ u(n), 1, 1 }, &.{
+                     p("L", "*fp32", m.b.logits), p("BIAS", "*fp32", L.bias), p("PICK", "*i32", m.b.pick), p("WTS", "*fp32", m.b.wts), aot.float("SCALE", L.route_scale),
+                 }, &.{ ci("NE", cfg.experts), ci("TOPK", cfg.top_k), ci("BLOCK", pow2(cfg.experts)), ci("KP", pow2(cfg.top_k)) });
+@@ -324,22 +405,28 @@ pub const Model = struct {
+             try m.addRms(s, try m.sum(s, m.b.part, n), after, m.b.x, n);
+             if (cap) |c| if (c.hook) |h| try h(c.ctx, .mlp, i, m.b.res, n * D * 4);
+         }
+-        // _head / _logits: this rank's vocab slice, gathered: row r = [rank 0's slice, rank 1's slice]
+-        const vr = m.w.head.n;
++        // _head / _logits: this rank's vocab slice; gathered over the ranks into recv [world, n, Vr]
+         try m.proj(s, m.w.head, m.b.x, m.b.head, true, n);
+-        if (m.comm) |c| {
+-            try c.allGather(m.b.head, m.b.recv, n * vr, .f32, s.handle);
+-            try s.synchronize();
+-            for (0..n) |r| for (0..m.w.world) |k| {
+-                try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(out[(r * m.w.world + k) * vr ..].ptr), m.b.recv + ((k * n + r) * vr) * 4, vr * 4), "logits");
+-            };
+-        } else {
+-            try s.synchronize();
+-            try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(out.ptr), m.b.head, n * vr * 4), "logits");
+-        }
++        if (m.comm) |c| try c.allGather(m.b.head, m.b.recv, n * m.w.head.n, .f32, s.handle);
++    }
++
++    /// The window's logits on the host: row r = [rank 0's slice, rank 1's slice, ...] (permute(1, 0, 2)).
++    pub fn logitsTo(m: *Model, s: Stream, n: usize, out: []f32) !void {
++        const vr = m.w.head.n;
++        try s.synchronize();
++        if (m.comm == null) return m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(out.ptr), m.b.head, n * vr * 4), "logits");
++        for (0..n) |r| for (0..m.w.world) |k| {
++            try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(out[(r * m.w.world + k) * vr ..].ptr), m.b.recv + ((k * n + r) * vr) * 4, vr * 4), "logits");
++        };
+     }
+ };
+ 
++/// shared._tile: rows a router program takes (16 to 128).
++pub fn routerTile(n: usize) usize {
++    for ([_]usize{ 16, 32, 64, 128 }) |b| if (n <= b) return b;
++    return 128;
++}
++
+ fn upload(d: *const cuda.Driver, at: u64, bytes: []const u8) !void {
+     try d.check(d.api.cuMemcpyHtoD_v2(at, bytes.ptr, bytes.len), "upload");
+ }
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index c8fd285d..2eb296d9 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -66,13 +66,18 @@ fn report(key: []const u8, got: []const u8, want: []const u8, half: bool) void {
+ 
+ pub fn main(init: std.process.Init) !u8 {
+     const args = try init.minimal.args.toSlice(init.arena.allocator());
+-    if (args.len < 5 or !std.mem.eql(u8, args[1], "m1")) {
+-        std.debug.print("usage: tf-mimo m1 MODEL ORACLE(rank<R>.safetensors) AOT_DIR [CONTEXT]\n", .{});
++    const is_m1 = args.len >= 5 and std.mem.eql(u8, args[1], "m1");
++    const is_win = args.len >= 6 and std.mem.eql(u8, args[1], "windows");
++    if (!is_m1 and !is_win) {
++        std.debug.print("usage: tf-mimo m1 MODEL ORACLE(rank<R>.safetensors) AOT_DIR [CONTEXT]\n" ++
++            "       tf-mimo windows MODEL ORACLE AOT_DIR WINDOWS_JSON(windows-r<R>.json)\n", .{});
+         return 2;
+     }
+     const gpa = init.gpa;
+     const io = init.io;
+-    const context: usize = if (args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096;
++    const context: usize = if (is_m1 and args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096;
++    const rows_max: usize = if (is_win) 128 else 1;
++    const slots: usize = if (is_win) 4 else 1;
+     const cfg = try tp.Config.fromEnv();
+     var driver = try cuda.Driver.open();
+     defer driver.close();
+@@ -93,12 +98,13 @@ pub fn main(init: std.process.Init) !u8 {
+     defer k3.deinit();
+     var set = try cuda.aot.Set.load(gpa, io, &driver, ctx.device, args[4]);
+     defer set.deinit();
+-    var model = try mimo.forward.Model.init(gpa, &driver, &w, &set, &k3, if (world > 1) session.comm() else null, context, 1, s);
++    var model = try mimo.forward.Model.init(gpa, &driver, &w, &set, &k3, if (world > 1) session.comm() else null, context, rows_max, slots, s);
+     defer model.deinit();
+     std.debug.print("[m1] rank {d}: loaded in {d:.0}s ({d:.1} GiB weights)\n", .{ rank, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(w.arena.total)) / (1 << 30) });
+ 
+     var ora = try core.safetensors.File.open(gpa, io, args[3]);
+     defer ora.close(io);
++    if (is_win) return windows(gpa, io, &model, s, &ora, args[5], rank);
+     const V = w.full.vocab;
+     const logits = try gpa.alloc(f32, V);
+     defer gpa.free(logits);
+@@ -131,7 +137,7 @@ pub fn main(init: std.process.Init) !u8 {
+         for (0..nsteps) |step| {
+             cmp.step = step;
+             const deep = step < 4;
+-            try model.forward(s, seq.items[step .. step + 1], step, logits, if (deep) .{ .hook = &hook, .ctx = &cmp } else null);
++            try model.forward(s, &.{.{ .slot = 0, .pos = @intCast(step), .token = seq.items[step] }}, logits, if (deep) .{ .hook = &hook, .ctx = &cmp } else null);
+             const got = mimo.forward.argmax(logits);
+             if (got == am[step]) ok_here += 1 else if (first_bad == null) first_bad = step;
+             if (step < lg_t.shape[0]) {
+@@ -152,3 +158,86 @@ pub fn main(init: std.process.Init) !u8 {
+     std.debug.print("{s} m1 rank {d}: argmax {d}/{d} steps; logits byte-equal {d}/{d}; {d} layer captures checked{s}{s}\n", .{ if (exact) "PASS" else "FAIL", rank, argmax_ok, total_steps, logits_ok, logits_n, cmp.checked, if (cmp.first_fail != null) "; first difference " else "", cmp.first_fail orelse "" });
+     return if (exact) 0 else 1;
+ }
++
++const Sched = struct {
++    context: usize,
++    slots: usize,
++    rounds: []struct { mode: []const u8, chains: []struct { slot: u32, prompt: []const u8, p0: u32, n: u32 } },
++    rows: []struct { prompt: []const u8, pos: u32, argmax: u32, sha256: []const u8 },
++};
++
++/// Z3: the Python engine's window schedule (tools/mimo_zig_windows.py) replayed, graphed and eager as it ran; every
++/// row's fp32 logits must hash equal to the Python window's row, and its argmax equal the serial answer key's.
++fn windows(gpa: std.mem.Allocator, io: std.Io, model: *mimo.forward.Model, s: cuda.Stream, ora: *const core.safetensors.File, path: []const u8, rank: usize) !u8 {
++    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 28));
++    defer gpa.free(text);
++    const parsed = try std.json.parseFromSlice(Sched, gpa, text, .{ .ignore_unknown_fields = true });
++    defer parsed.deinit();
++    const sc = parsed.value;
++    if (sc.context != model.context or sc.slots > model.slots) return error.ScheduleShape;
++    const V = model.w.full.vocab;
++    var nb: [128]u8 = undefined;
++    // each prompt's teacher-forced sequence (prompt + non-EOS greedy) and its serial argmax
++    var seqs = std.StringHashMap([]i64).init(gpa);
++    defer {
++        var it = seqs.valueIterator();
++        while (it.next()) |v| gpa.free(v.*);
++        seqs.deinit();
++    }
++    var serial = std.StringHashMap([]align(1) const i32).init(gpa);
++    defer serial.deinit();
++    for (prompts) |name| {
++        const ids_t = ora.get(try std.fmt.bufPrint(&nb, "{s}.ids", .{name})) orelse return error.NoIds;
++        const greedy_t = ora.get(try std.fmt.bufPrint(&nb, "{s}.greedy", .{name})) orelse return error.NoGreedy;
++        const am_t = ora.get(try std.fmt.bufPrint(&nb, "{s}.argmax", .{name})) orelse return error.NoArgmax;
++        var l: std.ArrayList(i64) = .empty;
++        for (std.mem.bytesAsSlice(i32, @as([]align(1) const u8, ids_t.bytes))) |t| try l.append(gpa, t);
++        for (std.mem.bytesAsSlice(i32, @as([]align(1) const u8, greedy_t.bytes))) |t| if (!model.w.full.isEos(@intCast(t))) try l.append(gpa, t);
++        try seqs.put(name, try l.toOwnedSlice(gpa));
++        try serial.put(name, std.mem.bytesAsSlice(i32, @as([]align(1) const u8, am_t.bytes)));
++    }
++    const logits = try gpa.alloc(f32, 128 * V);
++    defer gpa.free(logits);
++    var rows: [128]mimo.forward.Row = undefined;
++    var at: usize = 0; // index into sc.rows
++    var sha_ok: usize = 0;
++    var am_ok: usize = 0;
++    var serial_ok: usize = 0;
++    var first: ?usize = null;
++    var graph_rounds: usize = 0;
++    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++    for (sc.rounds, 0..) |rd, k| {
++        var n: usize = 0;
++        for (rd.chains) |c| {
++            const seq = seqs.get(c.prompt) orelse return error.UnknownPrompt;
++            for (0..c.n) |j| {
++                rows[n] = .{ .slot = c.slot, .pos = c.p0 + @as(u32, @intCast(j)), .token = seq[c.p0 + j] };
++                n += 1;
++            }
++        }
++        if (std.mem.eql(u8, rd.mode, "graph")) {
++            graph_rounds += 1;
++            try model.graphed(s, rows[0..n], logits);
++        } else try model.forward(s, rows[0..n], logits, null);
++        for (0..n) |r| {
++            const want = sc.rows[at + r];
++            const row = logits[r * V ..][0..V];
++            var h: [32]u8 = undefined;
++            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(row), &h, .{});
++            const hex = std.fmt.bytesToHex(h, .lower);
++            const am = mimo.forward.argmax(row);
++            if (std.mem.eql(u8, &hex, want.sha256)) sha_ok += 1 else if (first == null) {
++                first = at + r;
++                std.debug.print("FIRST DIFF round {d} ({s}, {d} rows) row {d}: {s} pos {d}: argmax {d} vs {d}\n", .{ k, rd.mode, n, r, want.prompt, want.pos, am, want.argmax });
++            }
++            if (am == want.argmax) am_ok += 1;
++            if (am == serial.get(want.prompt).?[want.pos]) serial_ok += 1;
++        }
++        at += n;
++    }
++    const total = sc.rows.len;
++    const ok = sha_ok == total and am_ok == total and serial_ok == total;
++    const secs = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9;
++    std.debug.print("{s} windows rank {d}: {d} rounds ({d} graphed: {d} captures, {d} replays), {d} rows: logits hash-equal to the Python window {d}/{d}, argmax equal {d}/{d}, equal to the serial answer key {d}/{d}; {d:.1}s\n", .{ if (ok) "PASS" else "FAIL", rank, sc.rounds.len, graph_rounds, model.captures, model.replays, total, sha_ok, total, am_ok, total, serial_ok, total, secs });
++    return if (ok) 0 else 1;
++}
+-- 
+2.53.0
+
