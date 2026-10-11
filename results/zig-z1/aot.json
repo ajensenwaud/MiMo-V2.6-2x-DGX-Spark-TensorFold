@@ -1,0 +1,903 @@
+{
+ "generator": "zig/tests/cuda/nemotron/aot_pack.py",
+ "kernels": [
+  {
+   "fn": "_add_rms",
+   "hash": "ca9c7d527cd87ad7727501e1774a38a25b9f55446b79fece6b57679be29edc6f",
+   "name": "_add_rms",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 4096,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "RES",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "N": {
+     "int": 4096
+    },
+    "EPS": {
+     "f32": 897988541
+    },
+    "BLOCK": {
+     "int": 4096
+    }
+   }
+  },
+  {
+   "fn": "_merge",
+   "hash": "66453a40186787f9ee6d92cd9ffc98a204796cdfe43489da47118b23f88cfe1b",
+   "name": "_merge",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SINKS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "NCH": {
+     "int": 1
+    },
+    "H": {
+     "int": 32
+    },
+    "HAS_SINK": {
+     "int": 0
+    }
+   }
+  },
+  {
+   "fn": "_merge",
+   "hash": "76406ca0dd84a349547f257a290d00539d080637ccb604f18bcc1a214f745b84",
+   "name": "_merge",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SINKS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HAS_SINK": {
+     "int": 1
+    }
+   }
+  },
+  {
+   "fn": "_merge",
+   "hash": "9396d5dca0f17808f50de9deeb42dfe861a4b1d054d5b57318d7a0baacac8e8e",
+   "name": "_merge",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SINKS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HAS_SINK": {
+     "int": 0
+    }
+   }
+  },
+  {
+   "fn": "_qkv",
+   "hash": "70ffe144325b71820cadf61dda4976c67963fefb0d77c5fa361e2d94c062f007",
+   "name": "_qkv",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "K",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "V",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "COS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SIN",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "QO",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 4
+    },
+    "RD": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_qkv",
+   "hash": "96413823b8c19d8e9e91d286cefaba82ae508c4711f7a2174bf3eccf860bef8e",
+   "name": "_qkv",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "K",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "V",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "COS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SIN",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "QO",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 2
+    },
+    "RD": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_rms",
+   "hash": "ade50c4ee981f69c618b652d40985fabac06e296065d1ce6303c5b85cf1c32dd",
+   "name": "_rms",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 16,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "N": {
+     "int": 4096
+    },
+    "EPS": {
+     "f32": 897988541
+    },
+    "BLOCK": {
+     "int": 4096
+    }
+   }
+  },
+  {
+   "fn": "_router",
+   "hash": "83bc28b3fdd98a9025c9d577df0532a686f3dc07e4c56d0fa8426c0119a1436c",
+   "name": "_router",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 73728,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "x_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "M": {
+     "int": 1
+    },
+    "D": {
+     "int": 4096
+    },
+    "NE": {
+     "int": 256
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_E": {
+     "int": 32
+    },
+    "BK": {
+     "int": 256
+    }
+   }
+  },
+  {
+   "fn": "_rows",
+   "hash": "34d02875eb4735d7e3b5bfbf16142378740614854f7512464db291e9b68915c5",
+   "name": "_rows",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 49152,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 2
+    },
+    "G": {
+     "int": 16
+    },
+    "WIN": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1033096506
+    },
+    "CK": {
+     "int": 256
+    },
+    "BN": {
+     "int": 64
+    },
+    "GP": {
+     "int": 16
+    }
+   }
+  },
+  {
+   "fn": "_rows",
+   "hash": "8caec40a55d22936f31afab6d48e6024a78ba2f75e870fd5dc066cd842646d2e",
+   "name": "_rows",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 49152,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 4
+    },
+    "G": {
+     "int": 8
+    },
+    "WIN": {
+     "int": 128
+    },
+    "SCALE": {
+     "f32": 1033096506
+    },
+    "CK": {
+     "int": 256
+    },
+    "BN": {
+     "int": 64
+    },
+    "GP": {
+     "int": 16
+    }
+   }
+  },
+  {
+   "fn": "_rows",
+   "hash": "a18c8a706d4b6db2661838b2b9ab7293528b838e01d25c9e7c20bcb38302a935",
+   "name": "_rows",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 49152,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "NCH": {
+     "int": 1
+    },
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 2
+    },
+    "G": {
+     "int": 16
+    },
+    "WIN": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1033096506
+    },
+    "CK": {
+     "int": 256
+    },
+    "BN": {
+     "int": 64
+    },
+    "GP": {
+     "int": 16
+    }
+   }
+  },
+  {
+   "fn": "_silu_mul",
+   "hash": "2c665389cce132b0ccf9798e8d908feca0ddc2388c6a1dcbde0809b092dd297b",
+   "name": "_silu_mul",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "G",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "U",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "N": {
+     "int": 8192
+    },
+    "BLOCK": {
+     "int": 1024
+    }
+   }
+  },
+  {
+   "fn": "_topk",
+   "hash": "26166538040e2c24c9fdd2ca23d100ad3c8fb455d174a9e61772f584fdb11aad",
+   "name": "_topk",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 16,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "L",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "BIAS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PICK",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "WTS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SCALE",
+     "type": "fp32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "NE": {
+     "int": 256
+    },
+    "TOPK": {
+     "int": 8
+    },
+    "BLOCK": {
+     "int": 256
+    },
+    "KP": {
+     "int": 8
+    }
+   }
+  }
+ ]
+}

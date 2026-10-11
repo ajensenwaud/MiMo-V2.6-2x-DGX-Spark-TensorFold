@@ -1,7 +1,7 @@
 From e02cb1a6213191f0049883be2f12d95f41bf9dfa Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 14:13:05 +1100
-Subject: [PATCH 09/14] cuda/exl3.zig: the MiMo EXL3 kernels' launches,
+Subject: [PATCH 09/15] cuda/exl3.zig: the MiMo EXL3 kernels' launches,
  mirroring the Python bindings (plans, symbols, grids); host tests against the
  Python plans
 

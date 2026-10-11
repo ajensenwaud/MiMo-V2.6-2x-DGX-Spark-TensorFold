@@ -15,7 +15,7 @@ Confirmed by Anders on 2026-10-11 ("go"): D1 as below; D2-D7 as recommended.
 |---|---|---|
 | D1 | Engine base | **Decided by Anders (2026-10-11): TensorFold v1.0.5 (`bec00ae`), not Jay's 1.0.2 export.** Jay's generic pieces that 1.0.5 lacks are ported onto it in gate Z0B: the keyed graph cache and device arena (his #635), CUDA tensor parallelism (#636), the EXL3 mul1 CUDA kernels (unsubmitted part of his stack), and later sessions (#637). #635-#638 conflict with `main` today, so we rebase them ourselves. New upstream releases are taken by rebase at a gate boundary, never mid-gate. |
 | D2 | Exactness bar | **Bit-exact with the Python engine** on the same pack: same logits at greedy, same SASS where kernels are shared. Then the published quality evals carry over and need no rerun. |
-| D3 | GPU windows | Python serve stays up for Z0-Z1 (build, host tests, capture of oracles uses short windows). From Z2 the GPUs are the project's; the Python serve comes back between windows on request. The desktop Hermes session needs another model during windows. |
+| D3 | GPU windows | **Anders (2026-10-11): take the GPUs down any time the serve is not in critical use** (check `/health` requests_running == 0 and no established :8891 connections first; restart with `~/mimo/recipe/start.sh` on gx10 after). |
 | D4 | Where it lives | Same repo, `zig/` (family source, kernels, launcher) + `patches-zig/` (TensorFold commits as `git format-patch`), README section added at release. Published only on an explicit yes. |
 | D5 | Toolchain | Zig 0.17.0 inside a build image layered on the existing base image (nvcc 13.3.73, Triton 3.7.1 already there). No host installs. |
 | D6 | Upstream contact | Tell Jay (public GitHub issue or X) once Z2 passes, not before; credit him in every artefact. Contributing the family upstream needs lint cleanup and is out of scope until Z8. |
@@ -164,5 +164,22 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
   time (else `NoKernel`).
 - Logs: `results/zig-z0b/`.
 
-**Next (no GPU):** Z1.1 capture script (per-layer residuals, router picks, logits, 256 greedy tokens at TP=2);
-Z1.3 Triton AOT fill for MiMo's 11 kernels; Z2.1 family skeleton. **Next GPU window:** Z1.1 capture + Z1.3.
+### 2026-10-11 (session 2; serve down ~12 min while idle, restarted)
+- **Z1.1 done.** `tools/mimo_zig_capture.py` (+ `.sh` for both ranks): 8 prompts fed one row at a time through
+  decode forwards, then greedy to 256 tokens or EOS; 1,329 decode steps. Per rank: argmax at every step, fp32 logits
+  for the first 16 steps, residuals after every layer's attention and MLP plus routed picks/weights for steps 0-3,
+  attention outputs at the first full (0) and first sliding (1) layer. On gx10 `~/mimo/oracle/rank0.safetensors`
+  (sha256 ce588994042b5a13...) and `peer/rank1.safetensors` (117297532cfeb30b...). Checks
+  (`tools/mimo_oracle_check.py`): run 1 == run 2 on 6,144 tensors; rank 0 == rank 1 on all 6,112 rank-shared tensors;
+  argmax equal on both ranks at every step.
+- **Z1.3 done for the decode path.** Triton launches recorded with upstream's `tools/zig/triton_aot_manifest.py`,
+  packed with `aot_pack.py`: 13 specialisations of 8 functions (_rms, _add_rms, _qkv x2, _rows x3, _merge x3,
+  _router, _topk, _silu_mul), identical on both ranks. Kernel set: gx10 `~/mimo/oracle/aot-sm121/` (aot.json
+  bf36ead545e8ee81...). Prompt-path and DFlash kernels are captured later (Z3.2, Z4).
+- Z2.1 started: `zig/src/families/mimo_v2/config.zig` (Config.read + rank cuts), 3/3 host tests (`zig build test-mimo`).
+- Build containers now run as uid 1000 (`--user 1000:1000 -e ZIG_GLOBAL_CACHE_DIR=/mimo/.zig-global`); outputs of
+  root containers are handed back with `docker run ... chown`, not sudo.
+
+**Next (no GPU):** Z2.1 pack loader (EXL3 strips, stacked experts, norms, router, embeddings, sinks); Z2.2-Z2.4
+layer forward (attention via the AOT set, router/top-k via AOT, EXL3 via cuda/exl3.zig); Z2.5 TP sums over the fabric;
+Z2.6 greedy loop against the answer key. **Next GPU window:** first layer-by-layer comparison once Z2.4 builds.

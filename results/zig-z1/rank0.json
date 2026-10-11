@@ -1,0 +1,58 @@
+{
+ "en_story": {
+  "prompt": 24,
+  "generated": 256,
+  "eos": false,
+  "seconds": 53.6,
+  "text": " The message is from a future version of himself, warning him about a coming storm. The lighthouse keeper, initially skeptical, decides to trust the message and"
+ },
+ "zh_explain": {
+  "prompt": 17,
+  "generated": 256,
+  "eos": false,
+  "seconds": 6.6,
+  "text": "  \n\n量子纠缠是量子力学中的一种现象，指两个或多个粒子之间存在一种特殊的关联，使得它们的状态无论相隔多远都能瞬间相互影响。这种关联是超距的，不受光速限制，但无法用于传递信息。  \n\n类比：想象你有一双手套，分别放在两个盒子里，一个留在地球，另一个送到月球。当你打开地球上的盒子发现是左手手套时，你立刻知道月球上的一定是"
+ },
+ "code_py": {
+  "prompt": 39,
+  "generated": 256,
+  "eos": false,
+  "seconds": 7.2,
+  "text": " Include docstrings and handle invalid input with ValueError.\n\nHere is a Python function that parses an ISO-8601 duration string into a datetime.timedelta objec"
+ },
+ "math": {
+  "prompt": 61,
+  "generated": 256,
+  "eos": false,
+  "seconds": 7.7,
+  "text": "  \n\n  \n\nI know the answer is 12:00 at 160 km from A, but I don't know how to get there.  \n\n  \n\nThanks in advance.\n\n  \n-  \n\nLet t be the time in hours after 9:00"
+ },
+ "tool_json": {
+  "prompt": 49,
+  "generated": 1,
+  "eos": true,
+  "seconds": 1.2,
+  "text": ""
+ },
+ "edit": {
+  "prompt": 48,
+  "generated": 256,
+  "eos": false,
+  "seconds": 7.4,
+  "text": "```\n\n**Answer:**\n\n```python\ndef f(xs):\n    \"\"\"Return the number of positive elements in xs.\"\"\"\n    count = 0\n    for x in xs:\n        if x > 0:\n            coun"
+ },
+ "list": {
+  "prompt": 22,
+  "generated": 108,
+  "eos": true,
+  "seconds": 3.2,
+  "text": " Use a numbered list.\n\n1. Mercury - The smallest planet in the solar system.\n2. Venus - The hottest planet in the solar system.\n3. Earth - The only planet known"
+ },
+ "short": {
+  "prompt": 2,
+  "generated": 256,
+  "eos": false,
+  "seconds": 6.3,
+  "text": " Repository: https://github.com/alexey-gavrilov/My-Projects\n\nI'm trying to create a simple game in Godot 4.3. I have a player character (CharacterBody2D) with a"
+ }
+}

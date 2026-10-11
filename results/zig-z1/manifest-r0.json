@@ -1,0 +1,2742 @@
+{
+ "generator": "tools/zig/triton_aot_manifest.py",
+ "cache": "/m/oracle/triton-r0",
+ "kernels": [
+  {
+   "name": "_add_rms",
+   "function": "tensorfold.families.mimo_v2.cuda.ops._add_rms",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/families/mimo_v2/cuda/ops.py",
+    "line": 38
+   },
+   "hash": "ca9c7d527cd87ad7727501e1774a38a25b9f55446b79fece6b57679be29edc6f",
+   "cubin": "ZKOH2UT43B5NO4TVAHQXOSRYUJNZ6VKENN475TTLK5TZXYU63RXQ/_add_rms.cubin",
+   "cubin_sha256": "17acaf13fe495f225f748bed8e49e07b338eef28927d0b1075591558bab0a0b4",
+   "cubin_bytes": 32104,
+   "ptx": "ZKOH2UT43B5NO4TVAHQXOSRYUJNZ6VKENN475TTLK5TZXYU63RXQ/_add_rms.ptx",
+   "metadata": {
+    "name": "_add_rms",
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "maxnreg": null,
+    "shared": 4096,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "ca9c7d527cd87ad7727501e1774a38a25b9f55446b79fece6b57679be29edc6f"
+   },
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 4096,
+   "n_regs": 72,
+   "n_spills": 0,
+   "signature": {
+    "X": "*fp32",
+    "RES": "*fp32",
+    "W": "*fp32",
+    "OUT": "*fp16",
+    "N": "constexpr",
+    "EPS": "constexpr",
+    "BLOCK": "constexpr"
+   },
+   "constexprs": {
+    "N": 4096,
+    "EPS": {
+     "float": 1e-06,
+     "fp32_bits": "0x358637bd",
+     "fp64_bits": "0x3eb0c6f7a0b5ed8d"
+    },
+    "BLOCK": 4096
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "RES": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "EPS": [],
+    "BLOCK": []
+   },
+   "entry": {
+    "symbol": "_add_rms",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _add_rms_param_0",
+     ".param .u64 .ptr .global .align 1 _add_rms_param_1",
+     ".param .u64 .ptr .global .align 1 _add_rms_param_2",
+     ".param .u64 .ptr .global .align 1 _add_rms_param_3",
+     ".param .u64 .ptr .global .align 1 _add_rms_param_4",
+     ".param .u64 .ptr .global .align 1 _add_rms_param_5"
+    ],
+    "directives": [
+     ".reqntid 128"
+    ]
+   },
+   "abi": [
+    {
+     "name": "X",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _add_rms_param_0"
+    },
+    {
+     "name": "RES",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _add_rms_param_1"
+    },
+    {
+     "name": "W",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _add_rms_param_2"
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _add_rms_param_3"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _add_rms_param_4"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _add_rms_param_5"
+    }
+   ],
+   "launches": {
+    "startup": 182880
+   },
+   "grids": [
+    [
+     1
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/families/mimo_v2/cuda/ops.py:54 add_rms <- tensorfold/families/mimo_v2/cuda/forward.py:159 forward",
+    "tensorfold/families/mimo_v2/cuda/ops.py:54 add_rms <- tensorfold/families/mimo_v2/cuda/forward.py:169 forward"
+   ]
+  },
+  {
+   "name": "_merge",
+   "function": "tensorfold.families.mimo_v2.cuda.attention._merge",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/families/mimo_v2/cuda/attention.py",
+    "line": 151
+   },
+   "hash": "66453a40186787f9ee6d92cd9ffc98a204796cdfe43489da47118b23f88cfe1b",
+   "cubin": "MZCTUQAYM6D7T3TNSLGZ77EYUICHS3G74Q2ITWSHCGFSH6EM7YNQ/_merge.cubin",
+   "cubin_sha256": "efaf27bdf63a77cca82b66e7b71563a93389b5587e3dc23031733b626c83b710",
+   "cubin_bytes": 11400,
+   "ptx": "MZCTUQAYM6D7T3TNSLGZ77EYUICHS3G74Q2ITWSHCGFSH6EM7YNQ/_merge.ptx",
+   "metadata": {
+    "name": "_merge",
+    "num_warps": 1,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "maxnreg": null,
+    "shared": 0,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "66453a40186787f9ee6d92cd9ffc98a204796cdfe43489da47118b23f88cfe1b"
+   },
+   "block": [
+    32,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 0,
+   "n_regs": 14,
+   "n_spills": 0,
+   "signature": {
+    "PO": "*fp32",
+    "PM": "*fp32",
+    "PL": "*fp32",
+    "SINKS": "*fp32",
+    "OUT": "*fp16",
+    "NCH": "constexpr",
+    "H": "constexpr",
+    "HAS_SINK": "constexpr"
+   },
+   "constexprs": {
+    "NCH": 1,
+    "H": 32,
+    "HAS_SINK": false
+   },
+   "attrs": {
+    "PO": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PM": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PL": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SINKS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "NCH": [],
+    "H": [],
+    "HAS_SINK": []
+   },
+   "entry": {
+    "symbol": "_merge",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _merge_param_0",
+     ".param .u64 .ptr .global .align 1 _merge_param_1",
+     ".param .u64 .ptr .global .align 1 _merge_param_2",
+     ".param .u64 .ptr .global .align 1 _merge_param_3",
+     ".param .u64 .ptr .global .align 1 _merge_param_4",
+     ".param .u64 .ptr .global .align 1 _merge_param_5",
+     ".param .u64 .ptr .global .align 1 _merge_param_6"
+    ],
+    "directives": [
+     ".reqntid 32"
+    ]
+   },
+   "abi": [
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_0"
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_1"
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_2"
+    },
+    {
+     "name": "SINKS",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_3"
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_4"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_5"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_6"
+    }
+   ],
+   "launches": {
+    "startup": 15426
+   },
+   "grids": [
+    [
+     1,
+     32
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/families/mimo_v2/cuda/attention.py:209 rows <- tools/mimo_zig_capture.py:112 rows"
+   ]
+  },
+  {
+   "name": "_merge",
+   "function": "tensorfold.families.mimo_v2.cuda.attention._merge",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/families/mimo_v2/cuda/attention.py",
+    "line": 151
+   },
+   "hash": "76406ca0dd84a349547f257a290d00539d080637ccb604f18bcc1a214f745b84",
+   "cubin": "OZAGZIG5QSRUSVD7EV5CSDIAKOOQQBRXZS3AJ4MLZQNCCT3ULOCA/_merge.cubin",
+   "cubin_sha256": "07362196319c42dfd88c48467d9d22e7793b1de816ad2f8ef2d1720329dda775",
+   "cubin_bytes": 19560,
+   "ptx": "OZAGZIG5QSRUSVD7EV5CSDIAKOOQQBRXZS3AJ4MLZQNCCT3ULOCA/_merge.ptx",
+   "metadata": {
+    "name": "_merge",
+    "num_warps": 1,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "maxnreg": null,
+    "shared": 0,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "76406ca0dd84a349547f257a290d00539d080637ccb604f18bcc1a214f745b84"
+   },
+   "block": [
+    32,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 0,
+   "n_regs": 49,
+   "n_spills": 0,
+   "signature": {
+    "PO": "*fp32",
+    "PM": "*fp32",
+    "PL": "*fp32",
+    "SINKS": "*fp32",
+    "OUT": "*fp16",
+    "NCH": "i32",
+    "H": "constexpr",
+    "HAS_SINK": "constexpr"
+   },
+   "constexprs": {
+    "H": 32,
+    "HAS_SINK": true
+   },
+   "attrs": {
+    "PO": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PM": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PL": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SINKS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "NCH": [],
+    "H": [],
+    "HAS_SINK": []
+   },
+   "entry": {
+    "symbol": "_merge",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _merge_param_0",
+     ".param .u64 .ptr .global .align 1 _merge_param_1",
+     ".param .u64 .ptr .global .align 1 _merge_param_2",
+     ".param .u64 .ptr .global .align 1 _merge_param_3",
+     ".param .u64 .ptr .global .align 1 _merge_param_4",
+     ".param .u32 _merge_param_5",
+     ".param .u64 .ptr .global .align 1 _merge_param_6",
+     ".param .u64 .ptr .global .align 1 _merge_param_7"
+    ],
+    "directives": [
+     ".reqntid 32"
+    ]
+   },
+   "abi": [
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_0"
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_1"
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_2"
+    },
+    {
+     "name": "SINKS",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_3"
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_4"
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "divisibility_16": false,
+     "ptx": ".param .u32 _merge_param_5"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_6"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_7"
+    }
+   ],
+   "launches": {
+    "startup": 74295
+   },
+   "grids": [
+    [
+     1,
+     32
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/families/mimo_v2/cuda/attention.py:209 rows <- tools/mimo_zig_capture.py:112 rows"
+   ]
+  },
+  {
+   "name": "_merge",
+   "function": "tensorfold.families.mimo_v2.cuda.attention._merge",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/families/mimo_v2/cuda/attention.py",
+    "line": 151
+   },
+   "hash": "9396d5dca0f17808f50de9deeb42dfe861a4b1d054d5b57318d7a0baacac8e8e",
+   "cubin": "SOLNLXFA6F4AR5IN5HPOWQW75BQ2JMOQKTK3K4YY26QLVLFMR2HA/_merge.cubin",
+   "cubin_sha256": "41b1ac92786d738f7dec47679fc20211d4244fd4045f664369aed7a897fdfcf9",
+   "cubin_bytes": 17592,
+   "ptx": "SOLNLXFA6F4AR5IN5HPOWQW75BQ2JMOQKTK3K4YY26QLVLFMR2HA/_merge.ptx",
+   "metadata": {
+    "name": "_merge",
+    "num_warps": 1,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "maxnreg": null,
+    "shared": 0,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "9396d5dca0f17808f50de9deeb42dfe861a4b1d054d5b57318d7a0baacac8e8e"
+   },
+   "block": [
+    32,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 0,
+   "n_regs": 47,
+   "n_spills": 0,
+   "signature": {
+    "PO": "*fp32",
+    "PM": "*fp32",
+    "PL": "*fp32",
+    "SINKS": "*fp32",
+    "OUT": "*fp16",
+    "NCH": "i32",
+    "H": "constexpr",
+    "HAS_SINK": "constexpr"
+   },
+   "constexprs": {
+    "H": 32,
+    "HAS_SINK": false
+   },
+   "attrs": {
+    "PO": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PM": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PL": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SINKS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "NCH": [],
+    "H": [],
+    "HAS_SINK": []
+   },
+   "entry": {
+    "symbol": "_merge",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _merge_param_0",
+     ".param .u64 .ptr .global .align 1 _merge_param_1",
+     ".param .u64 .ptr .global .align 1 _merge_param_2",
+     ".param .u64 .ptr .global .align 1 _merge_param_3",
+     ".param .u64 .ptr .global .align 1 _merge_param_4",
+     ".param .u32 _merge_param_5",
+     ".param .u64 .ptr .global .align 1 _merge_param_6",
+     ".param .u64 .ptr .global .align 1 _merge_param_7"
+    ],
+    "directives": [
+     ".reqntid 32"
+    ]
+   },
+   "abi": [
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_0"
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_1"
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_2"
+    },
+    {
+     "name": "SINKS",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_3"
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_4"
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "divisibility_16": false,
+     "ptx": ".param .u32 _merge_param_5"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_6"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _merge_param_7"
+    }
+   ],
+   "launches": {
+    "startup": 1719
+   },
+   "grids": [
+    [
+     1,
+     32
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/families/mimo_v2/cuda/attention.py:209 rows <- tools/mimo_zig_capture.py:112 rows"
+   ]
+  },
+  {
+   "name": "_qkv",
+   "function": "tensorfold.families.mimo_v2.cuda.attention._qkv",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/families/mimo_v2/cuda/attention.py",
+    "line": 25
+   },
+   "hash": "70ffe144325b71820cadf61dda4976c67963fefb0d77c5fa361e2d94c062f007",
+   "cubin": "OD76CRBSLNYYEDFN6YO5USLWYZ4WH7X3BV34L6RWDYWZJQDC6ADQ/_qkv.cubin",
+   "cubin_sha256": "3b5fc4388db80838a1f37db1b47fb526df7c5b77951d566e9126bd652639ad7c",
+   "cubin_bytes": 15536,
+   "ptx": "OD76CRBSLNYYEDFN6YO5USLWYZ4WH7X3BV34L6RWDYWZJQDC6ADQ/_qkv.ptx",
+   "metadata": {
+    "name": "_qkv",
+    "num_warps": 1,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "maxnreg": null,
+    "shared": 0,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "70ffe144325b71820cadf61dda4976c67963fefb0d77c5fa361e2d94c062f007"
+   },
+   "block": [
+    32,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 0,
+   "n_regs": 28,
+   "n_spills": 0,
+   "signature": {
+    "Q": "*fp16",
+    "K": "*fp16",
+    "V": "*fp16",
+    "COS": "*fp32",
+    "SIN": "*fp32",
+    "POS": "*i32",
+    "SLOT": "*i32",
+    "QO": "*fp16",
+    "KC": "*fp16",
+    "VC": "*fp16",
+    "LEN": "i32",
+    "H": "constexpr",
+    "HK": "constexpr",
+    "RD": "constexpr"
+   },
+   "constexprs": {
+    "H": 32,
+    "HK": 4,
+    "RD": 64
+   },
+   "attrs": {
+    "Q": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "V": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "COS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SIN": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "POS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SLOT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "QO": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "KC": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "VC": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "LEN": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "H": [],
+    "HK": [],
+    "RD": []
+   },
+   "entry": {
+    "symbol": "_qkv",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _qkv_param_0",
+     ".param .u64 .ptr .global .align 1 _qkv_param_1",
+     ".param .u64 .ptr .global .align 1 _qkv_param_2",
+     ".param .u64 .ptr .global .align 1 _qkv_param_3",
+     ".param .u64 .ptr .global .align 1 _qkv_param_4",
+     ".param .u64 .ptr .global .align 1 _qkv_param_5",
+     ".param .u64 .ptr .global .align 1 _qkv_param_6",
+     ".param .u64 .ptr .global .align 1 _qkv_param_7",
+     ".param .u64 .ptr .global .align 1 _qkv_param_8",
+     ".param .u64 .ptr .global .align 1 _qkv_param_9",
+     ".param .u32 _qkv_param_10",
+     ".param .u64 .ptr .global .align 1 _qkv_param_11",
+     ".param .u64 .ptr .global .align 1 _qkv_param_12"
+    ],
+    "directives": [
+     ".reqntid 32"
+    ]
+   },
+   "abi": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_0"
+    },
+    {
+     "name": "K",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_1"
+    },
+    {
+     "name": "V",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_2"
+    },
+    {
+     "name": "COS",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_3"
+    },
+    {
+     "name": "SIN",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_4"
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_5"
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_6"
+    },
+    {
+     "name": "QO",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_7"
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_8"
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_9"
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "divisibility_16": true,
+     "ptx": ".param .u32 _qkv_param_10"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_11"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_12"
+    }
+   ],
+   "launches": {
+    "startup": 74295
+   },
+   "grids": [
+    [
+     1,
+     40
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/families/mimo_v2/cuda/attention.py:73 qkv <- tensorfold/families/mimo_v2/cuda/forward.py:147 forward"
+   ]
+  },
+  {
+   "name": "_qkv",
+   "function": "tensorfold.families.mimo_v2.cuda.attention._qkv",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/families/mimo_v2/cuda/attention.py",
+    "line": 25
+   },
+   "hash": "96413823b8c19d8e9e91d286cefaba82ae508c4711f7a2174bf3eccf860bef8e",
+   "cubin": "SZATQI5YYGOY5HUR2KDM56V2QKXFBDCHCH32EF2L6PWM7BQL56HA/_qkv.cubin",
+   "cubin_sha256": "5891ee92a4e915bdffc52c2095897dab5ed1c73a64fa787405443f3cf0e096ac",
+   "cubin_bytes": 15536,
+   "ptx": "SZATQI5YYGOY5HUR2KDM56V2QKXFBDCHCH32EF2L6PWM7BQL56HA/_qkv.ptx",
+   "metadata": {
+    "name": "_qkv",
+    "num_warps": 1,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "maxnreg": null,
+    "shared": 0,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "96413823b8c19d8e9e91d286cefaba82ae508c4711f7a2174bf3eccf860bef8e"
+   },
+   "block": [
+    32,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 0,
+   "n_regs": 28,
+   "n_spills": 0,
+   "signature": {
+    "Q": "*fp16",
+    "K": "*fp16",
+    "V": "*fp16",
+    "COS": "*fp32",
+    "SIN": "*fp32",
+    "POS": "*i32",
+    "SLOT": "*i32",
+    "QO": "*fp16",
+    "KC": "*fp16",
+    "VC": "*fp16",
+    "LEN": "i32",
+    "H": "constexpr",
+    "HK": "constexpr",
+    "RD": "constexpr"
+   },
+   "constexprs": {
+    "H": 32,
+    "HK": 2,
+    "RD": 64
+   },
+   "attrs": {
+    "Q": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "K": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "V": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "COS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SIN": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "POS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SLOT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "QO": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "KC": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "VC": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "LEN": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "H": [],
+    "HK": [],
+    "RD": []
+   },
+   "entry": {
+    "symbol": "_qkv",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _qkv_param_0",
+     ".param .u64 .ptr .global .align 1 _qkv_param_1",
+     ".param .u64 .ptr .global .align 1 _qkv_param_2",
+     ".param .u64 .ptr .global .align 1 _qkv_param_3",
+     ".param .u64 .ptr .global .align 1 _qkv_param_4",
+     ".param .u64 .ptr .global .align 1 _qkv_param_5",
+     ".param .u64 .ptr .global .align 1 _qkv_param_6",
+     ".param .u64 .ptr .global .align 1 _qkv_param_7",
+     ".param .u64 .ptr .global .align 1 _qkv_param_8",
+     ".param .u64 .ptr .global .align 1 _qkv_param_9",
+     ".param .u32 _qkv_param_10",
+     ".param .u64 .ptr .global .align 1 _qkv_param_11",
+     ".param .u64 .ptr .global .align 1 _qkv_param_12"
+    ],
+    "directives": [
+     ".reqntid 32"
+    ]
+   },
+   "abi": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_0"
+    },
+    {
+     "name": "K",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_1"
+    },
+    {
+     "name": "V",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_2"
+    },
+    {
+     "name": "COS",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_3"
+    },
+    {
+     "name": "SIN",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_4"
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_5"
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_6"
+    },
+    {
+     "name": "QO",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_7"
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_8"
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_9"
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "divisibility_16": true,
+     "ptx": ".param .u32 _qkv_param_10"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_11"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _qkv_param_12"
+    }
+   ],
+   "launches": {
+    "startup": 17145
+   },
+   "grids": [
+    [
+     1,
+     36
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/families/mimo_v2/cuda/attention.py:73 qkv <- tensorfold/families/mimo_v2/cuda/forward.py:147 forward"
+   ]
+  },
+  {
+   "name": "_rms",
+   "function": "tensorfold.families.mimo_v2.cuda.ops._rms",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/families/mimo_v2/cuda/ops.py",
+    "line": 18
+   },
+   "hash": "ade50c4ee981f69c618b652d40985fabac06e296065d1ce6303c5b85cf1c32dd",
+   "cubin": "VXSQYTXJQH3JYYMLMUWUBGC7VOWANYUWAZORZZRQHRNYLTY4GLOQ/_rms.cubin",
+   "cubin_sha256": "7460eec517d84c5c3ac9d8d358e2f6f97a7c2d2d08a7cf6e40269e81074bceea",
+   "cubin_bytes": 25136,
+   "ptx": "VXSQYTXJQH3JYYMLMUWUBGC7VOWANYUWAZORZZRQHRNYLTY4GLOQ/_rms.ptx",
+   "metadata": {
+    "name": "_rms",
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "maxnreg": null,
+    "shared": 16,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "ade50c4ee981f69c618b652d40985fabac06e296065d1ce6303c5b85cf1c32dd"
+   },
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 16,
+   "n_regs": 54,
+   "n_spills": 0,
+   "signature": {
+    "X": "*fp32",
+    "W": "*fp32",
+    "OUT": "*fp16",
+    "N": "constexpr",
+    "EPS": "constexpr",
+    "BLOCK": "constexpr"
+   },
+   "constexprs": {
+    "N": 4096,
+    "EPS": {
+     "float": 1e-06,
+     "fp32_bits": "0x358637bd",
+     "fp64_bits": "0x3eb0c6f7a0b5ed8d"
+    },
+    "BLOCK": 4096
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "EPS": [],
+    "BLOCK": []
+   },
+   "entry": {
+    "symbol": "_rms",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _rms_param_0",
+     ".param .u64 .ptr .global .align 1 _rms_param_1",
+     ".param .u64 .ptr .global .align 1 _rms_param_2",
+     ".param .u64 .ptr .global .align 1 _rms_param_3",
+     ".param .u64 .ptr .global .align 1 _rms_param_4"
+    ],
+    "directives": [
+     ".reqntid 128"
+    ]
+   },
+   "abi": [
+    {
+     "name": "X",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rms_param_0"
+    },
+    {
+     "name": "W",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rms_param_1"
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rms_param_2"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _rms_param_3"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _rms_param_4"
+    }
+   ],
+   "launches": {
+    "startup": 1905
+   },
+   "grids": [
+    [
+     1
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/families/mimo_v2/cuda/ops.py:34 rms <- tensorfold/families/mimo_v2/cuda/forward.py:137 forward"
+   ]
+  },
+  {
+   "name": "_router",
+   "function": "tensorfold.cuda.moe._router",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/cuda/moe.py",
+    "line": 23
+   },
+   "hash": "83bc28b3fdd98a9025c9d577df0532a686f3dc07e4c56d0fa8426c0119a1436c",
+   "cubin": "QO6CRM753GFJAJOJ2V356BJSU2DPHXAH4TCW2D5IIJWACGNBINWA/_router.cubin",
+   "cubin_sha256": "23ec67b619c99d87cb4fcd7c372c0640cc6b7b22e61236413786d9e5788291fc",
+   "cubin_bytes": 39432,
+   "ptx": "QO6CRM753GFJAJOJ2V356BJSU2DPHXAH4TCW2D5IIJWACGNBINWA/_router.ptx",
+   "metadata": {
+    "name": "_router",
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 4,
+    "maxnreg": null,
+    "shared": 73728,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "83bc28b3fdd98a9025c9d577df0532a686f3dc07e4c56d0fa8426c0119a1436c"
+   },
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 73728,
+   "n_regs": 48,
+   "n_spills": 0,
+   "signature": {
+    "X": "*fp16",
+    "W": "*fp16",
+    "OUT": "*fp32",
+    "M": "constexpr",
+    "x_stride": "i32",
+    "D": "constexpr",
+    "NE": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_E": "constexpr",
+    "BK": "constexpr"
+   },
+   "constexprs": {
+    "M": 1,
+    "D": 4096,
+    "NE": 256,
+    "BM": 16,
+    "BLOCK_E": 32,
+    "BK": 256
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "D": [],
+    "NE": [],
+    "BM": [],
+    "BLOCK_E": [],
+    "BK": []
+   },
+   "entry": {
+    "symbol": "_router",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _router_param_0",
+     ".param .u64 .ptr .global .align 1 _router_param_1",
+     ".param .u64 .ptr .global .align 1 _router_param_2",
+     ".param .u32 _router_param_3",
+     ".param .u64 .ptr .global .align 1 _router_param_4",
+     ".param .u64 .ptr .global .align 1 _router_param_5"
+    ],
+    "directives": [
+     ".reqntid 128"
+    ]
+   },
+   "abi": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _router_param_0"
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _router_param_1"
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _router_param_2"
+    },
+    {
+     "name": "x_stride",
+     "type": "i32",
+     "divisibility_16": true,
+     "ptx": ".param .u32 _router_param_3"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _router_param_4"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _router_param_5"
+    }
+   ],
+   "launches": {
+    "startup": 89535
+   },
+   "grids": [
+    [
+     1,
+     8
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/cuda/moe.py:54 router <- tensorfold/families/mimo_v2/cuda/moe.py:83 __call__"
+   ]
+  },
+  {
+   "name": "_rows",
+   "function": "tensorfold.families.mimo_v2.cuda.attention._rows",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/families/mimo_v2/cuda/attention.py",
+    "line": 106
+   },
+   "hash": "34d02875eb4735d7e3b5bfbf16142378740614854f7512464db291e9b68915c5",
+   "cubin": "GTICQ5PLI425PY5VX67RMFBDPB2AMFEFJ52RERSNWKI6TNUJCXCQ/_rows.cubin",
+   "cubin_sha256": "eebea04d8594306add7f7d33e875bd9946cda7312c2068d5666da198ace13f3e",
+   "cubin_bytes": 85896,
+   "ptx": "GTICQ5PLI425PY5VX67RMFBDPB2AMFEFJ52RERSNWKI6TNUJCXCQ/_rows.ptx",
+   "metadata": {
+    "name": "_rows",
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 2,
+    "maxnreg": null,
+    "shared": 49152,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "34d02875eb4735d7e3b5bfbf16142378740614854f7512464db291e9b68915c5"
+   },
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 49152,
+   "n_regs": 128,
+   "n_spills": 0,
+   "signature": {
+    "Q": "*fp16",
+    "KC": "*fp16",
+    "VC": "*fp16",
+    "POS": "*i32",
+    "SLOT": "*i32",
+    "PO": "*fp32",
+    "PM": "*fp32",
+    "PL": "*fp32",
+    "LEN": "i32",
+    "NCH": "i32",
+    "H": "constexpr",
+    "HK": "constexpr",
+    "G": "constexpr",
+    "WIN": "constexpr",
+    "SCALE": "constexpr",
+    "CK": "constexpr",
+    "BN": "constexpr",
+    "GP": "constexpr"
+   },
+   "constexprs": {
+    "H": 32,
+    "HK": 2,
+    "G": 16,
+    "WIN": 0,
+    "SCALE": {
+     "float": 0.07216878364870322,
+     "fp32_bits": "0x3d93cd3a",
+     "fp64_bits": "0x3fb279a74590331c"
+    },
+    "CK": 256,
+    "BN": 64,
+    "GP": 16
+   },
+   "attrs": {
+    "Q": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "KC": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "VC": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "POS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SLOT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PO": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PM": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PL": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "LEN": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "NCH": [],
+    "H": [],
+    "HK": [],
+    "G": [],
+    "WIN": [],
+    "SCALE": [],
+    "CK": [],
+    "BN": [],
+    "GP": []
+   },
+   "entry": {
+    "symbol": "_rows",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _rows_param_0",
+     ".param .u64 .ptr .global .align 1 _rows_param_1",
+     ".param .u64 .ptr .global .align 1 _rows_param_2",
+     ".param .u64 .ptr .global .align 1 _rows_param_3",
+     ".param .u64 .ptr .global .align 1 _rows_param_4",
+     ".param .u64 .ptr .global .align 1 _rows_param_5",
+     ".param .u64 .ptr .global .align 1 _rows_param_6",
+     ".param .u64 .ptr .global .align 1 _rows_param_7",
+     ".param .u32 _rows_param_8",
+     ".param .u32 _rows_param_9",
+     ".param .u64 .ptr .global .align 1 _rows_param_10",
+     ".param .u64 .ptr .global .align 1 _rows_param_11"
+    ],
+    "directives": [
+     ".reqntid 128"
+    ]
+   },
+   "abi": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_0"
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_1"
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_2"
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_3"
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_4"
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_5"
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_6"
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_7"
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "divisibility_16": true,
+     "ptx": ".param .u32 _rows_param_8"
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "divisibility_16": false,
+     "ptx": ".param .u32 _rows_param_9"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_10"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_11"
+    }
+   ],
+   "launches": {
+    "startup": 1719
+   },
+   "grids": [
+    [
+     1,
+     2,
+     2
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/families/mimo_v2/cuda/attention.py:206 rows <- tools/mimo_zig_capture.py:112 rows"
+   ]
+  },
+  {
+   "name": "_rows",
+   "function": "tensorfold.families.mimo_v2.cuda.attention._rows",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/families/mimo_v2/cuda/attention.py",
+    "line": 106
+   },
+   "hash": "8caec40a55d22936f31afab6d48e6024a78ba2f75e870fd5dc066cd842646d2e",
+   "cubin": "RSXMICSV2IUTN4Y27K3NJDTAESTYXIXXL2DQ7VO4AZWNQQTENUXA/_rows.cubin",
+   "cubin_sha256": "6f16f810381dcf8a5d514a2a0a0ca85778328ddbf68644326c68b266fbf861a7",
+   "cubin_bytes": 90776,
+   "ptx": "RSXMICSV2IUTN4Y27K3NJDTAESTYXIXXL2DQ7VO4AZWNQQTENUXA/_rows.ptx",
+   "metadata": {
+    "name": "_rows",
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 2,
+    "maxnreg": null,
+    "shared": 49152,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "8caec40a55d22936f31afab6d48e6024a78ba2f75e870fd5dc066cd842646d2e"
+   },
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 49152,
+   "n_regs": 128,
+   "n_spills": 0,
+   "signature": {
+    "Q": "*fp16",
+    "KC": "*fp16",
+    "VC": "*fp16",
+    "POS": "*i32",
+    "SLOT": "*i32",
+    "PO": "*fp32",
+    "PM": "*fp32",
+    "PL": "*fp32",
+    "LEN": "i32",
+    "NCH": "i32",
+    "H": "constexpr",
+    "HK": "constexpr",
+    "G": "constexpr",
+    "WIN": "constexpr",
+    "SCALE": "constexpr",
+    "CK": "constexpr",
+    "BN": "constexpr",
+    "GP": "constexpr"
+   },
+   "constexprs": {
+    "H": 32,
+    "HK": 4,
+    "G": 8,
+    "WIN": 128,
+    "SCALE": {
+     "float": 0.07216878364870322,
+     "fp32_bits": "0x3d93cd3a",
+     "fp64_bits": "0x3fb279a74590331c"
+    },
+    "CK": 256,
+    "BN": 64,
+    "GP": 16
+   },
+   "attrs": {
+    "Q": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "KC": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "VC": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "POS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SLOT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PO": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PM": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PL": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "LEN": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "NCH": [],
+    "H": [],
+    "HK": [],
+    "G": [],
+    "WIN": [],
+    "SCALE": [],
+    "CK": [],
+    "BN": [],
+    "GP": []
+   },
+   "entry": {
+    "symbol": "_rows",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _rows_param_0",
+     ".param .u64 .ptr .global .align 1 _rows_param_1",
+     ".param .u64 .ptr .global .align 1 _rows_param_2",
+     ".param .u64 .ptr .global .align 1 _rows_param_3",
+     ".param .u64 .ptr .global .align 1 _rows_param_4",
+     ".param .u64 .ptr .global .align 1 _rows_param_5",
+     ".param .u64 .ptr .global .align 1 _rows_param_6",
+     ".param .u64 .ptr .global .align 1 _rows_param_7",
+     ".param .u32 _rows_param_8",
+     ".param .u32 _rows_param_9",
+     ".param .u64 .ptr .global .align 1 _rows_param_10",
+     ".param .u64 .ptr .global .align 1 _rows_param_11"
+    ],
+    "directives": [
+     ".reqntid 128"
+    ]
+   },
+   "abi": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_0"
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_1"
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_2"
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_3"
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_4"
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_5"
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_6"
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_7"
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "divisibility_16": true,
+     "ptx": ".param .u32 _rows_param_8"
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "divisibility_16": false,
+     "ptx": ".param .u32 _rows_param_9"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_10"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_11"
+    }
+   ],
+   "launches": {
+    "startup": 74295
+   },
+   "grids": [
+    [
+     1,
+     4,
+     2
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/families/mimo_v2/cuda/attention.py:206 rows <- tools/mimo_zig_capture.py:112 rows"
+   ]
+  },
+  {
+   "name": "_rows",
+   "function": "tensorfold.families.mimo_v2.cuda.attention._rows",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/families/mimo_v2/cuda/attention.py",
+    "line": 106
+   },
+   "hash": "a18c8a706d4b6db2661838b2b9ab7293528b838e01d25c9e7c20bcb38302a935",
+   "cubin": "UGGIU4DNJNW3EZQYHCZLTK3SSNJIXA4OAHJFZHT4EC6LHAYCVE2Q/_rows.cubin",
+   "cubin_sha256": "0a767a5d4a38c9bb38b42438381adc5d5d36b6923652c5136c64b933840ab8fe",
+   "cubin_bytes": 85352,
+   "ptx": "UGGIU4DNJNW3EZQYHCZLTK3SSNJIXA4OAHJFZHT4EC6LHAYCVE2Q/_rows.ptx",
+   "metadata": {
+    "name": "_rows",
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 2,
+    "maxnreg": null,
+    "shared": 49152,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "a18c8a706d4b6db2661838b2b9ab7293528b838e01d25c9e7c20bcb38302a935"
+   },
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 49152,
+   "n_regs": 128,
+   "n_spills": 0,
+   "signature": {
+    "Q": "*fp16",
+    "KC": "*fp16",
+    "VC": "*fp16",
+    "POS": "*i32",
+    "SLOT": "*i32",
+    "PO": "*fp32",
+    "PM": "*fp32",
+    "PL": "*fp32",
+    "LEN": "i32",
+    "NCH": "constexpr",
+    "H": "constexpr",
+    "HK": "constexpr",
+    "G": "constexpr",
+    "WIN": "constexpr",
+    "SCALE": "constexpr",
+    "CK": "constexpr",
+    "BN": "constexpr",
+    "GP": "constexpr"
+   },
+   "constexprs": {
+    "NCH": 1,
+    "H": 32,
+    "HK": 2,
+    "G": 16,
+    "WIN": 0,
+    "SCALE": {
+     "float": 0.07216878364870322,
+     "fp32_bits": "0x3d93cd3a",
+     "fp64_bits": "0x3fb279a74590331c"
+    },
+    "CK": 256,
+    "BN": 64,
+    "GP": 16
+   },
+   "attrs": {
+    "Q": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "KC": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "VC": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "POS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "SLOT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PO": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PM": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PL": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "LEN": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "NCH": [],
+    "H": [],
+    "HK": [],
+    "G": [],
+    "WIN": [],
+    "SCALE": [],
+    "CK": [],
+    "BN": [],
+    "GP": []
+   },
+   "entry": {
+    "symbol": "_rows",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _rows_param_0",
+     ".param .u64 .ptr .global .align 1 _rows_param_1",
+     ".param .u64 .ptr .global .align 1 _rows_param_2",
+     ".param .u64 .ptr .global .align 1 _rows_param_3",
+     ".param .u64 .ptr .global .align 1 _rows_param_4",
+     ".param .u64 .ptr .global .align 1 _rows_param_5",
+     ".param .u64 .ptr .global .align 1 _rows_param_6",
+     ".param .u64 .ptr .global .align 1 _rows_param_7",
+     ".param .u32 _rows_param_8",
+     ".param .u64 .ptr .global .align 1 _rows_param_9",
+     ".param .u64 .ptr .global .align 1 _rows_param_10"
+    ],
+    "directives": [
+     ".reqntid 128"
+    ]
+   },
+   "abi": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_0"
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_1"
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_2"
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_3"
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_4"
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_5"
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_6"
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_7"
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "divisibility_16": true,
+     "ptx": ".param .u32 _rows_param_8"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_9"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _rows_param_10"
+    }
+   ],
+   "launches": {
+    "startup": 15426
+   },
+   "grids": [
+    [
+     1,
+     2,
+     1
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/families/mimo_v2/cuda/attention.py:206 rows <- tools/mimo_zig_capture.py:112 rows"
+   ]
+  },
+  {
+   "name": "_silu_mul",
+   "function": "tensorfold.families.mimo_v2.cuda.ops._silu_mul",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/families/mimo_v2/cuda/ops.py",
+    "line": 59
+   },
+   "hash": "2c665389cce132b0ccf9798e8d908feca0ddc2388c6a1dcbde0809b092dd297b",
+   "cubin": "FRTFHCOM4EZLBTHZPGHI3EEP5SQN3QRYRRVB3S66BAE3BEW5FF5Q/_silu_mul.cubin",
+   "cubin_sha256": "03ab35d92e50468a083ca23dea6204f59f04b3e2c1d625bdfd2b380d6acaa86e",
+   "cubin_bytes": 14888,
+   "ptx": "FRTFHCOM4EZLBTHZPGHI3EEP5SQN3QRYRRVB3S66BAE3BEW5FF5Q/_silu_mul.ptx",
+   "metadata": {
+    "name": "_silu_mul",
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "maxnreg": null,
+    "shared": 0,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "2c665389cce132b0ccf9798e8d908feca0ddc2388c6a1dcbde0809b092dd297b"
+   },
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 0,
+   "n_regs": 30,
+   "n_spills": 0,
+   "signature": {
+    "G": "*fp16",
+    "U": "*fp16",
+    "OUT": "*fp16",
+    "N": "constexpr",
+    "BLOCK": "constexpr"
+   },
+   "constexprs": {
+    "N": 8192,
+    "BLOCK": 1024
+   },
+   "attrs": {
+    "G": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "U": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "BLOCK": []
+   },
+   "entry": {
+    "symbol": "_silu_mul",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _silu_mul_param_0",
+     ".param .u64 .ptr .global .align 1 _silu_mul_param_1",
+     ".param .u64 .ptr .global .align 1 _silu_mul_param_2",
+     ".param .u64 .ptr .global .align 1 _silu_mul_param_3",
+     ".param .u64 .ptr .global .align 1 _silu_mul_param_4"
+    ],
+    "directives": [
+     ".reqntid 128"
+    ]
+   },
+   "abi": [
+    {
+     "name": "G",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _silu_mul_param_0"
+    },
+    {
+     "name": "U",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _silu_mul_param_1"
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _silu_mul_param_2"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _silu_mul_param_3"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _silu_mul_param_4"
+    }
+   ],
+   "launches": {
+    "startup": 1905
+   },
+   "grids": [
+    [
+     1,
+     8
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/families/mimo_v2/cuda/ops.py:71 silu_mul <- tensorfold/families/mimo_v2/cuda/forward.py:167 forward"
+   ]
+  },
+  {
+   "name": "_topk",
+   "function": "tensorfold.families.mimo_v2.cuda.moe._topk",
+   "source": {
+    "file": "/opt/tensorfold-mimo/src/tensorfold/families/mimo_v2/cuda/moe.py",
+    "line": 29
+   },
+   "hash": "26166538040e2c24c9fdd2ca23d100ad3c8fb455d174a9e61772f584fdb11aad",
+   "cubin": "EYLGKOAEBYWCJSP52LFCHUIAVU6I7NCV2F2KTZQXOL2YJ7NRDKWQ/_topk.cubin",
+   "cubin_sha256": "756184d7f73ebf4cb1e9747435bc86374fbdf18af24a626c43bb730a0dda21c6",
+   "cubin_bytes": 56672,
+   "ptx": "EYLGKOAEBYWCJSP52LFCHUIAVU6I7NCV2F2KTZQXOL2YJ7NRDKWQ/_topk.ptx",
+   "metadata": {
+    "name": "_topk",
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "maxnreg": null,
+    "shared": 16,
+    "tmem_size": 0,
+    "global_scratch_size": 0,
+    "global_scratch_align": 1,
+    "profile_scratch_size": 0,
+    "profile_scratch_align": 1,
+    "launch_pdl": false,
+    "launch_cooperative_grid": false,
+    "ptx_version": null,
+    "arch": "sm121",
+    "enable_fp_fusion": true,
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "debug": false,
+    "sanitize_overflow": true,
+    "triton_version": "3.7.1",
+    "target": {
+     "backend": "cuda",
+     "arch": 121,
+     "warp_size": 32
+    },
+    "hash": "26166538040e2c24c9fdd2ca23d100ad3c8fb455d174a9e61772f584fdb11aad"
+   },
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "dynamic_shared_bytes": 16,
+   "n_regs": 40,
+   "n_spills": 0,
+   "signature": {
+    "L": "*fp32",
+    "BIAS": "*fp32",
+    "PICK": "*i32",
+    "WTS": "*fp32",
+    "SCALE": "fp32",
+    "NE": "constexpr",
+    "TOPK": "constexpr",
+    "BLOCK": "constexpr",
+    "KP": "constexpr"
+   },
+   "constexprs": {
+    "NE": 256,
+    "TOPK": 8,
+    "BLOCK": 256,
+    "KP": 8
+   },
+   "attrs": {
+    "L": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "BIAS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PICK": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "WTS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "NE": [],
+    "TOPK": [],
+    "BLOCK": [],
+    "KP": []
+   },
+   "entry": {
+    "symbol": "_topk",
+    "params": [
+     ".param .u64 .ptr .global .align 1 _topk_param_0",
+     ".param .u64 .ptr .global .align 1 _topk_param_1",
+     ".param .u64 .ptr .global .align 1 _topk_param_2",
+     ".param .u64 .ptr .global .align 1 _topk_param_3",
+     ".param .f32 _topk_param_4",
+     ".param .u64 .ptr .global .align 1 _topk_param_5",
+     ".param .u64 .ptr .global .align 1 _topk_param_6"
+    ],
+    "directives": [
+     ".reqntid 128"
+    ]
+   },
+   "abi": [
+    {
+     "name": "L",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _topk_param_0"
+    },
+    {
+     "name": "BIAS",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _topk_param_1"
+    },
+    {
+     "name": "PICK",
+     "type": "*i32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _topk_param_2"
+    },
+    {
+     "name": "WTS",
+     "type": "*fp32",
+     "divisibility_16": true,
+     "ptx": ".param .u64 .ptr .global .align 1 _topk_param_3"
+    },
+    {
+     "name": "SCALE",
+     "type": "fp32",
+     "divisibility_16": false,
+     "ptx": ".param .f32 _topk_param_4"
+    },
+    {
+     "name": "global_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _topk_param_5"
+    },
+    {
+     "name": "profile_scratch",
+     "type": "*i8",
+     "ptx": ".param .u64 .ptr .global .align 1 _topk_param_6"
+    }
+   ],
+   "launches": {
+    "startup": 89535
+   },
+   "grids": [
+    [
+     1
+    ]
+   ],
+   "call_sites": [
+    "tensorfold/families/mimo_v2/cuda/moe.py:89 __call__ <- tensorfold/families/mimo_v2/cuda/forward.py:163 forward"
+   ]
+  }
+ ],
+ "extension_calls": {},
+ "compiled_not_launched": [],
+ "env": {}
+}
