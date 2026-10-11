@@ -1,7 +1,7 @@
 From 9821b3cbf3660607baad429c599b31911e6050b6 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 20:33:40 +1100
-Subject: [PATCH 32/46] mimo_v2: open TP sessions with the RoCE mailbox kernel
+Subject: [PATCH 32/55] mimo_v2: open TP sessions with the RoCE mailbox kernel
  (tp_kernel, shared by tf-tp-test); RoCE was falling back to NCCL with
  NoKernel
 

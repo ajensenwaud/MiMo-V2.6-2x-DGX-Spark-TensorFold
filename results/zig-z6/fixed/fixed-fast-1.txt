@@ -1,0 +1,12 @@
+chat   rep 0: 46.34 tok/s, 512 tokens
+chat   rep 1: 44.29 tok/s, 512 tokens
+chat   rep 2: 47.85 tok/s, 512 tokens
+code   rep 0: 62.04 tok/s, 512 tokens
+code   rep 1: 70.68 tok/s, 512 tokens
+code   rep 2: 71.97 tok/s, 512 tokens
+agent  rep 0: 60.24 tok/s, 512 tokens
+agent  rep 1: 58.54 tok/s, 512 tokens
+agent  rep 2: 57.20 tok/s, 512 tokens
+report rep 0: 46.52 tok/s, 512 tokens
+report rep 1: 51.20 tok/s, 512 tokens
+report rep 2: 48.60 tok/s, 512 tokens

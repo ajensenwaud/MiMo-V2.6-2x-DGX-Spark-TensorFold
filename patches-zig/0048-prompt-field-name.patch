@@ -1,0 +1,45 @@
+From d77fe85852a206a2bab752cb8844b8b123d22f63 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 06:53:21 +1100
+Subject: [PATCH 48/55] prompt: field name
+
+---
+ zig/src/families/mimo_v2/prompt.zig | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/prompt.zig b/zig/src/families/mimo_v2/prompt.zig
+index fb98cfe7..983e44e7 100644
+--- a/zig/src/families/mimo_v2/prompt.zig
++++ b/zig/src/families/mimo_v2/prompt.zig
+@@ -67,7 +67,7 @@ pub const Prompt = struct {
+     xh: u64,
+     part: u64,
+     recv: u64,
+-    sum: u64,
++    summed: u64,
+     logits: u64,
+     pick: u64,
+     wts: u64,
+@@ -150,7 +150,7 @@ pub const Prompt = struct {
+         pr.xh = try ar.zeros(R * max_k * 2);
+         pr.part = try ar.zeros(R * D * 4);
+         pr.recv = try ar.zeros(2 * R * D * 4);
+-        pr.sum = try ar.zeros(R * D * 4);
++        pr.summed = try ar.zeros(R * D * 4);
+         pr.logits = try ar.zeros(R * cfg.experts * 4);
+         pr.pick = try ar.zeros(R * K8 * 4);
+         pr.wts = try ar.zeros(R * K8 * 4);
+@@ -233,8 +233,8 @@ pub const Prompt = struct {
+         const c = m.comm orelse return part;
+         const D = m.w.cfg.hidden;
+         try c.allGather(part, pr.recv, n * D, .f32, s.handle);
+-        try m.add2(s, pr.recv, pr.recv + n * D * 4, pr.sum, n * D);
+-        return pr.sum;
++        try m.add2(s, pr.recv, pr.recv + n * D * 4, pr.summed, n * D);
++        return pr.summed;
+     }
+ 
+     fn launch(f: cuda.Function, s: Stream, gx: usize, threads: usize, a: *cuda.Args) !void {
+-- 
+2.53.0
+

@@ -1,0 +1,45 @@
+From ba024c09d54fe011f040518e1c622390d93ddc54 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 08:58:50 +1100
+Subject: [PATCH 55/55] mimo: Python's lone-stream depth rule by default
+ (TF_MIMO_DEPTH=lanes|geometric to change)
+
+---
+ zig/src/families/mimo_v2/native.zig | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index 8fdfa583..b33288e6 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -285,10 +285,11 @@ pub const Lanes = struct {
+             .max_streams = @intCast(l.e.model.slots),
+             .shared_costs = l.shared[0..l.nshared],
+             .draft_streams = true,
+-            // TF_MIMO_DEPTH=geometric: Python's joint_widths rule for a lone stream (off by default until measured)
+-            .geometric_depth = if (std.c.getenv("TF_MIMO_DEPTH")) |v| std.mem.eql(u8, std.mem.span(v), "geometric") or std.mem.eql(u8, std.mem.span(v), "python") else false,
+-            // TF_MIMO_DEPTH=python: decoder.py's own constants (GRID[1], DRAFT_COST), not the costs measured at load
+-            .geometric_costs = if (std.c.getenv("TF_MIMO_DEPTH")) |v| (if (std.mem.eql(u8, std.mem.span(v), "python")) &python_grid1 else &.{}) else &.{},
++            // A lone stream's depth: TF_MIMO_DEPTH=python (default) Python's decoder.joint_widths with its own constants
++            // (GRID[1], DRAFT_COST 0.25; on identical texts it beats the lanes rule in 3 of 4 workloads), geometric the
++            // same rule on the costs measured at load, lanes the per-depth lanes rule. Shared rounds keep the lanes rule.
++            .geometric_depth = !depthIs("lanes"),
++            .geometric_costs = if (depthIs("geometric")) &.{} else &python_grid1,
+             .geometric_draft_cost = 0.25,
+         };
+     }
+@@ -577,6 +578,11 @@ pub fn draw(gpa: std.mem.Allocator, row: []const f32, settings: ?lanes.Sampling,
+ 
+ const Owned = struct { gpa: std.mem.Allocator, e: *Engine, l: Lanes, session: ?*tp.Session };
+ 
++fn depthIs(v: []const u8) bool {
++    const e = std.c.getenv("TF_MIMO_DEPTH") orelse return false;
++    return std.mem.eql(u8, std.mem.span(e), v);
++}
++
+ fn env(name: [:0]const u8) ?[]const u8 {
+     return std.mem.span(std.c.getenv(name) orelse return null);
+ }
+-- 
+2.53.0
+

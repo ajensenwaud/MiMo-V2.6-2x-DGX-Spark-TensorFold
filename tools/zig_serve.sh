@@ -26,7 +26,13 @@ fi
 mkdir -p "$HOME/mimo/logs"
 docker rm -f mimo-zig >/dev/null 2>&1
 ssh -n "$WORKER" "docker rm -f mimo-zig-follow >/dev/null 2>&1; docker run -d --name mimo-zig-follow $(common 1) --entrypoint $BIN/bin/tf-mimo mimo-tf:latest follow /model $AOT >/dev/null" </dev/null
-docker run -d --name mimo-zig $(common 0) --entrypoint $BIN/native/bin/tensorfold-native mimo-tf:latest \
+# NSYS=name: rank 0 under nsys (software CUDA trace), collecting NSYS_DUR s after NSYS_DELAY s; the server ends with it
+if [ -n "${NSYS:-}" ]; then
+  ENTRY="--entrypoint /usr/local/cuda/bin/nsys mimo-tf:latest profile -o /mimo/nsys/$NSYS --trace=cuda-sw,nvtx,osrt --delay ${NSYS_DELAY:-280} --duration ${NSYS_DUR:-40} --force-overwrite true $BIN/native/bin/tensorfold-native"
+else
+  ENTRY="--entrypoint $BIN/native/bin/tensorfold-native mimo-tf:latest"
+fi
+docker run -d --name mimo-zig $(common 0) $ENTRY \
   serve /model --host 0.0.0.0 --port "$PORT" --name mimo-zig --parallel 4 --context "$CONTEXT" --max-tokens 32768 --top-k 20 --top-p 0.95 >/dev/null
 for i in $(seq 1 120); do
   sleep 5

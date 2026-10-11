@@ -1,0 +1,26 @@
+plain-1: python / zig
+  chat   sha= rounds  353/ 351 drafted  313/ 345 accepted  158/ 160  ms/round  30.5/ 31.8  tok/s  47.5/ 45.9
+  chat   sha= rounds  371/ 341 drafted  275/ 351 accepted  140/ 170  ms/round  29.4/ 32.1  tok/s  47.0/ 46.8
+  chat   sha= rounds  322/ 328 drafted  357/ 380 accepted  189/ 183  ms/round  32.1/ 32.7  tok/s  49.5/ 47.8
+  code   sha= rounds  175/ 166 drafted  509/ 557 accepted  336/ 345  ms/round  44.4/ 46.9  tok/s  65.9/ 65.7
+  code   sha= rounds  163/ 154 drafted  461/ 505 accepted  348/ 358  ms/round  43.1/ 45.8  tok/s  72.9/ 72.5
+  code   sha= rounds  150/ 134 drafted  485/ 516 accepted  361/ 377  ms/round  45.6/ 49.6  tok/s  74.9/ 77.0
+  agent  sha= rounds  220/ 216 drafted  479/ 532 accepted  291/ 296  ms/round  39.9/ 41.7  tok/s  58.3/ 56.9
+  agent  sha= rounds  190/ 189 drafted  499/ 549 accepted  321/ 323  ms/round  42.8/ 45.0  tok/s  62.9/ 60.1
+  agent  sha= rounds  211/ 218 drafted  463/ 515 accepted  300/ 293  ms/round  39.7/ 40.8  tok/s  61.1/ 57.5
+  report sha= rounds  299/ 328 drafted  388/ 381 accepted  212/ 183  ms/round  34.0/ 33.1  tok/s  50.3/ 47.2
+  report sha= rounds  268/ 260 drafted  420/ 479 accepted  243/ 252  ms/round  35.4/ 37.0  tok/s  54.0/ 53.2
+  report sha= rounds  277/ 287 drafted  412/ 448 accepted  234/ 224  ms/round  35.0/ 35.4  tok/s  52.9/ 50.4
+fast-2: python / zig
+  chat   sha= rounds  353/ 334 drafted  313/ 383 accepted  158/ 178  ms/round  30.5/ 32.9  tok/s  47.5/ 46.6
+  chat   sha= rounds  371/ 334 drafted  275/ 375 accepted  140/ 177  ms/round  29.4/ 32.9  tok/s  47.0/ 46.6
+  chat   sha= rounds  322/ 304 drafted  357/ 429 accepted  189/ 207  ms/round  32.1/ 34.6  tok/s  49.5/ 48.7
+  code   sha= rounds  175/ 171 drafted  509/ 539 accepted  336/ 340  ms/round  44.4/ 46.1  tok/s  65.9/ 65.0
+  code   sha= rounds  163/ 152 drafted  461/ 480 accepted  348/ 359  ms/round  43.1/ 46.7  tok/s  72.9/ 72.1
+  code   sha= rounds  150/ 146 drafted  485/ 502 accepted  361/ 365  ms/round  45.6/ 47.2  tok/s  74.9/ 74.3
+  agent  sha= rounds  220/ 209 drafted  479/ 543 accepted  291/ 303  ms/round  39.9/ 43.0  tok/s  58.3/ 57.0
+  agent  sha= rounds  190/ 181 drafted  499/ 569 accepted  321/ 331  ms/round  42.8/ 46.3  tok/s  62.9/ 61.1
+  agent  sha= rounds  211/ 215 drafted  463/ 520 accepted  300/ 296  ms/round  39.7/ 41.6  tok/s  61.1/ 57.2
+  report sha= rounds  299/ 288 drafted  388/ 443 accepted  212/ 223  ms/round  34.0/ 36.1  tok/s  50.3/ 49.3
+  report sha= rounds  268/ 276 drafted  420/ 461 accepted  243/ 236  ms/round  35.4/ 36.4  tok/s  54.0/ 51.0
+  report sha= rounds  277/ 253 drafted  412/ 514 accepted  234/ 259  ms/round  35.0/ 39.2  tok/s  52.9/ 51.6

@@ -1,0 +1,123 @@
+From d7639cc5f0beeedb9ac169b12e3f9fb0141addf4 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 07:24:22 +1100
+Subject: [PATCH 52/55] lanes geometric_depth: the family's own cost table
+ (TF_MIMO_DEPTH=python: decoder.GRID[1], DRAFT_COST 0.25)
+
+---
+ zig/src/core/lanes/config.zig       |  8 ++++++++
+ zig/src/core/lanes/depth.zig        | 11 ++++++++++-
+ zig/src/core/lanes/engine.zig       |  2 ++
+ zig/src/families/mimo_v2/native.zig |  7 ++++++-
+ 4 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index cb32b78b..1f26aafd 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -36,6 +36,10 @@ pub const Model = struct {
+     /// chance and a draft pass charged once whatever its depth (Python mimo_v2 decoder.joint_widths, for a DFlash-style
+     /// head that drafts its whole block in one pass); off: the per-depth rule with probes (depth.zig).
+     geometric_depth: bool = false,
++    /// geometric_depth's costs as the family's own table: a forward of r rows against one row, index r - 1, past
++    /// the end extended by its last step (decoder.cost); the draft pass against one row. Empty: the measured costs.
++    geometric_costs: []const f64 = &.{},
++    geometric_draft_cost: f64 = 0,
+ };
+ 
+ pub const Config = struct {
+@@ -66,6 +70,8 @@ pub const Config = struct {
+     lane_costs: Table, // window ms by rows to 64 (lanes/plan_lanes.zig)
+     mtp_step_ms: f64,
+     geometric_depth: bool = false,
++    geometric_costs: []const f64 = &.{},
++    geometric_draft_cost: f64 = 0,
+     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
+     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
+     k: Constants = .{},
+@@ -122,6 +128,8 @@ pub const Config = struct {
+             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+             .mtp_step_ms = m.mtp_step_ms,
+             .geometric_depth = m.geometric_depth,
++            .geometric_costs = m.geometric_costs,
++            .geometric_draft_cost = m.geometric_draft_cost,
+         };
+     }
+ 
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index 50b3e4ed..5e9236b2 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -58,6 +58,8 @@ pub const Rule = struct {
+     node_probabilities: bool,
+     batch_rows: u32,
+     geometric: bool = false, // Config.geometric_depth: a lone stream's depth by its one acceptance (Python joint_widths)
++    geo_costs: []const f64 = &.{}, // Config.geometric_costs
++    geo_draft: f64 = 0,
+     sharing: bool = false, // inside budgets(): shared rounds keep the per-depth rule
+     round_ms: Table = .{}, // a round's wall time by drafts, shared by every stream
+     overhead: std.ArrayList(Overhead) = .empty, // a shared round's ms past its forward, by streams (insertion order)
+@@ -158,7 +160,7 @@ pub const Rule = struct {
+         var run: f64 = 1.0;
+         var d: i64 = 1;
+         while (d <= most) : (d += 1) {
+-            const cost = (try r.roundCost(d, who)) orelse break;
++            const cost = if (r.geo_costs.len > 0) geoCost(r.geo_costs, @intCast(d + 1)) + (if (d > 0) r.geo_draft else 0.0) else (try r.roundCost(d, who)) orelse break;
+             const at: usize = @intCast(d - 1);
+             run *= if (at < p.len) p[at] else p[p.len - 1];
+             expected += run;
+@@ -200,6 +202,13 @@ pub const Rule = struct {
+         return best;
+     }
+ 
++    /// decoder.cost for one stream: the table at `rows`, past its end extended by its last step.
++    fn geoCost(tab: []const f64, rows: usize) f64 {
++        if (rows <= tab.len) return tab[rows - 1];
++        const step = if (tab.len > 1) tab[tab.len - 1] - tab[tab.len - 2] else 0.0;
++        return tab[tab.len - 1] + @as(f64, @floatFromInt(rows - tab.len)) * step;
++    }
++
+     /// One draft after `wait` plain rounds in a row; each probe doubles the wait until drafting wins again.
+     fn probePlain(r: *Rule, st: *State) bool {
+         st.plain = (st.plain orelse 0) + 1;
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 01716da7..4ad4f4c5 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -59,6 +59,8 @@ pub const Engine = struct {
+                 .node_probabilities = cfg.node_probabilities,
+                 .batch_rows = cfg.batch_rows,
+                 .geometric = cfg.geometric_depth,
++                .geo_costs = cfg.geometric_costs,
++                .geo_draft = cfg.geometric_draft_cost,
+             },
+         };
+     }
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index 17fc82c6..af36d121 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -49,6 +49,8 @@ pub const Op = enum(i64) { hello = 0x31A0, forward = 1, draft = 2, stop = 3, pro
+ const draft_prior = [_]f64{ 0.789, 0.78, 0.801, 0.833, 0.833, 0.846, 0.825 };
+ 
+ const slots_default: usize = 4;
++/// decoder.GRID[1]: a lone stream's forward of r rows against one row (r = 1 .. 8), and DRAFT_COST (0.25).
++const python_grid1 = [_]f64{ 1.00, 1.26, 1.50, 1.75, 2.01, 2.25, 2.46, 2.67 };
+ const prompt_mod = @import("prompt.zig");
+ 
+ /// The model, its kernels and the TP session: what rank 0 serves and rank 1 follows.
+@@ -278,7 +280,10 @@ pub const Lanes = struct {
+             .shared_costs = l.shared[0..l.nshared],
+             .draft_streams = true,
+             // TF_MIMO_DEPTH=geometric: Python's joint_widths rule for a lone stream (off by default until measured)
+-            .geometric_depth = if (std.c.getenv("TF_MIMO_DEPTH")) |v| std.mem.eql(u8, std.mem.span(v), "geometric") else false,
++            .geometric_depth = if (std.c.getenv("TF_MIMO_DEPTH")) |v| std.mem.eql(u8, std.mem.span(v), "geometric") or std.mem.eql(u8, std.mem.span(v), "python") else false,
++            // TF_MIMO_DEPTH=python: decoder.py's own constants (GRID[1], DRAFT_COST), not the costs measured at load
++            .geometric_costs = if (std.c.getenv("TF_MIMO_DEPTH")) |v| (if (std.mem.eql(u8, std.mem.span(v), "python")) &python_grid1 else &.{}) else &.{},
++            .geometric_draft_cost = 0.25,
+         };
+     }
+ 
+-- 
+2.53.0
+

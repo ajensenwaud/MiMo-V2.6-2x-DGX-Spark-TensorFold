@@ -1,0 +1,53 @@
+From 4616cf6fdb3797169103e4df5bebaf369e95558c Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 08:20:44 +1100
+Subject: [PATCH 54/55] lanes: TF_LANES_DEPTH_LOG (geometric depth decisions,
+ round by round)
+
+---
+ zig/src/core/lanes/depth.zig | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index 5e9236b2..f34a1010 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -46,6 +46,15 @@ pub const Probe = struct {
+ 
+ pub const Overhead = struct { streams: u32, ms: f64 };
+ 
++/// TF_LANES_DEPTH_LOG=1: log each geometric depth decision (A/B against Python's decoder, round for round).
++var depth_log_checked = false;
++var depth_log = false;
++fn depthLogInit() void {
++    if (depth_log_checked) return;
++    depth_log_checked = true;
++    depth_log = if (std.c.getenv("TF_LANES_DEPTH_LOG")) |v| v[0] == '1' else false;
++}
++
+ pub const Rule = struct {
+     gpa: Allocator,
+     k: Constants = .{},
+@@ -181,6 +190,7 @@ pub const Rule = struct {
+     /// decoder.joint_widths for one stream: the depth (0 .. most) with the most expected tokens (1 + a + a^2 + ...) a ms
+     /// of its round; a stream that stopped drafting re-checks with one draft every 8 rounds (decoder.PROBE).
+     fn geometricDepth(r: *Rule, who: Who, alpha: f64, most: i64) !i64 {
++        depthLogInit();
+         var best: i64 = 0;
+         var best_rate: f64 = -1.0;
+         var expected: f64 = 0.0;
+@@ -198,8 +208,9 @@ pub const Rule = struct {
+         }
+         const st = &who.state.*.?;
+         st.rounds += 1;
+-        if (best == 0 and st.rounds % 8 == 0) return @min(1, most);
+-        return best;
++        const out = if (best == 0 and st.rounds % 8 == 0) @min(1, most) else best;
++        if (depth_log) std.log.info("depth round {d} alpha {d:.6} most {d} -> {d}", .{ st.rounds, alpha, most, out });
++        return out;
+     }
+ 
+     /// decoder.cost for one stream: the table at `rows`, past its end extended by its last step.
+-- 
+2.53.0
+

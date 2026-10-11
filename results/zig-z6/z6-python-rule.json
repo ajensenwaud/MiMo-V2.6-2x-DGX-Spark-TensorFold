@@ -1,0 +1,311 @@
+{
+  "tool": "spark-bench/1.0",
+  "started": "2026-10-12T08:24:00",
+  "host": "gx10",
+  "base_url": "http://localhost:8892",
+  "model": "mimo-zig",
+  "label": "Zig Z6 python-rule",
+  "preset": "full",
+  "thinking": false,
+  "server": {
+    "backend": null,
+    "context_length": null,
+    "streams": null
+  },
+  "config": {
+    "suites": [
+      "decode",
+      "depth"
+    ],
+    "concurrency": [
+      1,
+      2,
+      4
+    ],
+    "decode_tokens": 512,
+    "depths": [
+      4096,
+      16384,
+      65536,
+      131072
+    ],
+    "depth_samples": 3,
+    "gsm8k_n": 200,
+    "mmlu_per_subject": 4,
+    "quality_concurrency": 4,
+    "seed": 20261010,
+    "depth_gen_tokens": 128
+  },
+  "busy_at_start": 0,
+  "decode": [
+    {
+      "workload": "chat",
+      "concurrency": 1,
+      "per_stream_tps_mean": 46.91,
+      "per_stream_tps_min": 46.91,
+      "aggregate_tps": 45.89,
+      "aggregate_decode_tps": 47.0,
+      "ttft_p50_s": 0.263,
+      "completion_tokens": [
+        512
+      ],
+      "finish": [
+        "length"
+      ],
+      "contended": false
+    },
+    {
+      "workload": "chat",
+      "concurrency": 2,
+      "per_stream_tps_mean": 32.46,
+      "per_stream_tps_min": 28.35,
+      "aggregate_tps": 55.15,
+      "aggregate_decode_tps": 56.0,
+      "ttft_p50_s": 0.412,
+      "completion_tokens": [
+        512,
+        512
+      ],
+      "finish": [
+        "length"
+      ],
+      "contended": false
+    },
+    {
+      "workload": "chat",
+      "concurrency": 4,
+      "per_stream_tps_mean": 20.72,
+      "per_stream_tps_min": 18.46,
+      "aggregate_tps": 73.23,
+      "aggregate_decode_tps": 74.0,
+      "ttft_p50_s": 0.685,
+      "completion_tokens": [
+        512,
+        512,
+        512,
+        512
+      ],
+      "finish": [
+        "length"
+      ],
+      "contended": false
+    },
+    {
+      "workload": "code",
+      "concurrency": 1,
+      "per_stream_tps_mean": 64.25,
+      "per_stream_tps_min": 64.25,
+      "aggregate_tps": 62.05,
+      "aggregate_decode_tps": 64.38,
+      "ttft_p50_s": 0.299,
+      "completion_tokens": [
+        512
+      ],
+      "finish": [
+        "length"
+      ],
+      "contended": false
+    },
+    {
+      "workload": "code",
+      "concurrency": 2,
+      "per_stream_tps_mean": 49.84,
+      "per_stream_tps_min": 43.82,
+      "aggregate_tps": 79.53,
+      "aggregate_decode_tps": 87.82,
+      "ttft_p50_s": 1.799,
+      "completion_tokens": [
+        512,
+        512
+      ],
+      "finish": [
+        "length"
+      ],
+      "contended": false
+    },
+    {
+      "workload": "code",
+      "concurrency": 4,
+      "per_stream_tps_mean": 24.82,
+      "per_stream_tps_min": 21.85,
+      "aggregate_tps": 86.58,
+      "aggregate_decode_tps": 87.57,
+      "ttft_p50_s": 2.131,
+      "completion_tokens": [
+        512,
+        512,
+        512,
+        512
+      ],
+      "finish": [
+        "length"
+      ],
+      "contended": false
+    },
+    {
+      "workload": "agent",
+      "concurrency": 1,
+      "per_stream_tps_mean": 55.89,
+      "per_stream_tps_min": 55.89,
+      "aggregate_tps": 54.08,
+      "aggregate_decode_tps": 56.0,
+      "ttft_p50_s": 0.325,
+      "completion_tokens": [
+        512
+      ],
+      "finish": [
+        "length"
+      ],
+      "contended": false
+    },
+    {
+      "workload": "agent",
+      "concurrency": 2,
+      "per_stream_tps_mean": 46.75,
+      "per_stream_tps_min": 40.54,
+      "aggregate_tps": 79.2,
+      "aggregate_decode_tps": 81.23,
+      "ttft_p50_s": 0.478,
+      "completion_tokens": [
+        512,
+        512
+      ],
+      "finish": [
+        "length"
+      ],
+      "contended": false
+    },
+    {
+      "workload": "agent",
+      "concurrency": 4,
+      "per_stream_tps_mean": 19.82,
+      "per_stream_tps_min": 16.63,
+      "aggregate_tps": 65.94,
+      "aggregate_decode_tps": 66.67,
+      "ttft_p50_s": 0.808,
+      "completion_tokens": [
+        512,
+        512,
+        512,
+        512
+      ],
+      "finish": [
+        "length"
+      ],
+      "contended": false
+    },
+    {
+      "workload": "report",
+      "concurrency": 1,
+      "per_stream_tps_mean": 47.74,
+      "per_stream_tps_min": 47.74,
+      "aggregate_tps": 46.7,
+      "aggregate_decode_tps": 47.84,
+      "ttft_p50_s": 0.26,
+      "completion_tokens": [
+        512
+      ],
+      "finish": [
+        "length"
+      ],
+      "contended": false
+    },
+    {
+      "workload": "report",
+      "concurrency": 2,
+      "per_stream_tps_mean": 37.2,
+      "per_stream_tps_min": 34.84,
+      "aggregate_tps": 68.6,
+      "aggregate_decode_tps": 69.82,
+      "ttft_p50_s": 0.397,
+      "completion_tokens": [
+        512,
+        512
+      ],
+      "finish": [
+        "length"
+      ],
+      "contended": false
+    },
+    {
+      "workload": "report",
+      "concurrency": 4,
+      "per_stream_tps_mean": 20.43,
+      "per_stream_tps_min": 19.08,
+      "aggregate_tps": 73.6,
+      "aggregate_decode_tps": 74.32,
+      "ttft_p50_s": 0.654,
+      "completion_tokens": [
+        512,
+        512,
+        512,
+        512
+      ],
+      "finish": [
+        "length"
+      ],
+      "contended": false
+    }
+  ],
+  "depth": [
+    {
+      "target_tokens": 4096,
+      "prompt_tokens": 3987,
+      "ttft_s": 5.923,
+      "prefill_tps": 673.1,
+      "decode_tps": 46.34,
+      "samples": 3,
+      "cached_prompt_tokens": [
+        null,
+        null,
+        null
+      ],
+      "contended": false
+    },
+    {
+      "target_tokens": 16384,
+      "prompt_tokens": 15999,
+      "ttft_s": 12.269,
+      "prefill_tps": 1302.5,
+      "decode_tps": 37.8,
+      "samples": 3,
+      "cached_prompt_tokens": [
+        null,
+        null,
+        null
+      ],
+      "contended": false
+    },
+    {
+      "target_tokens": 65536,
+      "prompt_tokens": 63989,
+      "ttft_s": 55.635,
+      "prefill_tps": 1150.2,
+      "decode_tps": 36.77,
+      "samples": 3,
+      "cached_prompt_tokens": [
+        null,
+        null,
+        null
+      ],
+      "contended": false
+    },
+    {
+      "target_tokens": 131072,
+      "prompt_tokens": 128083,
+      "ttft_s": 119.063,
+      "prefill_tps": 1075.8,
+      "decode_tps": 30.87,
+      "samples": 3,
+      "cached_prompt_tokens": [
+        null,
+        null,
+        null
+      ],
+      "contended": false
+    }
+  ],
+  "rejected_request_fields": [],
+  "wall_s": 844.5,
+  "contended": false
+}

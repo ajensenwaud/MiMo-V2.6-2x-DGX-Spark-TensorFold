@@ -1,7 +1,7 @@
 From 5a5c81493a2aac4e69bc5ece58892d8fba3713f3 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 22:54:00 +1100
-Subject: [PATCH 42/46] EvProf: enum values
+Subject: [PATCH 42/55] EvProf: enum values
 
 ---
  zig/src/families/mimo_v2/forward.zig | 2 +-

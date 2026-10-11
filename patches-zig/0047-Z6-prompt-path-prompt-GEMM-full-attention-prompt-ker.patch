@@ -1,0 +1,904 @@
+From 4338fd1677bff115e3d30d361b1adb84bbd2b1fa Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 06:52:23 +1100
+Subject: [PATCH 47/55] Z6: prompt path (prompt GEMM, full-attention prompt
+ kernel, per-expert prompt MoE with torch's glue), chunk plan, tf-mimo prompt
+ gate
+
+---
+ zig/kernels/cuda/mimo_v2/glue.cu     |  72 +++++
+ zig/src/cuda/exl3.zig                |  27 +-
+ zig/src/families/mimo_v2/dflash.zig  |  19 +-
+ zig/src/families/mimo_v2/load.zig    |  14 +-
+ zig/src/families/mimo_v2/m1_main.zig | 152 ++++++++-
+ zig/src/families/mimo_v2/prompt.zig  | 467 +++++++++++++++++++++++++++
+ zig/src/families/mimo_v2/root.zig    |   2 +
+ 7 files changed, 740 insertions(+), 13 deletions(-)
+ create mode 100644 zig/src/families/mimo_v2/prompt.zig
+
+diff --git a/zig/kernels/cuda/mimo_v2/glue.cu b/zig/kernels/cuda/mimo_v2/glue.cu
+index 0fcee924..fd61924f 100644
+--- a/zig/kernels/cuda/mimo_v2/glue.cu
++++ b/zig/kernels/cuda/mimo_v2/glue.cu
+@@ -69,3 +69,75 @@ extern "C" __global__ void mimo_argmax(const float* __restrict__ recv, int32_t*
+     }
+     if (tid == 0) out[r] = bi[0];
+ }
++
++// ---- Z6: the prompt path's MoE glue (moe.MoE._prompt), torch's ops bit for bit -------------------------------------
++// counts = torch.bincount(pick.flatten(), minlength=E) (counts are exact whatever the atomic order)
++extern "C" __global__ void mimo_moe_count(const int32_t* __restrict__ pick, int n, int32_t* __restrict__ counts) {
++    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) atomicAdd(&counts[pick[i]], 1);
++}
++
++// order = torch.argsort(pick.flatten(), stable=True): a block per expert e places its (row, slot) pairs at
++// starts[e] .. in increasing flat index (a ballot scan per 1024-entry tile).
++extern "C" __global__ void __launch_bounds__(1024) mimo_moe_order(const int32_t* __restrict__ pick, int n,
++                                                                  const int32_t* __restrict__ starts,
++                                                                  int32_t* __restrict__ order) {
++    __shared__ int warp_n[32];
++    __shared__ int base;
++    const int e = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    if (threadIdx.x == 0) base = starts[e];
++    __syncthreads();
++    for (int t0 = 0; t0 < n; t0 += blockDim.x) {
++        const int i = t0 + threadIdx.x;
++        const bool mine = i < n && pick[i] == e;
++        const unsigned bal = __ballot_sync(0xffffffffu, mine);
++        if (lane == 0) warp_n[warp] = __popc(bal);
++        __syncthreads();
++        int before = 0;
++        for (int w = 0; w < warp; ++w) before += warp_n[w];
++        if (mine) order[base + before + __popc(bal & ((1u << lane) - 1u))] = i;
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            int tot = 0;
++            for (int w = 0; w < (int)(blockDim.x >> 5); ++w) tot += warp_n[w];
++            base += tot;
++        }
++        __syncthreads();
++    }
++}
++
++// xs = x.index_select(0, order // k); ws = wts.flatten().index_select(0, order) / scale (torch divides by a CPU
++// scalar as a product with its fp32 reciprocal); inv[order] = arange. A block per routed copy j.
++extern "C" __global__ void mimo_moe_gather(const uint16_t* __restrict__ x, const int32_t* __restrict__ order,
++                                           const float* __restrict__ wts, float inv_scale, int k, int D,
++                                           uint16_t* __restrict__ xs, float* __restrict__ ws,
++                                           int32_t* __restrict__ inv) {
++    const int64_t j = blockIdx.x;
++    const int32_t o = order[j];
++    const uint16_t* src = x + (int64_t)(o / k) * D;
++    for (int d = threadIdx.x; d < D; d += blockDim.x) xs[j * D + d] = src[d];
++    if (threadIdx.x == 0) {
++        ws[j] = wts[o] * inv_scale;
++        inv[o] = (int32_t)j;
++    }
++}
++
++// out = d.index_select(0, inv).view(rows, k, D).sum(1) (* scale when scale != 1): torch's reduce over a strided
++// dimension of 8 runs one thread an output with 4 accumulators (vt0): a_i = (0 + x_i) + x_{i+4}, then
++// ((a_0 + a_1) + a_2) + a_3. k == 8 only.
++extern "C" __global__ void mimo_moe_combine(const float* __restrict__ d, const int32_t* __restrict__ inv, int D,
++                                            float scale, int apply, float* __restrict__ out) {
++    const int64_t r = blockIdx.x;
++    int32_t at[8];
++#pragma unroll
++    for (int j = 0; j < 8; ++j) at[j] = inv[r * 8 + j];
++    for (int c = threadIdx.x; c < D; c += blockDim.x) {
++        float a[4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) a[i] = 0.0f + d[(int64_t)at[i] * D + c];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) a[i] = a[i] + d[(int64_t)at[i + 4] * D + c];
++        float y = ((a[0] + a[1]) + a[2]) + a[3];
++        if (apply) y = y * scale;
++        out[r * D + c] = y;
++    }
++}
+diff --git a/zig/src/cuda/exl3.zig b/zig/src/cuda/exl3.zig
+index 34b25166..2897c853 100644
+--- a/zig/src/cuda/exl3.zig
++++ b/zig/src/cuda/exl3.zig
+@@ -153,6 +153,21 @@ pub const Experts = struct {
+     width: usize, // I (this rank's)
+     k2_gu: [2]u32, // (min, max) over gate and up
+     k2_d: [2]u32,
++    /// Host copies of the pointer and width tables, [gate E, up E, down E] (the prompt path's per-expert GEMMs).
++    host_ptr: []const u64 = &.{},
++    host_k2: []const i32 = &.{},
++
++    /// Expert e's gate (j 0), up (1) or down (2) as an Exl3Linear view of its stored trellis (moe._linears).
++    pub fn linear(x: Experts, e: usize, j: usize) Linear {
++        const E = x.count;
++        const D = x.dims;
++        const I = x.width;
++        return switch (j) {
++            0 => .{ .words = x.host_ptr[e], .suh = x.suh_g + e * D * 2, .svh = x.svh_g + e * I * 2, .counters = 0, .k = D, .n = I, .k2 = @intCast(x.host_k2[e]), .split = .{ 1, 1 } },
++            1 => .{ .words = x.host_ptr[E + e], .suh = x.suh_u + e * D * 2, .svh = x.svh_u + e * I * 2, .counters = 0, .k = D, .n = I, .k2 = @intCast(x.host_k2[E + e]), .split = .{ 1, 1 } },
++            else => .{ .words = x.host_ptr[2 * E + e], .suh = x.suh_d + e * I * 2, .svh = x.svh_d + e * D * 2, .counters = 0, .k = I, .n = D, .k2 = @intCast(x.host_k2[2 * E + e]), .split = .{ 1, 1 } },
++        };
++    }
+ };
+ 
+ /// Scratch for up to `rows` rows of `slots` slots (experts.Scratch); device addresses, sized by `bytes`.
+@@ -293,8 +308,18 @@ pub const Kernels = struct {
+ 
+     /// exl3_unpack_cuda: W (K, N) fp16 from the strips layout.
+     pub fn unpackWeight(k: *const Kernels, s: Stream, l: Linear, w: u64) !void {
++        return k.unpackStrided(s, l, w, l.strides());
++    }
++
++    /// Exl3Linear.strides for the "stored" layout [K/16, N/16, W] (experts.prepare's trellises).
++    pub fn storedStrides(l: Linear) [2]i64 {
++        const tw: i64 = 4 * @as(i64, l.k2);
++        return .{ @as(i64, @intCast(l.n / 16)) * tw, 8 * tw };
++    }
++
++    /// exl3_unpack_cuda with explicit (k tile, 128-column block) strides in words.
++    pub fn unpackStrided(k: *const Kernels, s: Stream, l: Linear, w: u64, st: [2]i64) !void {
+         const ki = k2Index(l.k2) orelse return error.UnsupportedWidth;
+-        const st = l.strides();
+         var a: Args = .{};
+         a.add(l.words);
+         a.add(w);
+diff --git a/zig/src/families/mimo_v2/dflash.zig b/zig/src/families/mimo_v2/dflash.zig
+index 89aa9cae..3d02d998 100644
+--- a/zig/src/families/mimo_v2/dflash.zig
++++ b/zig/src/families/mimo_v2/dflash.zig
+@@ -288,10 +288,15 @@ pub const Drafter = struct {
+ 
+     /// The target forward's tap: residual rows after target layer `layer` (when tapped) into the tap buffer.
+     pub fn tap(dr: *Drafter, s: Stream, layer: usize, res: u64, n: usize) !void {
++        return dr.tapInto(s, layer, res, n, dr.tapbuf);
++    }
++
++    /// `tap` into another buffer of the same row layout (a prompt chunk's last TOKENS_PER_UPDATE rows).
++    pub fn tapInto(dr: *Drafter, s: Stream, layer: usize, res: u64, n: usize, dst: u64) !void {
+         const j = std.mem.indexOfScalar(usize, dr.taps, layer) orelse return;
+         var a: cuda.Args = .{};
+         a.add(res);
+-        a.add(dr.tapbuf);
++        a.add(dst);
+         a.add(@as(c_int, @intCast(dr.hidden)));
+         a.add(@as(c_int, @intCast(dr.taps.len)));
+         a.add(@as(c_int, @intCast(j)));
+@@ -300,14 +305,18 @@ pub const Drafter = struct {
+ 
+     /// Drafter.update: the target's `n` rows (positions / slots staged in the target's buffers) into the caches.
+     pub fn update(dr: *Drafter, s: Stream, n: usize) !void {
+-        const m = dr.m;
+-        try dr.proj(s, dr.fc, dr.tapbuf, dr.ctx32, true, n);
++        return dr.updateFrom(s, dr.tapbuf, dr.m.b.pos, dr.m.b.slot, n);
++    }
++
++    /// `update` from given taps, positions and slots (n <= the decode rows).
++    pub fn updateFrom(dr: *Drafter, s: Stream, taps: u64, pos: u64, slot: u64, n: usize) !void {
++        try dr.proj(s, dr.fc, taps, dr.ctx32, true, n);
+         try dr.rms(s, dr.ctx32, dr.fc_norm, dr.ctx, n);
+         for (dr.layers, 0..) |L, i| {
+             try dr.proj(s, L.k, dr.ctx, dr.kb, false, n);
+-            try dr.normRope(s, dr.kb, L.k_norm, m.b.pos, m.b.slot, 0, dr.kc[i], dr.kv, n);
++            try dr.normRope(s, dr.kb, L.k_norm, pos, slot, 0, dr.kc[i], dr.kv, n);
+             try dr.proj(s, L.v, dr.ctx, dr.vb, false, n);
+-            try dr.store(s, dr.vb, m.b.pos, m.b.slot, dr.vc[i], n);
++            try dr.store(s, dr.vb, pos, slot, dr.vc[i], n);
+         }
+     }
+ 
+diff --git a/zig/src/families/mimo_v2/load.zig b/zig/src/families/mimo_v2/load.zig
+index d527ce48..a616d962 100644
+--- a/zig/src/families/mimo_v2/load.zig
++++ b/zig/src/families/mimo_v2/load.zig
+@@ -201,6 +201,10 @@ pub const Weights = struct {
+     gpa: std.mem.Allocator,
+ 
+     pub fn deinit(w: *Weights) void {
++        for (w.layers) |L| if (L.experts) |e| {
++            w.gpa.free(e.host_ptr);
++            w.gpa.free(e.host_k2);
++        };
+         w.gpa.free(w.layers);
+         w.arena.deinit();
+     }
+@@ -284,10 +288,10 @@ fn f32Upload(gpa: std.mem.Allocator, ar: *Arena, t: core.safetensors.Tensor) !u6
+ fn experts(gpa: std.mem.Allocator, ar: *Arena, ck: *core.Checkpoint, full: Config, cuts: []const config.Cut) !exl3.Experts {
+     const E = full.experts;
+     if (cuts.len != 3 * E) return error.ExpertCuts;
+-    const ptrs = try gpa.alloc(u64, 3 * E);
+-    defer gpa.free(ptrs);
+-    const k2s = try gpa.alloc(i32, 3 * E);
+-    defer gpa.free(k2s);
++    const ptrs = try gpa.alloc(u64, 3 * E); // kept: Experts.host_ptr
++    errdefer gpa.free(ptrs);
++    const k2s = try gpa.alloc(i32, 3 * E); // kept: Experts.host_k2
++    errdefer gpa.free(k2s);
+     var st: [6]std.ArrayList(f16) = @splat(.empty); // suh_g, suh_u, svh_g, svh_u, suh_d, svh_d
+     defer for (&st) |*l| l.deinit(gpa);
+     var lo: [2]u32 = .{ 99, 99 };
+@@ -337,6 +341,8 @@ fn experts(gpa: std.mem.Allocator, ar: *Arena, ck: *core.Checkpoint, full: Confi
+         .width = width,
+         .k2_gu = .{ lo[0], hi[0] },
+         .k2_d = .{ lo[1], hi[1] },
++        .host_ptr = ptrs,
++        .host_k2 = k2s,
+     };
+ }
+ 
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index fa9ef108..158028a1 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -72,18 +72,20 @@ pub fn main(init: std.process.Init) !u8 {
+     const is_drafted = args.len >= 5 and std.mem.eql(u8, args[1], "drafted");
+     const is_follow = args.len >= 4 and std.mem.eql(u8, args[1], "follow");
+     const is_timing = args.len >= 5 and std.mem.eql(u8, args[1], "timing");
+-    if (!is_m1 and !is_win and !is_dfl and !is_drafted and !is_follow and !is_timing) {
++    const is_prompt = args.len >= 5 and std.mem.eql(u8, args[1], "prompt");
++    if (!is_m1 and !is_win and !is_dfl and !is_drafted and !is_follow and !is_timing and !is_prompt) {
+         std.debug.print("usage: tf-mimo m1 MODEL ORACLE(rank<R>.safetensors) AOT_DIR [CONTEXT]\n" ++
+             "       tf-mimo windows MODEL ORACLE AOT_DIR WINDOWS_JSON(windows-r<R>.json)\n" ++
+             "       tf-mimo dflash MODEL ORACLE AOT_DIR DFLASH_JSON(dflash-r<R>.json)\n" ++
+             "       tf-mimo drafted MODEL ORACLE AOT_DIR\n" ++
+             "       tf-mimo follow MODEL AOT_DIR   (TP rank 1 behind tensorfold-native serve on rank 0)\n" ++
+-            "       tf-mimo timing MODEL ORACLE AOT_DIR   (both ranks: graphed forward costs, drafter off then on)\n", .{});
++            "       tf-mimo timing MODEL ORACLE AOT_DIR   (both ranks: graphed forward costs, drafter off then on)\n" ++
++            "       tf-mimo prompt MODEL PROMPT_KEY(prompt-r<R>.safetensors) AOT_DIR   (Z6: the prompt path vs Python's)\n", .{});
+         return 2;
+     }
+     const gpa = init.gpa;
+     const io = init.io;
+-    const context: usize = if (is_timing) (if (std.c.getenv("TF_MIMO_TIMING_CONTEXT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 32768) else if (is_m1 and args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096; // timing: graphs-3.0.json's context
++    const context: usize = if (is_prompt) 32768 else if (is_timing) (if (std.c.getenv("TF_MIMO_TIMING_CONTEXT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 32768) else if (is_m1 and args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096; // timing: graphs-3.0.json's context
+     const rows_max: usize = if (is_m1) 1 else 128;
+     const slots: usize = if (is_m1) 1 else 4;
+     const cfg = try tp.Config.fromEnv();
+@@ -117,6 +119,7 @@ pub fn main(init: std.process.Init) !u8 {
+     var ora = try core.safetensors.File.open(gpa, io, args[3]);
+     defer ora.close(io);
+     if (is_win) return windows(gpa, io, &model, s, &ora, args[5], rank);
++    if (is_prompt) return promptGate(gpa, &model, s, &ora, rank);
+     if (std.mem.eql(u8, args[1], "timing")) {
+         try timing(io, &model, s, rank, "drafter off");
+         const ddir = try std.fmt.allocPrint(gpa, "{s}/dflash", .{args[2]});
+@@ -555,3 +558,146 @@ fn timing(io: std.Io, model: *mimo.forward.Model, s: cuda.Stream, rank: usize, l
+         std.debug.print("[timing] rank {d} {s}: draft pass, {d} stream(s): {d:.2} ms ({s})\n", .{ rank, label, S, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6 / reps, if (dr.use_graphs) "graphed" else "eager" });
+     };
+ }
++
++
++const PCmp = struct {
++    gpa: std.mem.Allocator,
++    d: *const cuda.Driver,
++    s: cuda.Stream,
++    ora: *const core.safetensors.File,
++    name: []const u8,
++    chunk: usize,
++    rank: usize,
++    host: []u8,
++    checked: usize = 0,
++    equal: usize = 0,
++    first_fail: ?[]const u8 = null,
++};
++
++/// tools/mimo_zig_prompt.py's fingerprint: per row, sum over columns of the fp32 bits (as int32) times (2c + 1).
++fn fingerprint(row: []const u8) i64 {
++    var acc: i64 = 0;
++    for (0..row.len / 4) |c| acc +%= @as(i64, std.mem.readInt(i32, row[4 * c ..][0..4], .little)) *% @as(i64, @intCast(2 * c + 1));
++    return acc;
++}
++
++fn promptHook(ctx: *anyopaque, what: mimo.forward.Model.Tap, layer: usize, dev: u64, bytes: usize) anyerror!void {
++    const c: *PCmp = @ptrCast(@alignCast(ctx));
++    if (what == .att) return;
++    var nb: [128]u8 = undefined;
++    const key = try std.fmt.bufPrint(&nb, "{s}.c{d}.{s}.{d}", .{ c.name, c.chunk, if (what == .attn) "fpa" else "fp", layer });
++    const want = c.ora.get(key) orelse return error.NoFingerprint;
++    try c.s.synchronize();
++    try c.d.check(c.d.api.cuMemcpyDtoH_v2(@ptrCast(c.host.ptr), dev, bytes), "capture");
++    const rows = want.bytes.len / 8;
++    const D = bytes / 4 / rows;
++    var bad: usize = 0;
++    var first: ?usize = null;
++    for (0..rows) |r| {
++        const w = std.mem.readInt(i64, want.bytes[8 * r ..][0..8], .little);
++        if (fingerprint(c.host[r * D * 4 ..][0 .. D * 4]) != w) {
++            bad += 1;
++            if (first == null) first = r;
++        }
++    }
++    c.checked += 1;
++    if (bad == 0) {
++        c.equal += 1;
++        return;
++    }
++    if (c.first_fail == null) {
++        c.first_fail = try c.gpa.dupe(u8, key);
++        std.debug.print("FIRST DIFF {s}: {d} of {d} rows differ (first row {?d})\n", .{ key, bad, rows, first });
++    }
++}
++
++fn hostArgmax(model: *mimo.forward.Model, s: cuda.Stream, logits: []f32) !usize {
++    try model.logitsTo(s, 1, logits);
++    return mimo.forward.argmax(logits);
++}
++
++/// Z6 gate: the Python prompt answer key's scenarios (tools/mimo_zig_prompt.py) through the Zig prompt path, the
++/// same chunks: every layer's residual fingerprints per row and each chunk's last-row logits byte-equal, then the
++/// greedy decode rows after the prompt equal. Then each scenario again in the serving plan's chunks (cap 4096, no
++/// capture): last logits and greedy rows equal Python's (rows never depend on their chunk; "mixed" excepted: its
++/// 200-row chunk ran the grouped experts in Python).
++fn promptGate(gpa: std.mem.Allocator, model: *mimo.forward.Model, s: cuda.Stream, ora: *const core.safetensors.File, rank: usize) !u8 {
++    const names = [_][]const u8{ "short", "mid", "multi", "mixed", "big" };
++    const pr = try mimo.prompt.Prompt.init(model, gpa, 9000, s);
++    defer pr.deinit();
++    std.debug.print("[prompt] rank {d}: prompt scratch {d:.2} GiB for 9000 rows\n", .{ rank, @as(f64, @floatFromInt(pr.bytes())) / (1 << 30) });
++    const V = model.w.full.vocab;
++    const logits = try gpa.alloc(f32, V);
++    defer gpa.free(logits);
++    const host = try gpa.alloc(u8, 9000 * model.w.cfg.hidden * 4);
++    defer gpa.free(host);
++    var c: PCmp = .{ .gpa = gpa, .d = model.d, .s = s, .ora = ora, .name = "", .chunk = 0, .rank = rank, .host = host };
++    var nb: [128]u8 = undefined;
++    var logits_ok: usize = 0;
++    var logits_n: usize = 0;
++    var steps_ok: usize = 0;
++    var steps_n: usize = 0;
++    var plan_ok: usize = 0;
++    var plan_n: usize = 0;
++    for (names) |name| {
++        c.name = name;
++        const ids_t = ora.get(try std.fmt.bufPrint(&nb, "{s}.ids", .{name})) orelse return error.NoIds;
++        const ch_t = ora.get(try std.fmt.bufPrint(&nb, "{s}.chunks", .{name})) orelse return error.NoChunks;
++        const am_t = ora.get(try std.fmt.bufPrint(&nb, "{s}.argmax", .{name})) orelse return error.NoArgmax;
++        const ids32 = std.mem.bytesAsSlice(i32, @as([]align(1) const u8, ids_t.bytes));
++        const chunks = std.mem.bytesAsSlice(i32, @as([]align(1) const u8, ch_t.bytes));
++        const am = std.mem.bytesAsSlice(i32, @as([]align(1) const u8, am_t.bytes));
++        const ids = try gpa.alloc(i64, ids32.len);
++        defer gpa.free(ids);
++        for (ids32, ids) |a, *b| b.* = a;
++        var last_want: []const u8 = &.{};
++        for (0..2) |pass| {
++            // pass 0: Python's chunks, captured; pass 1: the serving plan's chunks (cap 4096), uncaptured
++            var cuts: std.ArrayList(usize) = .empty;
++            defer cuts.deinit(gpa);
++            if (pass == 0) {
++                for (chunks) |x| try cuts.append(gpa, @intCast(x));
++            } else {
++                const pl = try mimo.prompt.plan(gpa, 0, ids.len, 4096);
++                defer gpa.free(pl);
++                try cuts.appendSlice(gpa, pl);
++            }
++            var p0: usize = 0;
++            for (cuts.items, 0..) |n, j| {
++                c.chunk = j;
++                try pr.chunk(s, 0, p0, ids[p0 .. p0 + n], if (pass == 0) .{ .hook = &promptHook, .ctx = &c } else null);
++                try model.logitsTo(s, 1, logits);
++                if (pass == 0) {
++                    const lw = ora.get(try std.fmt.bufPrint(&nb, "{s}.c{d}.logits", .{ name, j })) orelse return error.NoLogits;
++                    logits_n += 1;
++                    if (std.mem.eql(u8, std.mem.sliceAsBytes(logits), lw.bytes)) logits_ok += 1 else std.debug.print("[prompt] {s} chunk {d}: last-row logits differ\n", .{ name, j });
++                    last_want = lw.bytes;
++                }
++                p0 += n;
++            }
++            // greedy decode rows after the prompt (decode path, eager), from the last chunk's logits
++            var tok: i64 = @intCast(mimo.forward.argmax(logits));
++            var ok: usize = 0;
++            var first_bad: ?usize = null;
++            var pos: usize = ids.len;
++            for (am, 0..) |want, step| {
++                if (tok == want) ok += 1 else if (first_bad == null) first_bad = step;
++                if (step + 1 == am.len) break;
++                try model.forward(s, &.{.{ .slot = 0, .pos = @intCast(pos), .token = tok }}, logits, null);
++                tok = @intCast(mimo.forward.argmax(logits));
++                pos += 1;
++            }
++            if (pass == 0) {
++                steps_ok += ok;
++                steps_n += am.len;
++            } else if (!std.mem.eql(u8, name, "mixed")) {
++                plan_n += 1;
++                if (ok == am.len) plan_ok += 1;
++            }
++            std.debug.print("[prompt] rank {d} {s} ({s}, {d} chunks): greedy {d}/{d}{s}\n", .{ rank, name, if (pass == 0) "Python's chunks" else "serving plan", cuts.items.len, ok, am.len, if (first_bad) |b| try std.fmt.bufPrint(&nb, " (first difference at {d})", .{b}) else "" });
++        }
++    }
++    const exact = c.first_fail == null and logits_ok == logits_n and steps_ok == steps_n and plan_ok == plan_n;
++    std.debug.print("{s} prompt rank {d}: fingerprints {d}/{d} layer captures; last-row logits {d}/{d}; greedy {d}/{d}; serving plan {d}/{d} scenarios{s}{s}\n", .{ if (exact) "PASS" else "FAIL", rank, c.equal, c.checked, logits_ok, logits_n, steps_ok, steps_n, plan_ok, plan_n, if (c.first_fail != null) "; first difference " else "", c.first_fail orelse "" });
++    return if (exact) 0 else 1;
++}
+diff --git a/zig/src/families/mimo_v2/prompt.zig b/zig/src/families/mimo_v2/prompt.zig
+new file mode 100644
+index 00000000..fb98cfe7
+--- /dev/null
++++ b/zig/src/families/mimo_v2/prompt.zig
+@@ -0,0 +1,467 @@
++//! MiMo-V2's prompt path (Z6), as the Python engine runs a prompt chunk (forward.Model.forward(prompt=True), f3a8c11):
++//!   - every EXL3 projection on the prompt GEMM (exl3/prefill.py matmul: rot_in, W_q unpacked once a call, the Triton
++//!     `_gemm` with its Hadamard epilogue; a row's bits never depend on its chunk);
++//!   - full layers on the full-attention prompt kernel (attention._prompt, over one slot's cache); sliding layers on
++//!     the decode rows kernel, as Python's prompt chunks run them;
++//!   - routed experts per expert on the prompt GEMM from PROMPT_EXPERTS_MIN rows (moe.MoE._prompt: stable expert
++//!     order, gathered copies, routing weight folded into down's input, torch's 8-way sum), the grouped decode kernel
++//!     below that;
++//!   - the drafter fed the chunk's last TOKENS_PER_UPDATE rows (in decode-GEMV windows of 128: its bits differ from
++//!     Python's prompt-GEMM update, a drafter only proposes);
++//!   - the last row's logits through the decode head (forward._head on x[rows]).
++//! Kernels are the Python engine's own: Triton cubins from the prompt answer key's capture (aot5), EXL3 rot_in and
++//! unpack from linear.cu; the MoE glue (count / order / gather / combine) is ours in glue.cu, torch's ops bit for bit.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const load_ = @import("load.zig");
++const fwd = @import("forward.zig");
++const exl3 = cuda.exl3;
++const aot = cuda.aot;
++const Stream = cuda.Stream;
++const Model = fwd.Model;
++
++pub const EXPERTS_MIN = 256; // moe.PROMPT_EXPERTS_MIN
++pub const TOKENS_PER_UPDATE = 1024; // dflash.TOKENS_PER_UPDATE
++pub const HAD_SCALE: f32 = 0.08838834764831845; // prefill.HAD_SCALE, as the fp32 constexpr
++const BM_GEMM = 128; // prefill.tiles
++const PROMPT_BM = 8; // attention.BM
++
++const p = aot.ptr;
++fn ci(name: []const u8, v: usize) aot.Const {
++    return aot.ci(name, @intCast(v));
++}
++fn ii(name: []const u8, v: usize) aot.Arg {
++    return aot.int(name, @intCast(v));
++}
++fn u(x: usize) u32 {
++    return @intCast(x);
++}
++fn pow2(x: usize) usize {
++    return std.math.ceilPowerOfTwo(usize, x) catch unreachable;
++}
++
++pub const Prompt = struct {
++    m: *Model,
++    gpa: std.mem.Allocator,
++    cap: usize, // rows a chunk
++    ar: load_.Arena,
++    f_count: cuda.Function,
++    f_order: cuda.Function,
++    f_gather: cuda.Function,
++    f_combine: cuda.Function,
++    // rows [cap]
++    ids: u64,
++    pos: u64,
++    slot: u64,
++    res: u64,
++    x: u64,
++    q: u64,
++    k: u64,
++    v: u64,
++    qo: u64,
++    att: u64,
++    po: u64,
++    pm: u64,
++    pl: u64,
++    xh: u64,
++    part: u64,
++    recv: u64,
++    sum: u64,
++    logits: u64,
++    pick: u64,
++    wts: u64,
++    g: u64,
++    up: u64,
++    h: u64,
++    wq: u64, // fp16 [max K * N]: W_q decoded a call
++    had: u64, // bf16 [128, 128]
++    // per-expert prompt MoE: copies [cap * k]
++    counts: u64,
++    starts: u64,
++    order: u64,
++    inv: u64,
++    xs: u64,
++    ws: u64,
++    eg: u64,
++    eu: u64,
++    eh: u64,
++    ed: u64,
++    sc: exl3.Scratch, // the grouped kernel's, for chunks under EXPERTS_MIN rows
++    taps: u64, // drafter: the chunk's last TOKENS_PER_UPDATE rows' taps
++    h_ids: []i64,
++    h_pos: []i32,
++    h_slot: []i32,
++    h_counts: []i32,
++    h_starts: []i32,
++
++    pub fn init(m: *Model, gpa: std.mem.Allocator, cap: usize, s: Stream) !*Prompt {
++        const w = m.w;
++        const cfg = w.cfg;
++        const pr = try gpa.create(Prompt);
++        errdefer gpa.destroy(pr);
++        pr.* = undefined;
++        pr.m = m;
++        pr.gpa = gpa;
++        pr.cap = cap;
++        pr.ar = .{ .d = m.d, .gpa = gpa };
++        errdefer pr.ar.deinit();
++        pr.f_count = try m.glue.function("mimo_moe_count");
++        pr.f_order = try m.glue.function("mimo_moe_order");
++        pr.f_gather = try m.glue.function("mimo_moe_gather");
++        pr.f_combine = try m.glue.function("mimo_moe_combine");
++        const ar = &pr.ar;
++        const R = cap;
++        const D = cfg.hidden;
++        const H = cfg.heads;
++        const hk = @max(cfg.kv_full, cfg.kv_swa);
++        const nd = cfg.dense_width / w.world;
++        const nch = (cfg.window + fwd.CK - 1) / fwd.CK + 1;
++        var max_k: usize = @max(D, H * 128);
++        max_k = @max(max_k, nd);
++        var max_kn: usize = 0;
++        var ex: ?exl3.Experts = null;
++        for (w.layers) |L| {
++            inline for (.{ "q", "k", "v", "o" }) |f| max_kn = @max(max_kn, @field(L, f).k * @field(L, f).n);
++            inline for (.{ "gate", "up", "down" }) |f| if (@field(L, f)) |l| {
++                max_kn = @max(max_kn, l.k * l.n);
++            };
++            if (L.experts) |e| {
++                max_kn = @max(max_kn, e.dims * e.width);
++                if (ex == null) ex = e;
++            }
++        }
++        const e0 = ex orelse return error.NoMoE;
++        const I = e0.width;
++        const K8 = cfg.top_k;
++        pr.ids = try ar.zeros(R * 8);
++        pr.pos = try ar.zeros(R * 4);
++        pr.slot = try ar.zeros(R * 4);
++        pr.res = try ar.zeros(R * D * 4);
++        pr.x = try ar.zeros(R * D * 2);
++        pr.q = try ar.zeros(R * H * 192 * 2);
++        pr.k = try ar.zeros(R * hk * 192 * 2);
++        pr.v = try ar.zeros(R * hk * 192 * 2);
++        pr.qo = try ar.zeros(R * H * 192 * 2);
++        pr.att = try ar.zeros(R * H * 128 * 2);
++        pr.po = try ar.zeros(R * nch * H * 128 * 4);
++        pr.pm = try ar.zeros(R * nch * H * 4);
++        pr.pl = try ar.zeros(R * nch * H * 4);
++        pr.xh = try ar.zeros(R * max_k * 2);
++        pr.part = try ar.zeros(R * D * 4);
++        pr.recv = try ar.zeros(2 * R * D * 4);
++        pr.sum = try ar.zeros(R * D * 4);
++        pr.logits = try ar.zeros(R * cfg.experts * 4);
++        pr.pick = try ar.zeros(R * K8 * 4);
++        pr.wts = try ar.zeros(R * K8 * 4);
++        pr.g = try ar.zeros(R * nd * 2);
++        pr.up = try ar.zeros(R * nd * 2);
++        pr.h = try ar.zeros(R * nd * 2);
++        pr.wq = try ar.zeros(max_kn * 2);
++        pr.counts = try ar.zeros(cfg.experts * 4);
++        pr.starts = try ar.zeros(cfg.experts * 4);
++        pr.order = try ar.zeros(R * K8 * 4);
++        pr.inv = try ar.zeros(R * K8 * 4);
++        pr.xs = try ar.zeros(R * K8 * D * 2);
++        pr.ws = try ar.zeros(R * K8 * 4);
++        pr.eg = try ar.zeros(R * K8 * I * 2);
++        pr.eu = try ar.zeros(R * K8 * I * 2);
++        pr.eh = try ar.zeros(R * K8 * I * 2);
++        pr.ed = try ar.zeros(R * K8 * D * 4);
++        // prefill.Workspace.hadamard: +-1 by the parity of popcount(i & j), bf16
++        var hb: [128 * 128]u16 = undefined;
++        for (0..128) |i| for (0..128) |j| {
++            hb[i * 128 + j] = if (@popCount(i & j) & 1 == 1) 0xBF80 else 0x3F80;
++        };
++        pr.had = try ar.upload(std.mem.sliceAsBytes(&hb));
++        // the grouped kernel's scratch for EXPERTS_MIN - 1 rows (moe.WINDOW covers them in one call)
++        const rows_g = EXPERTS_MIN - 1;
++        const cfg_gu = try exl3.defaultConfig(e0.dims, e0.width, true);
++        const cfg_d = try exl3.defaultConfig(e0.width, e0.dims, false);
++        const sz = exl3.Scratch.bytes(e0, rows_g, K8, cfg_gu, cfg_d);
++        pr.sc = .{ .xg = try ar.zeros(sz.xg), .xu = try ar.zeros(sz.xg), .xd = try ar.zeros(sz.xd), .z = try ar.zeros(sz.z), .y = try ar.zeros(sz.y), .ids = try ar.zeros(sz.ids), .count = try ar.zeros(4), .members = try ar.alloc(sz.members), .rows = rows_g, .slots = K8, .cfg_gu = cfg_gu, .cfg_d = cfg_d };
++        try m.d.check(m.d.api.cuMemsetD32_v2(pr.sc.members, 0xFFFF_FFFF, sz.members / 4), "members -1");
++        pr.taps = if (m.dr) |dr| try ar.zeros(@min(R, TOKENS_PER_UPDATE) * dr.taps.len * D * 2) else 0; // fp16, as the tap buffer
++        pr.h_ids = try gpa.alloc(i64, R);
++        pr.h_pos = try gpa.alloc(i32, R);
++        pr.h_slot = try gpa.alloc(i32, R);
++        pr.h_counts = try gpa.alloc(i32, cfg.experts);
++        pr.h_starts = try gpa.alloc(i32, cfg.experts);
++        try s.synchronize();
++        return pr;
++    }
++
++    pub fn deinit(pr: *Prompt) void {
++        pr.gpa.free(pr.h_ids);
++        pr.gpa.free(pr.h_pos);
++        pr.gpa.free(pr.h_slot);
++        pr.gpa.free(pr.h_counts);
++        pr.gpa.free(pr.h_starts);
++        pr.ar.deinit();
++        pr.gpa.destroy(pr);
++    }
++
++    pub fn bytes(pr: *const Prompt) usize {
++        return pr.ar.total;
++    }
++
++    /// prefill.matmul: out [n, N] (row stride N) = x [n, K] fp16 @ W + bias, the prompt path's arithmetic.
++    fn gemm(pr: *Prompt, s: Stream, l: exl3.Linear, stored: bool, x: u64, out: u64, out_f32: bool, n: usize) !void {
++        const m = pr.m;
++        try m.k3.linearRotIn(s, x, .f16, l.suh, pr.xh, n, l.k);
++        try m.k3.unpackStrided(s, l, pr.wq, if (stored) exl3.Kernels.storedStrides(l) else l.strides());
++        try m.set.run(s, "_gemm", .{ u(((n + BM_GEMM - 1) / BM_GEMM) * (l.n / 128)), 1, 1 }, &.{
++            p("X", "*fp16", pr.xh),                                  p("W", "*fp16", pr.wq),    p("H", "*bf16", pr.had),
++            p("SVH", "*fp16", l.svh),                                p("BIAS", "*fp16", if (l.bias != 0) l.bias else l.svh),
++            p("OUT", if (out_f32) "*fp32" else "*fp16", out),        ii("M", n),                ii("o_stride", l.n),
++        }, &.{ ci("K", l.k), ci("N", l.n), ci("BM", BM_GEMM), ci("BK", 32), ci("GROUP", 8), ci("HAS_BIAS", @intFromBool(l.bias != 0)), aot.cf("SCALE", HAD_SCALE) });
++    }
++
++    fn rms(pr: *Prompt, s: Stream, x: u64, w: u64, out: u64, n: usize) !void {
++        const D = pr.m.w.cfg.hidden;
++        try pr.m.set.run(s, "_rms", .{ u(n), 1, 1 }, &.{ p("X", "*fp32", x), p("W", "*fp32", w), p("OUT", "*fp16", out) }, &.{ ci("N", D), aot.cf("EPS", @floatCast(pr.m.w.cfg.eps)), ci("BLOCK", pow2(D)) });
++    }
++
++    fn addRms(pr: *Prompt, s: Stream, x: u64, w: u64, n: usize) !void {
++        const D = pr.m.w.cfg.hidden;
++        try pr.m.set.run(s, "_add_rms", .{ u(n), 1, 1 }, &.{ p("X", "*fp32", x), p("RES", "*fp32", pr.res), p("W", "*fp32", w), p("OUT", "*fp16", pr.x) }, &.{ ci("N", D), aot.cf("EPS", @floatCast(pr.m.w.cfg.eps)), ci("BLOCK", pow2(D)) });
++    }
++
++    /// forward._sum over the chunk's rows.
++    fn sum(pr: *Prompt, s: Stream, part: u64, n: usize) !u64 {
++        const m = pr.m;
++        const c = m.comm orelse return part;
++        const D = m.w.cfg.hidden;
++        try c.allGather(part, pr.recv, n * D, .f32, s.handle);
++        try m.add2(s, pr.recv, pr.recv + n * D * 4, pr.sum, n * D);
++        return pr.sum;
++    }
++
++    fn launch(f: cuda.Function, s: Stream, gx: usize, threads: usize, a: *cuda.Args) !void {
++        try cuda.launch.launch(f, .{ .grid = .{ .x = u(gx), .y = 1, .z = 1 }, .block = .{ .x = u(threads), .y = 1, .z = 1 } }, s, a);
++    }
++
++    /// moe.MoE._prompt: per expert on the prompt GEMM; the weighted sum of a row's 8 into pr.part (fp32).
++    fn experts(pr: *Prompt, s: Stream, e: exl3.Experts, scale: f32, n: usize) !void {
++        const m = pr.m;
++        const d = m.d;
++        const E = e.count;
++        const D = e.dims;
++        const I = e.width;
++        const K8 = m.w.cfg.top_k;
++        const nk = n * K8;
++        try d.check(d.api.cuMemsetD32Async(pr.counts, 0, E, s.handle), "counts 0");
++        {
++            var a: cuda.Args = .{};
++            a.add(pr.pick);
++            a.add(@as(c_int, @intCast(nk)));
++            a.add(pr.counts);
++            try launch(pr.f_count, s, @min((nk + 255) / 256, 1024), 256, &a);
++        }
++        try s.synchronize(); // torch.bincount(...).tolist(): one host sync a layer
++        try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(pr.h_counts.ptr), pr.counts, E * 4), "counts");
++        var at: i32 = 0;
++        for (pr.h_counts, pr.h_starts) |c, *st| {
++            st.* = at;
++            at += c;
++        }
++        try d.check(d.api.cuMemcpyHtoD_v2(pr.starts, @ptrCast(pr.h_starts.ptr), E * 4), "starts");
++        {
++            var a: cuda.Args = .{};
++            a.add(pr.pick);
++            a.add(@as(c_int, @intCast(nk)));
++            a.add(pr.starts);
++            a.add(pr.order);
++            try launch(pr.f_order, s, E, 1024, &a);
++        }
++        {
++            var a: cuda.Args = .{};
++            a.add(pr.x);
++            a.add(pr.order);
++            a.add(pr.wts);
++            a.add(@as(f32, 1.0) / scale); // torch: x / scalar as x * (1 / scalar) in fp32
++            a.add(@as(c_int, @intCast(K8)));
++            a.add(@as(c_int, @intCast(D)));
++            a.add(pr.xs);
++            a.add(pr.ws);
++            a.add(pr.inv);
++            try launch(pr.f_gather, s, nk, 256, &a);
++        }
++        for (0..E) |ei| {
++            const c: usize = @intCast(pr.h_counts[ei]);
++            if (c == 0) continue;
++            const o: usize = @intCast(pr.h_starts[ei]);
++            try pr.gemm(s, e.linear(ei, 0), true, pr.xs + o * D * 2, pr.eg + o * I * 2, false, c);
++            try pr.gemm(s, e.linear(ei, 1), true, pr.xs + o * D * 2, pr.eu + o * I * 2, false, c);
++            try m.set.run(s, "_silu_mul_scale", .{ u(c), 1, 1 }, &.{
++                p("G", "*fp16", pr.eg + o * I * 2), p("U", "*fp16", pr.eu + o * I * 2), p("W", "*fp32", pr.ws + o * 4), p("OUT", "*fp16", pr.eh + o * I * 2),
++            }, &.{ ci("N", I), ci("BLOCK", pow2(I)) });
++            try pr.gemm(s, e.linear(ei, 2), true, pr.eh + o * I * 2, pr.ed + o * D * 4, true, c);
++        }
++        {
++            var a: cuda.Args = .{};
++            a.add(pr.ed);
++            a.add(pr.inv);
++            a.add(@as(c_int, @intCast(D)));
++            a.add(scale);
++            a.add(@as(c_int, @intFromBool(scale != 1.0)));
++            a.add(pr.part);
++            try launch(pr.f_combine, s, n, 256, &a);
++        }
++    }
++
++    /// One prompt chunk of `tokens` at [p0, p0 + n) of `slot` (forward.Model.forward(chains=[chain], prompt=True)):
++    /// writes the caches (and the drafter's, when attached and not capturing); leaves the last row's logits in the
++    /// model's decode buffers (argmaxTo / logitsTo with n = 1).
++    pub fn chunk(pr: *Prompt, s: Stream, slot: u32, p0: usize, tokens: []const i64, cap: ?Model.Capture) !void {
++        const m = pr.m;
++        const cfg = m.w.cfg;
++        const D = cfg.hidden;
++        const H = cfg.heads;
++        const n = tokens.len;
++        if (n == 0 or n > pr.cap) return error.ChunkTooWide;
++        if (n > m.ring - cfg.window) return error.RingOverrun;
++        if (p0 + n > m.context) return error.PastContext;
++        if (slot >= m.slots) return error.BadSlot;
++        for (tokens, 0..) |t, j| {
++            pr.h_ids[j] = t;
++            pr.h_pos[j] = @intCast(p0 + j);
++            pr.h_slot[j] = @intCast(slot);
++        }
++        try m.d.check(m.d.api.cuMemcpyHtoD_v2(pr.ids, @ptrCast(pr.h_ids.ptr), n * 8), "ids");
++        try m.d.check(m.d.api.cuMemcpyHtoD_v2(pr.pos, @ptrCast(pr.h_pos.ptr), n * 4), "pos");
++        try m.d.check(m.d.api.cuMemcpyHtoD_v2(pr.slot, @ptrCast(pr.h_slot.ptr), n * 4), "slot");
++        const dr = if (cap == null) m.dr else null;
++        const keep = @min(n, TOKENS_PER_UPDATE);
++        {
++            var a: cuda.Args = .{};
++            a.add(m.w.embed);
++            a.add(pr.ids);
++            a.add(pr.res);
++            a.add(@as(c_int, @intCast(D)));
++            try launch(m.f_embed, s, n, 256, &a);
++        }
++        try pr.rms(s, pr.res, m.w.layers[0].input_norm, pr.x, n);
++        for (m.w.layers, 0..) |L, i| {
++            const hk = cfg.kvHeads(i);
++            try pr.gemm(s, L.q, false, pr.x, pr.q, false, n);
++            try pr.gemm(s, L.k, false, pr.x, pr.k, false, n);
++            try pr.gemm(s, L.v, false, pr.x, pr.v, false, n);
++            const full = cfg.full[i];
++            const len = if (full) m.context else m.ring;
++            try m.set.run(s, "_qkv", .{ u(n), u(H + 2 * hk), 1 }, &.{
++                p("Q", "*fp16", pr.q),        p("K", "*fp16", pr.k),          p("V", "*fp16", pr.v),
++                p("COS", "*fp32", if (full) m.cos_full else m.cos_swa), p("SIN", "*fp32", if (full) m.sin_full else m.sin_swa),
++                p("POS", "*i32", pr.pos),     p("SLOT", "*i32", pr.slot),     p("QO", "*fp16", pr.qo),
++                p("KC", "*fp16", m.kc[i]),    p("VC", "*fp16", m.vc[i]),      ii("LEN", len),
++            }, &.{ ci("H", H), ci("HK", hk), ci("RD", cfg.rope_dim) });
++            const g = H / hk;
++            if (full) {
++                // attention.prompt over the slot's whole cache
++                const kc = m.kc[i] + @as(u64, slot) * m.context * hk * 192 * 2;
++                const vc = m.vc[i] + @as(u64, slot) * m.context * hk * 128 * 2;
++                try m.set.run(s, "_prompt", .{ u((n + PROMPT_BM - 1) / PROMPT_BM), u(hk), 1 }, &.{
++                    p("Q", "*fp16", pr.qo), p("KC", "*fp16", kc), p("VC", "*fp16", vc), p("OUT", "*fp16", pr.att),
++                    ii("P0", p0),           ii("W", n),
++                }, &.{ ci("H", H), ci("HK", hk), ci("G", g), aot.cf("SCALE", m.scale), ci("BM", PROMPT_BM), ci("BN", fwd.BN) });
++            } else {
++                const nch: usize = (cfg.window + fwd.CK - 1) / fwd.CK + 1;
++                try m.set.run(s, "_rows", .{ u(n), u(hk), u(nch) }, &.{
++                    p("Q", "*fp16", pr.qo),   p("KC", "*fp16", m.kc[i]), p("VC", "*fp16", m.vc[i]),
++                    p("POS", "*i32", pr.pos), p("SLOT", "*i32", pr.slot), p("PO", "*fp32", pr.po),
++                    p("PM", "*fp32", pr.pm),  p("PL", "*fp32", pr.pl),   ii("LEN", len),
++                    ii("NCH", nch),
++                }, &.{ ci("H", H), ci("HK", hk), ci("G", g), ci("WIN", cfg.window), aot.cf("SCALE", m.scale), ci("CK", fwd.CK), ci("BN", fwd.BN), ci("GP", fwd.GP) });
++                const sinks = L.sinks;
++                try m.set.run(s, "_merge", .{ u(n), u(H), 1 }, &.{
++                    p("PO", "*fp32", pr.po),                        p("PM", "*fp32", pr.pm), p("PL", "*fp32", pr.pl),
++                    p("SINKS", "*fp32", if (sinks != 0) sinks else pr.pm), p("OUT", "*fp16", pr.att), ii("NCH", nch),
++                }, &.{ ci("H", H), ci("HAS_SINK", @intFromBool(sinks != 0)) });
++            }
++            if (cap) |c| if (c.hook) |hf| try hf(c.ctx, .att, i, pr.att, n * H * 128 * 2);
++            try pr.gemm(s, L.o, false, pr.att, pr.part, true, n);
++            try pr.addRms(s, try pr.sum(s, pr.part, n), L.post_norm, n);
++            if (cap) |c| if (c.hook) |hf| try hf(c.ctx, .attn, i, pr.res, n * D * 4);
++            if (L.experts) |e| {
++                const bm = fwd.routerTile(n);
++                const be: usize, const bk: usize = if (bm == 16) .{ 32, 256 } else .{ 64, 64 };
++                try m.set.run(s, "_router", .{ u((n + bm - 1) / bm), u((cfg.experts + be - 1) / be), 1 }, &.{
++                    p("X", "*fp16", pr.x), p("W", "*fp16", L.router), p("OUT", "*fp32", pr.logits), ii("M", n), ii("x_stride", D),
++                }, &.{ ci("D", D), ci("NE", cfg.experts), ci("BM", bm), ci("BLOCK_E", be), ci("BK", bk) });
++                try m.set.run(s, "_topk", .{ u(n), 1, 1 }, &.{
++                    p("L", "*fp32", pr.logits), p("BIAS", "*fp32", L.bias), p("PICK", "*i32", pr.pick), p("WTS", "*fp32", pr.wts), aot.float("SCALE", L.route_scale),
++                }, &.{ ci("NE", cfg.experts), ci("TOPK", cfg.top_k), ci("BLOCK", pow2(cfg.experts)), ci("KP", pow2(cfg.top_k)) });
++                if (n >= EXPERTS_MIN) {
++                    try pr.experts(s, e, L.route_scale, n);
++                } else {
++                    try m.k3.routed(s, pr.x, false, D, pr.pick, pr.wts, e, pr.sc, pr.part, n, std.math.inf(f32), 1, true);
++                }
++            } else {
++                try pr.gemm(s, L.gate.?, false, pr.x, pr.g, false, n);
++                try pr.gemm(s, L.up.?, false, pr.x, pr.up, false, n);
++                const nd = L.gate.?.n;
++                try m.set.run(s, "_silu_mul", .{ u(n), u(nd / 1024), 1 }, &.{ p("G", "*fp16", pr.g), p("U", "*fp16", pr.up), p("OUT", "*fp16", pr.h) }, &.{ ci("N", nd), ci("BLOCK", 1024) });
++                try pr.gemm(s, L.down.?, false, pr.h, pr.part, true, n);
++            }
++            const after = if (i + 1 < m.w.layers.len) m.w.layers[i + 1].input_norm else m.w.norm;
++            try pr.addRms(s, try pr.sum(s, pr.part, n), after, n);
++            if (cap) |c| if (c.hook) |hf| try hf(c.ctx, .mlp, i, pr.res, n * D * 4);
++            if (dr) |dd| try dd.tapInto(s, i, pr.res + (n - keep) * D * 4, keep, pr.taps);
++        }
++        if (dr) |dd| {
++            const row = dd.taps.len * D * 2;
++            var w0: usize = 0;
++            while (w0 < keep) : (w0 += fwd.DECODE_ROWS) {
++                const k = @min(fwd.DECODE_ROWS, keep - w0);
++                const at = n - keep + w0;
++                try dd.updateFrom(s, pr.taps + w0 * row, pr.pos + at * 4, pr.slot + at * 4, k);
++            }
++        }
++        // _head on the last row: the decode GEMV, gathered into the model's decode buffers
++        try m.k3.linear(s, m.w.head, pr.x + (n - 1) * D * 2, .f16, m.b.xh, m.b.head, .f32, if (m.w.head.split[0] > 1) m.b.z else 0, 1);
++        if (m.comm) |c| try c.allGather(m.b.head, m.b.recv, m.w.head.n, .f32, s.handle);
++    }
++};
++
++/// Zig's chunks for a prompt from `start`, bit-equal to Python's lone-stream fill (decoder._fill: PROMPT_CHUNK rows
++/// a forward): a Python chunk under EXPERTS_MIN rows runs as is (its experts take the grouped kernel), a wider one
++/// splits into parts of at most `cap` rows, every part a multiple of 16 rows but the last (P0 stays in the prompt
++/// kernel's divisible-by-16 class) and none under EXPERTS_MIN (rows' bits never depend on their chunk otherwise).
++pub fn plan(gpa: std.mem.Allocator, start: usize, len: usize, cap: usize) ![]usize {
++    var out: std.ArrayList(usize) = .empty;
++    errdefer out.deinit(gpa);
++    var a = start;
++    while (a < len) {
++        const b = @min(len, a + fwd.PROMPT_CHUNK);
++        const c = b - a;
++        if (c <= cap) {
++            try out.append(gpa, c);
++        } else {
++            const parts = (c + cap - 1) / cap;
++            const part = (c + parts - 1) / parts;
++            const p16 = (part + 15) / 16 * 16;
++            var left = c;
++            for (0..parts - 1) |_| {
++                try out.append(gpa, p16);
++                left -= p16;
++            }
++            if (left < EXPERTS_MIN) return error.ChunkPlan;
++            try out.append(gpa, left);
++        }
++        a = b;
++    }
++    return out.toOwnedSlice(gpa);
++}
++
++test "prompt chunk plan" {
++    const g = std.testing.allocator;
++    const a = try plan(g, 0, 40, 4096);
++    defer g.free(a);
++    try std.testing.expectEqualSlices(usize, &.{40}, a);
++    const b = try plan(g, 0, 9000, 4096);
++    defer g.free(b);
++    try std.testing.expectEqualSlices(usize, &.{ 3008, 3008, 2984 }, b);
++    const c = try plan(g, 0, 16384 + 100, 4096);
++    defer g.free(c);
++    try std.testing.expectEqualSlices(usize, &.{ 4096, 4096, 4096, 4096, 100 }, c);
++}
+diff --git a/zig/src/families/mimo_v2/root.zig b/zig/src/families/mimo_v2/root.zig
+index 6294201f..6d9ef25e 100644
+--- a/zig/src/families/mimo_v2/root.zig
++++ b/zig/src/families/mimo_v2/root.zig
+@@ -5,6 +5,7 @@ pub const config = @import("config.zig");
+ pub const load = @import("load.zig");
+ pub const forward = @import("forward.zig");
+ pub const dflash = @import("dflash.zig");
++pub const prompt = @import("prompt.zig");
+ pub const native = @import("native.zig");
+ pub const Config = config.Config;
+ 
+@@ -13,4 +14,5 @@ test {
+     _ = load;
+     _ = forward;
+     _ = dflash;
++    _ = prompt;
+ }
+-- 
+2.53.0
+

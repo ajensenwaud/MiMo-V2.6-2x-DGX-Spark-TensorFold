@@ -1,7 +1,7 @@
 From 368d6c903537726feed8ecfb95d80da982064432 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 20:36:23 +1100
-Subject: [PATCH 33/46] m1_run.sh: COMM, EXTRA_ENV
+Subject: [PATCH 33/55] m1_run.sh: COMM, EXTRA_ENV
 
 ---
  zig/src/families/mimo_v2/m1_run.sh | 2 +-

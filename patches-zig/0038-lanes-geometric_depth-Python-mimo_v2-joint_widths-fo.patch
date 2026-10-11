@@ -1,7 +1,7 @@
 From 178fe5feb283dd2f9cf43213c30a7ad33d95a31c Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 22:14:59 +1100
-Subject: [PATCH 38/46] lanes: geometric_depth (Python mimo_v2 joint_widths for
+Subject: [PATCH 38/55] lanes: geometric_depth (Python mimo_v2 joint_widths for
  a lone stream: one acceptance, draft pass charged once); mimo:
  TF_MIMO_DEPTH=geometric
 

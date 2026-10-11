@@ -1,0 +1,136 @@
+From 0be9a783339659fbded7682b98910e7f5ec8c2da Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 07:01:07 +1100
+Subject: [PATCH 50/55] Z6: serve prompts on the prompt path (Op.prompt on the
+ plan link; TF_MIMO_PROMPT_ROWS, default 16384; 0 = decode rows)
+
+---
+ zig/src/families/mimo_v2/native.zig | 50 +++++++++++++++++++++++++++--
+ 1 file changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index 3ab3d17e..34173b6a 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -42,13 +42,14 @@ pub const Loaded = struct {
+ };
+ 
+ /// The plan link's words: one GPU step each, executed by every rank in order.
+-pub const Op = enum(i64) { hello = 0x31A0, forward = 1, draft = 2, stop = 3 };
++pub const Op = enum(i64) { hello = 0x31A0, forward = 1, draft = 2, stop = 3, prompt = 4 };
+ 
+ /// The acceptance of DFlash drafts at depth 1, 2, ... given the ones before (the Python drafter on the answer key's
+ /// prompts, results/zig-z4), until a stream has its own.
+ const draft_prior = [_]f64{ 0.789, 0.78, 0.801, 0.833, 0.833, 0.846, 0.825 };
+ 
+ const slots_default: usize = 4;
++const prompt_mod = @import("prompt.zig");
+ 
+ /// The model, its kernels and the TP session: what rank 0 serves and rank 1 follows.
+ pub const Engine = struct {
+@@ -59,6 +60,7 @@ pub const Engine = struct {
+     set: cuda.aot.Set,
+     model: fwd.Model,
+     dr: ?*dflash.Drafter = null,
++    pr: ?*prompt_mod.Prompt = null, // the prompt path (Z6): TF_MIMO_PROMPT_ROWS rows a chunk; 0 = decode rows (Z5)
+     session: ?*tp.Session = null,
+     s: cuda.Stream,
+     logits: []f32, // [128, V] host
+@@ -90,6 +92,12 @@ pub const Engine = struct {
+             e.dr = try dflash.Drafter.init(gpa, io, &e.model, ddir, e.s);
+             e.model.dr = e.dr;
+         }
++        const prompt_rows: usize = if (std.c.getenv("TF_MIMO_PROMPT_ROWS")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else fwd.PROMPT_CHUNK;
++        if (prompt_rows > 0) {
++            if (prompt_rows < prompt_mod.EXPERTS_MIN * 2 or prompt_rows > fwd.PROMPT_CHUNK) return error.PromptRows;
++            e.pr = try prompt_mod.Prompt.init(&e.model, gpa, prompt_rows, e.s);
++            if (rank == 0) std.log.info("mimo prompt path: {d}-row chunks, {d:.2} GiB scratch", .{ prompt_rows, @as(f64, @floatFromInt(e.pr.?.bytes())) / (1 << 30) });
++        }
+         e.logits = try gpa.alloc(f32, fwd.DECODE_ROWS * e.w.full.vocab);
+         e.host_argmax = if (std.c.getenv("TF_MIMO_HOST_ARGMAX")) |v| v[0] == '1' else false;
+         return e;
+@@ -99,6 +107,7 @@ pub const Engine = struct {
+         const gpa = e.gpa;
+         e.words.deinit(gpa);
+         gpa.free(e.logits);
++        if (e.pr) |pr| pr.deinit();
+         if (e.dr) |dr| dr.deinit();
+         e.model.deinit();
+         e.set.deinit();
+@@ -129,6 +138,21 @@ pub const Engine = struct {
+         }
+     }
+ 
++    /// A prompt chunk on every rank (the prompt path): `want` reads its last row (ids[0] or logits row 0).
++    pub fn promptChunk(e: *Engine, slot: u32, p0: usize, tokens: []const u32, want: Want) !void {
++        const pr = e.pr orelse return error.NoPromptPath;
++        e.words.clearRetainingCapacity();
++        try e.words.appendSlice(e.gpa, &.{ @intFromEnum(Op.prompt), @intCast(tokens.len), slot, @intCast(p0) });
++        for (tokens) |t| try e.words.append(e.gpa, t);
++        try e.send(e.words.items);
++        try pr.chunk(e.s, slot, p0, e.words.items[4..], null);
++        const w: Want = if (want == .ids and e.host_argmax) .logits else want;
++        if (w == .logits) try e.model.logitsTo(e.s, 1, e.logits[0..e.w.full.vocab]);
++        if (want == .ids) {
++            if (e.host_argmax) e.ids[0] = @intCast(fwd.argmax(e.logits[0..e.w.full.vocab])) else try e.model.argmaxTo(e.s, 1, e.ids[0..1]);
++        } else if (want == .none) try e.s.synchronize();
++    }
++
+     /// A draft pass on every rank: drafts [S, block - 1] into `out`.
+     pub fn draft(e: *Engine, tokens: []const i64, pos0: []const u32, slots: []const u32, out: []i32) !void {
+         e.words.clearRetainingCapacity();
+@@ -143,6 +167,13 @@ pub const Engine = struct {
+         if (words.len < 2) return error.ShortPlan;
+         const op: Op = @enumFromInt(words[0]);
+         const n: usize = @intCast(words[1]);
++        if (op == .prompt) {
++            if (words.len != 4 + n) return error.BadPlan;
++            const pr = e.pr orelse return error.NoPromptPath;
++            try pr.chunk(e.s, @intCast(words[2]), @intCast(words[3]), words[4..], null);
++            try e.s.synchronize();
++            return true;
++        }
+         if (words.len != 2 + 3 * n) return error.BadPlan;
+         switch (op) {
+             .forward => {
+@@ -166,6 +197,7 @@ pub const Engine = struct {
+             },
+             .stop => return false,
+             .hello => return error.LateHello,
++            .prompt => unreachable,
+         }
+         return true;
+     }
+@@ -353,6 +385,21 @@ pub const Lanes = struct {
+         gop.value_ptr.nheld = 0;
+         const slot = gop.value_ptr.slot;
+         s.cached = 0;
++        const greedy = s.sampling == null or s.sampling.?.temperature <= 0;
++        if (e.pr) |pr| {
++            // the prompt path: Python's lone-stream chunks, split to this engine's chunk rows (prompt.plan)
++            const cuts = try prompt_mod.plan(l.gpa, 0, ids.len, pr.cap);
++            defer l.gpa.free(cuts);
++            var at: usize = 0;
++            for (cuts) |n| {
++                if (s.isCancelled()) return error.Cancelled;
++                const last = at + n == ids.len;
++                try e.promptChunk(slot, at, ids[at .. at + n], if (!last) .none else if (greedy) .ids else .logits);
++                if (last) _ = l.take(if (greedy) @intCast(e.ids[0]) else try draw(l.gpa, l.rowOf(0), s.sampling, ids.len));
++                at += n;
++            }
++            return;
++        }
+         var rows: [fwd.DECODE_ROWS]fwd.Row = undefined;
+         var at: usize = 0;
+         while (at < ids.len) {
+@@ -360,7 +407,6 @@ pub const Lanes = struct {
+             const n = @min(fwd.DECODE_ROWS, ids.len - at);
+             for (0..n) |j| rows[j] = .{ .slot = slot, .pos = @intCast(at + j), .token = ids[at + j] };
+             const last = at + n == ids.len;
+-            const greedy = s.sampling == null or s.sampling.?.temperature <= 0;
+             try e.forward(rows[0..n], if (!last) .none else if (greedy) .ids else .logits);
+             if (last) _ = l.take(if (greedy) @intCast(e.ids[n - 1]) else try draw(l.gpa, l.rowOf(n - 1), s.sampling, ids.len));
+             at += n;
+-- 
+2.53.0
+

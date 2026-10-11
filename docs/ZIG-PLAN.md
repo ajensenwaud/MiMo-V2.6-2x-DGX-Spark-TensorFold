@@ -351,3 +351,19 @@ where Python overlaps at 1 row, mirror it (likely the RoCE gather's launch/strea
 - Served (`Op.prompt` on the plan link, `TF_MIMO_PROMPT_ROWS`, default 16384: 7.43 GiB scratch, fits at 608,256
   context): **the twelve fixed-text 512-token greedy replies are byte-identical to the Python server's (12/12 shas)**.
   The Z5 replies gate now differs (1/8): its key fed prompts as decode rows; Python's server does not.
+- Speed on identical texts (fixed set, 1 stream). Four starts (RoCE fast pollers on/off alternating; no throttling,
+  SM ~2,440-2,490 MHz on both nodes) agree within 1%: Zig with Python's depth rule chat 46.7 / code 70.0 / agent 58.3
+  / report 49.7 against Python 48.0 / 71.2 / 60.8 / 52.4 (-1.7 to -5%). Same rounds as Python to within ~5%, but
+  10-30% more drafted rows (to diff round by round: TF_LANES_DEPTH_LOG=1 here, dev-src decoder patch for Python), and
+  1-3 ms more a round. One earlier run at 40 tok/s chat did not reproduce (likely another GPU tenant).
+- nsys of a served request (cuda-sw): 1-row verify graph 22.35 ms median (Python's 22.4), 2 rows 29.7, draft 5.8, the
+  GPU idle ~0.13 ms before each step: no serving overhead.
+- Full spark-bench (Python depth rule): prefill 4K / 16K / 64K / 128K 673 / 1,303 / 1,150 / 1,076 tok/s (Python 764 /
+  1,179 / 1,141 / 1,022; Zig Z5 ~317-400); decode at 128K 30.9 (Python 33.4). 4 streams (random tags, two runs a
+  cell, lanes rule): prompt path chat 62-76 / code 94-105 / agent 84-97 / report 86-90; decode-row prompts
+  78-82 / 113-118 / 94-96 / 89: the prompt path's small-prompt cost shows at 4 streams (first wave worst).
+- Default now: Python's lone-stream depth rule (TF_MIMO_DEPTH=lanes|geometric to change); shared rounds keep the lanes
+  rule; prompt path on (TF_MIMO_PROMPT_ROWS=0 for decode-row prompts).
+
+**Next:** 4K prefill and small-prompt cost (load every kernel at start; per-call launch overhead of the per-expert
+path), decode at 128K (-8%), the drafted-rows difference, the 4-5% on multi-row verifies, then Z8.

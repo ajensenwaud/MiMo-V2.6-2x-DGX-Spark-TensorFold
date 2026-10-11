@@ -1,0 +1,51 @@
+From a962c6bf8181d92ca7ef82a29d458f9ca56d2fd7 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 07:34:54 +1100
+Subject: [PATCH 53/55] mimo profile: forward ms by window rows
+
+---
+ zig/src/families/mimo_v2/native.zig | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index af36d121..8fdfa583 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -237,6 +237,8 @@ pub const Lanes = struct {
+         drafts: u64 = 0,
+         rows: u64 = 0,
+         drafted: u64 = 0,
++        by_rows_ns: [17]u64 = @splat(0), // forward ns by window rows (1 .. 16, 17+)
++        by_rows_n: [17]u64 = @splat(0),
+ 
+         fn now(p: *Prof) i96 {
+             return std.Io.Clock.awake.now(p.io).toNanoseconds();
+@@ -249,6 +251,10 @@ pub const Lanes = struct {
+         fn report(p: *Prof) void {
+             const v: f64 = @floatFromInt(@max(p.verifies, 1));
+             std.log.info("mimo profile ({d} verifies): verify {d:.2} ms (forward {d:.2}), draft {d:.2} ms ({d} drafts), outside {d:.2} ms a round; {d:.2} rows and {d:.2} drafted rows a verify", .{ p.verifies, @as(f64, @floatFromInt(p.verify_ns)) / v / 1e6, @as(f64, @floatFromInt(p.fwd_ns)) / v / 1e6, @as(f64, @floatFromInt(p.draft_ns)) / v / 1e6, p.drafts, @as(f64, @floatFromInt(p.outside_ns)) / v / 1e6, @as(f64, @floatFromInt(p.rows)) / v, @as(f64, @floatFromInt(p.drafted)) / v });
++            var line: [512]u8 = undefined;
++            var w: std.Io.Writer = .fixed(&line);
++            for (p.by_rows_ns, p.by_rows_n, 0..) |ns, c, i| if (c > 0) w.print(" {d}:{d:.2}x{d}", .{ i + 1, @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(c)) / 1e6, c }) catch {};
++            std.log.info("mimo profile forward ms by rows (rows:ms x count):{s}", .{w.buffered()});
+             p.* = .{ .io = p.io };
+         }
+     };
+@@ -468,7 +474,13 @@ pub const Lanes = struct {
+         };
+         const tf: i96 = if (l.prof) |*pr| pr.now() else 0;
+         try l.e.forward(rows[0..n], if (all_greedy) .ids else .logits);
+-        if (l.prof) |*pr| pr.fwd_ns += @intCast(pr.now() - tf);
++        if (l.prof) |*pr| {
++            const dt: u64 = @intCast(pr.now() - tf);
++            pr.fwd_ns += dt;
++            const b = @min(n, 17) - 1;
++            pr.by_rows_ns[b] += dt;
++            pr.by_rows_n[b] += 1;
++        }
+         var r0: usize = 0;
+         for (windows, out) |w, *o| {
+             const lane = l.lanes.getPtr(w.stream).?;
+-- 
+2.53.0
+

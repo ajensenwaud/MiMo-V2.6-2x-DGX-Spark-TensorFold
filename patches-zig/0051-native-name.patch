@@ -1,0 +1,33 @@
+From 9adc92604bee03a1424a40b53ce4872362ff6fb0 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 07:02:18 +1100
+Subject: [PATCH 51/55] native: name
+
+---
+ zig/src/families/mimo_v2/native.zig | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index 34173b6a..17fc82c6 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -92,11 +92,11 @@ pub const Engine = struct {
+             e.dr = try dflash.Drafter.init(gpa, io, &e.model, ddir, e.s);
+             e.model.dr = e.dr;
+         }
+-        const prompt_rows: usize = if (std.c.getenv("TF_MIMO_PROMPT_ROWS")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else fwd.PROMPT_CHUNK;
+-        if (prompt_rows > 0) {
+-            if (prompt_rows < prompt_mod.EXPERTS_MIN * 2 or prompt_rows > fwd.PROMPT_CHUNK) return error.PromptRows;
+-            e.pr = try prompt_mod.Prompt.init(&e.model, gpa, prompt_rows, e.s);
+-            if (rank == 0) std.log.info("mimo prompt path: {d}-row chunks, {d:.2} GiB scratch", .{ prompt_rows, @as(f64, @floatFromInt(e.pr.?.bytes())) / (1 << 30) });
++        const chunk_rows: usize = if (std.c.getenv("TF_MIMO_PROMPT_ROWS")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else fwd.PROMPT_CHUNK;
++        if (chunk_rows > 0) {
++            if (chunk_rows < prompt_mod.EXPERTS_MIN * 2 or chunk_rows > fwd.PROMPT_CHUNK) return error.PromptRows;
++            e.pr = try prompt_mod.Prompt.init(&e.model, gpa, chunk_rows, e.s);
++            if (rank == 0) std.log.info("mimo prompt path: {d}-row chunks, {d:.2} GiB scratch", .{ chunk_rows, @as(f64, @floatFromInt(e.pr.?.bytes())) / (1 << 30) });
+         }
+         e.logits = try gpa.alloc(f32, fwd.DECODE_ROWS * e.w.full.vocab);
+         e.host_argmax = if (std.c.getenv("TF_MIMO_HOST_ARGMAX")) |v| v[0] == '1' else false;
+-- 
+2.53.0
+
