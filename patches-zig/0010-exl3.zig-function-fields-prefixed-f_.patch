@@ -1,0 +1,190 @@
+From e9e25d13aff73dadec566810906d65a4ae0634ad Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 14:15:57 +1100
+Subject: [PATCH 10/12] exl3.zig: function fields prefixed f_
+
+---
+ zig/src/cuda/exl3.zig | 72 +++++++++++++++++++++----------------------
+ 1 file changed, 36 insertions(+), 36 deletions(-)
+
+diff --git a/zig/src/cuda/exl3.zig b/zig/src/cuda/exl3.zig
+index 16eb13e3..b0e49296 100644
+--- a/zig/src/cuda/exl3.zig
++++ b/zig/src/cuda/exl3.zig
+@@ -196,18 +196,18 @@ pub const Scratch = struct {
+ 
+ pub const Kernels = struct {
+     mods: [3]Module,
+-    rot_in: Function,
+-    linear: [linear_k2s.len][linear_wks.len]Function,
+-    unpack: [linear_k2s.len]Function,
+-    grouped: [grouped_cfgs.len][grouped_ranges.len]Function,
+-    dequant: [15]Function, // K2 2..16
+-    group: Function,
+-    x_rot_bf16: Function,
+-    x_rot_f16: Function,
+-    gateup_epilogue: Function,
+-    down_epilogue: Function,
+-    combine: Function,
+-    down_combine: Function,
++    f_rot_in: Function,
++    f_linear: [linear_k2s.len][linear_wks.len]Function,
++    f_unpack: [linear_k2s.len]Function,
++    f_grouped: [grouped_cfgs.len][grouped_ranges.len]Function,
++    f_dequant: [15]Function, // K2 2..16
++    f_group: Function,
++    f_x_rot_bf16: Function,
++    f_x_rot_f16: Function,
++    f_gateup_epilogue: Function,
++    f_down_epilogue: Function,
++    f_combine: Function,
++    f_down_combine: Function,
+ 
+     pub fn load(d: *const Driver) !Kernels {
+         if (!kernels.available) return error.KernelsNotBuilt;
+@@ -219,22 +219,22 @@ pub const Kernels = struct {
+         k.mods[2] = try Module.load(d, kernels.mimo_exl3_experts_cb2);
+         errdefer k.mods[2].unload();
+         const lin, const ex, const cb2 = .{ k.mods[0], k.mods[1], k.mods[2] };
+-        k.rot_in = try lin.function(sym.linear_rot_in);
++        k.f_rot_in = try lin.function(sym.linear_rot_in);
+         inline for (linear_k2s, 0..) |k2, i| {
+-            inline for (linear_wks, 0..) |wk, j| k.linear[i][j] = try lin.function(linearSymbol(k2, wk));
+-            k.unpack[i] = try lin.function(unpackSymbol(k2));
++            inline for (linear_wks, 0..) |wk, j| k.f_linear[i][j] = try lin.function(linearSymbol(k2, wk));
++            k.f_unpack[i] = try lin.function(unpackSymbol(k2));
+         }
+         inline for (grouped_cfgs, 0..) |c, i| {
+-            inline for (grouped_ranges, 0..) |r, j| k.grouped[i][j] = try cb2.function(groupedSymbol(c[0], c[1], c[2], r[0], r[1]));
++            inline for (grouped_ranges, 0..) |r, j| k.f_grouped[i][j] = try cb2.function(groupedSymbol(c[0], c[1], c[2], r[0], r[1]));
+         }
+-        inline for (2..17) |k2| k.dequant[k2 - 2] = try cb2.function(dequantSymbol(@as(u32, k2)));
+-        k.group = try ex.function(sym.group);
+-        k.x_rot_bf16 = try ex.function(sym.rot_in_bf16);
+-        k.x_rot_f16 = try ex.function(sym.rot_in_f16);
+-        k.gateup_epilogue = try ex.function(sym.gateup_epilogue);
+-        k.down_epilogue = try ex.function(sym.down_epilogue);
+-        k.combine = try ex.function(sym.combine);
+-        k.down_combine = try ex.function(sym.down_combine);
++        inline for (2..17) |k2| k.f_dequant[k2 - 2] = try cb2.function(dequantSymbol(@as(u32, k2)));
++        k.f_group = try ex.function(sym.group);
++        k.f_x_rot_bf16 = try ex.function(sym.rot_in_bf16);
++        k.f_x_rot_f16 = try ex.function(sym.rot_in_f16);
++        k.f_gateup_epilogue = try ex.function(sym.gateup_epilogue);
++        k.f_down_epilogue = try ex.function(sym.down_epilogue);
++        k.f_combine = try ex.function(sym.combine);
++        k.f_down_combine = try ex.function(sym.down_combine);
+         return k;
+     }
+ 
+@@ -252,7 +252,7 @@ pub const Kernels = struct {
+         a.add(suh);
+         a.add(xh);
+         a.add(int(kk));
+-        try launch_.launch(k.rot_in, .{ .grid = .{ .x = u(((kk / 128) + 3) / 4), .y = u(m), .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &a);
++        try launch_.launch(k.f_rot_in, .{ .grid = .{ .x = u(((kk / 128) + 3) / 4), .y = u(m), .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+     /// exl3_linear_cuda: y (M, N) of dtype `y_dtype` = xh @ W * svh (+ bias); z: fp32 [SK * M * N] when SK > 1.
+@@ -263,7 +263,7 @@ pub const Kernels = struct {
+         if (sk > 1 and z == 0) return error.NeedZ; // "Z is needed with more than one split"
+         const ki = k2Index(l.k2) orelse return error.UnsupportedWidth;
+         const wi = wkIndex(u(wk)) orelse return error.UnsupportedWarps;
+-        const f = k.linear[ki][wi];
++        const f = k.f_linear[ki][wi];
+         const smem: u32 = u(wk * @min(m, 8) * 128 * 4);
+         if (smem > 48 * 1024) try f.allowDynamicShared(smem);
+         const st = l.strides();
+@@ -301,7 +301,7 @@ pub const Kernels = struct {
+         a.add(int(l.n));
+         a.add(st[0]);
+         a.add(st[1]);
+-        try launch_.launch(k.unpack[ki], .{ .grid = .{ .x = u(l.n / 16), .y = u(l.k / 16), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
++        try launch_.launch(k.f_unpack[ki], .{ .grid = .{ .x = u(l.n / 16), .y = u(l.k / 16), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+     // -- experts.cu / experts_grouped.cuh ------------------------------------------------------------------------
+@@ -311,7 +311,7 @@ pub const Kernels = struct {
+         if (e > 1024 * 4) return error.TooManyExperts;
+         if (slots > 32) return error.TooManySlots;
+         const smem: u32 = u(r * slots * 4);
+-        if (smem + 1024 / 32 * 4 > 48 * 1024) try k.group.allowDynamicShared(smem);
++        if (smem + 1024 / 32 * 4 > 48 * 1024) try k.f_group.allowDynamicShared(smem);
+         var a: Args = .{};
+         a.add(pick);
+         a.add(ids);
+@@ -321,7 +321,7 @@ pub const Kernels = struct {
+         a.add(int(slots));
+         a.add(int(e));
+         a.add(int(maxm));
+-        try launch_.launch(k.group, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 }, .shared = smem }, s, &a);
++        try launch_.launch(k.f_group, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 }, .shared = smem }, s, &a);
+     }
+ 
+     /// exl3x_rot_in_cuda: each (row, slot)'s input rotated by its expert's gate and up suh.
+@@ -337,7 +337,7 @@ pub const Kernels = struct {
+         a.add(int(kk));
+         a.add(int(slots));
+         a.add(int(e));
+-        try launch_.launch(if (x_bf16) k.x_rot_bf16 else k.x_rot_f16, .{ .grid = .{ .x = u(rows * slots), .y = u(kk / 128), .z = 2 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
++        try launch_.launch(if (x_bf16) k.f_x_rot_bf16 else k.f_x_rot_f16, .{ .grid = .{ .x = u(rows * slots), .y = u(kk / 128), .z = 2 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+     pub const GroupedArgs = struct {
+@@ -370,7 +370,7 @@ pub const Kernels = struct {
+     pub fn grouped(k: *const Kernels, s: Stream, g: GroupedArgs) !void {
+         if (g.k % (16 * g.sk * g.warps) != 0 or g.n % (16 * g.nt) != 0) return error.UnevenSplit;
+         const ci = cfgIndex(g.nt, g.warps, g.pf) orelse return error.UnsupportedTile;
+-        const f = k.grouped[ci][rangeIndex(g.lo, g.hi)];
++        const f = k.f_grouped[ci][rangeIndex(g.lo, g.hi)];
+         const mt = (g.maxm + 15) / 16;
+         var a: Args = .{};
+         inline for (.{ g.x0, g.x1, g.tp0, g.tp1, g.k2_0, g.k2_1, g.uids, g.ucount, g.members, g.z }) |p| a.add(p);
+@@ -385,7 +385,7 @@ pub const Kernels = struct {
+         inline for (.{ p, n, sk, e }) |v| a.add(int(v));
+         a.add(limit);
+         a.add(act_mode);
+-        try launch_.launch(k.gateup_epilogue, .{ .grid = .{ .x = u(rows * slots), .y = u(n / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
++        try launch_.launch(k.f_gateup_epilogue, .{ .grid = .{ .x = u(rows * slots), .y = u(n / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+     /// exl3x_down_epilogue_cuda.
+@@ -393,7 +393,7 @@ pub const Kernels = struct {
+         var a: Args = .{};
+         inline for (.{ z, pick, svh_d, y }) |v| a.add(v);
+         inline for (.{ p, d, sk, e }) |v| a.add(int(v));
+-        try launch_.launch(k.down_epilogue, .{ .grid = .{ .x = u(rows * slots), .y = u(d / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
++        try launch_.launch(k.f_down_epilogue, .{ .grid = .{ .x = u(rows * slots), .y = u(d / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+     /// exl3x_down_combine_cuda: down epilogue and the weighted slot sum in one launch.
+@@ -402,7 +402,7 @@ pub const Kernels = struct {
+         var a: Args = .{};
+         inline for (.{ z, pick, svh_d, y, wts, out }) |v| a.add(v);
+         inline for (.{ p, d, sk, e, slots }) |v| a.add(int(v));
+-        try launch_.launch(k.down_combine, .{ .grid = .{ .x = u(rows), .y = u(d / 128), .z = 1 }, .block = .{ .x = u(32 * slots), .y = 1, .z = 1 } }, s, &a);
++        try launch_.launch(k.f_down_combine, .{ .grid = .{ .x = u(rows), .y = u(d / 128), .z = 1 }, .block = .{ .x = u(32 * slots), .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+     /// exl3x_combine_cuda.
+@@ -411,7 +411,7 @@ pub const Kernels = struct {
+         inline for (.{ y, wts, out }) |v| a.add(v);
+         a.add(int(d));
+         a.add(int(slots));
+-        try launch_.launch(k.combine, .{ .grid = .{ .x = u(rows), .y = u((d + 255) / 256), .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
++        try launch_.launch(k.f_combine, .{ .grid = .{ .x = u(rows), .y = u((d + 255) / 256), .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+     /// exl3x_dequant_cuda at mul1: W (K, N) fp16 from trellis words in the stored layout (tests).
+@@ -422,7 +422,7 @@ pub const Kernels = struct {
+         a.add(out);
+         a.add(int(kk));
+         a.add(int(n));
+-        try launch_.launch(k.dequant[k2 - 2], .{ .grid = .{ .x = u(kk / 16), .y = u(n / 16), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
++        try launch_.launch(k.f_dequant[k2 - 2], .{ .grid = .{ .x = u(kk / 16), .y = u(n / 16), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+     /// experts.routed with `wts` (the served path): group, rotate, gate/up, epilogue, down, down+combine.
+-- 
+2.53.0
+

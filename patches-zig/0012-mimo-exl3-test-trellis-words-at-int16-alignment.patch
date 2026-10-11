@@ -1,0 +1,25 @@
+From 9e579a45d1a754f9840d9309655e50e6c32b77e2 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Sun, 11 Oct 2026 14:23:17 +1100
+Subject: [PATCH 12/12] mimo-exl3 test: trellis words at int16 alignment
+
+---
+ zig/tests/cuda/mimo_exl3_tests.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/tests/cuda/mimo_exl3_tests.zig b/zig/tests/cuda/mimo_exl3_tests.zig
+index 046126d0..4fd6efb2 100644
+--- a/zig/tests/cuda/mimo_exl3_tests.zig
++++ b/zig/tests/cuda/mimo_exl3_tests.zig
+@@ -49,7 +49,7 @@ pub fn run(gpu: Gpu, file_path: []const u8, prefix: []const u8) !void {
+ 
+     // strips layout through unpack_kernel: [K/16, N/16, W] int32 words -> [N/128, K/16, 8, W] (linear.strips)
+     const w32 = 4 * @as(usize, k2);
+-    const words: []const u32 = std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(trellis));
++    const words: []align(2) const u32 = std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(trellis));
+     const strips = try a.alloc(u32, words.len);
+     defer a.free(strips);
+     for (0..tk) |kt| for (0..tn / 8) |nb8| for (0..8) |j| {
+-- 
+2.53.0
+

@@ -145,5 +145,12 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
   Zig launch wrappers + the EXL3 arm of `qlinear.zig`, and the GPU check against `core/exl3_format.zig`.
 - Patches exported to `patches-zig/0001-0008`.
 
-**Next (no GPU):** Z0B.3 Zig wrappers and host tests; Z2.1 family skeleton (config, pack loader). **Next GPU window
-(needs the serve down ~1 h):** Z0B.2 two-node linktest, Z0B.3 kernel-vs-reference check, Z1 oracle capture.
+- Z0B.3 launch half done: `zig/src/cuda/exl3.zig` (the 75 mul1 instances resolved by mangled name; launches mirror
+  the bindings' grids, blocks, shared memory and checks; `Kernels.routed` = experts.routed). Host tests: linear.plan
+  and experts.default_config equal the Python engine's at MiMo's TP=2 shapes (`plan_vectors.py`), symbols equal the
+  fatbins'. All host tests: 423/424 (1 GPU skip).
+- GPU check built, not yet run: `tf-cuda-test mimo-exl3 <shard> <prefix>`: dequant (stored) and unpack (strips)
+  bit-equal to `core/exl3_format.zig`, linear M=1/4/8/16 against the fp64 reference.
+
+**Next GPU window (serve down ~1 h):** Z0B.2 two-node linktest; `mimo-exl3` on q_proj (K2 10), a dense gate (K2 8),
+an expert gate/down (K2 6); Z1 oracle capture. **Next (no GPU):** Z2.1 family skeleton (config, pack loader).
