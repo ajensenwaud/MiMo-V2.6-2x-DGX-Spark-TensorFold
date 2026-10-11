@@ -11,7 +11,7 @@ cd $HOME/mimo/recipe && ./stop.sh >/dev/null 2>&1
 while [ $# -ge 2 ]; do
   a=$1; x=$2; shift 2
   docker rm -f mimo-zig >/dev/null 2>&1; ssh -n aj@10.100.128.2 "docker rm -f mimo-zig-follow" >/dev/null 2>&1 </dev/null
-  CONTEXT=608256 BIN=/mimo/zig-out-z7 EXTRA_ENV="$x" bash $T/zig_serve.sh >/dev/null 2>&1 || { echo "$a: serve failed"; continue; }
+  CONTEXT=${CONTEXT:-608256} BIN=${BIN:-/mimo/zig-out-z7} AOT=${AOT:-/mimo/oracle/aot4-sm121} EXTRA_ENV="$x" bash $T/zig_serve.sh >/dev/null 2>&1 || { echo "$a: serve failed"; continue; }
   (cd /tmp && /usr/bin/python3 $T/mimo_fixed_decode.py http://localhost:8892 --reps 3) > $L/fixed-$a.txt 2>&1
   docker logs mimo-zig > $L/fixed-$a-serve.log 2>&1
   grep "done " $L/fixed-$a-serve.log | grep "tokens=512" | tail -12 | \

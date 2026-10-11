@@ -333,3 +333,21 @@ where Python overlaps at 1 row, mirror it (likely the RoCE gather's launch/strea
 - Remaining gap: agent -10%, report -7%, code -4%, chat level. Next: Z6 (prompt kernels), which makes Zig's texts
   equal Python's so policies compare request for request, then tune depth on matched texts and the 4-5% on
   multi-row verifies.
+
+### Z6: the prompt path (session 11)
+- Answer key `tools/mimo_zig_prompt.py` (both ranks equal): 5 scenarios as prompt chunks (40; 700; 1024+1024+552;
+  1024+200; 9000 rows), per layer per row fingerprints after attention and MLP, each chunk's last-row logits, 32
+  greedy decode rows after; then a prompt-shape sweep for the kernel set. `aot5-sm121`: 42 variants (aot4 + `_gemm` x9,
+  `_prompt` x3, `_silu_mul_scale` x2, router tiles past 128 rows).
+- Engine `prompt.zig`: prompt GEMM (rot_in + unpack + Triton `_gemm`, Hadamard bf16 table), `_prompt` full
+  attention over the slot's cache, sliding layers on `_rows`, MoE per expert from 256 rows (glue.cu
+  `mimo_moe_count/order/gather/combine`: torch's bincount, stable argsort, index_select, x * (1/scale), and the
+  8-way sum in torch's reduce order ((x0+x4)+(x1+x5))+(x2+x6))+(x3+x7)), grouped kernel below 256 rows, drafter fed
+  the chunk's last 1024 rows in 128-row decode windows, head on the last row. `prompt.plan`: Python's lone-stream
+  16384-row chunks split to the engine's chunk rows (parts multiples of 16, none under 256).
+- **Gate passed first run, both ranks:** fingerprints 768/768 layer captures, last-row logits 8/8 byte-equal,
+  greedy 160/160; the serving plan's chunks (9000 -> 3008+3008+2984, 2600 -> one) give the same logits and replies
+  (4/4; "mixed" differs by design: Python's 200-row chunk ran the grouped experts).
+- Served (`Op.prompt` on the plan link, `TF_MIMO_PROMPT_ROWS`, default 16384: 7.43 GiB scratch, fits at 608,256
+  context): **the twelve fixed-text 512-token greedy replies are byte-identical to the Python server's (12/12 shas)**.
+  The Z5 replies gate now differs (1/8): its key fed prompts as decode rows; Python's server does not.
