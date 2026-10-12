@@ -1,7 +1,7 @@
 From a5b0a6c2e4e13610627fbefa029614d8202efe36 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 15:34:46 +1100
-Subject: [PATCH 17/55] m1: unused capture
+Subject: [PATCH 17/67] m1: unused capture
 
 ---
  zig/src/families/mimo_v2/m1_main.zig | 2 +-

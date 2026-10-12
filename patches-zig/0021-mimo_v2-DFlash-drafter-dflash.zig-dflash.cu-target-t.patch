@@ -1,7 +1,7 @@
 From 5944485514b3c803f1f6dc13f33ce3ef7485e70e Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 16:46:28 +1100
-Subject: [PATCH 21/55] mimo_v2: DFlash drafter (dflash.zig + dflash.cu),
+Subject: [PATCH 21/67] mimo_v2: DFlash drafter (dflash.zig + dflash.cu),
  target taps + context update, tf-mimo dflash / drafted
 
 ---

@@ -1,7 +1,7 @@
 From d77fe85852a206a2bab752cb8844b8b123d22f63 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Mon, 12 Oct 2026 06:53:21 +1100
-Subject: [PATCH 48/55] prompt: field name
+Subject: [PATCH 48/67] prompt: field name
 
 ---
  zig/src/families/mimo_v2/prompt.zig | 8 ++++----

@@ -1,0 +1,71 @@
+{
+  "tool": "spark-bench/1.0",
+  "started": "2026-10-12T13:42:16",
+  "host": "gx10",
+  "base_url": "http://localhost:8892",
+  "model": "mimo-zig",
+  "label": "kv8 gate fp16c",
+  "preset": "full",
+  "thinking": false,
+  "server": {
+    "backend": null,
+    "context_length": null,
+    "streams": null
+  },
+  "config": {
+    "suites": [
+      "quality"
+    ],
+    "concurrency": [
+      1,
+      2,
+      4
+    ],
+    "decode_tokens": 512,
+    "depths": [
+      4096,
+      16384,
+      65536,
+      131072
+    ],
+    "depth_samples": 3,
+    "gsm8k_n": 500,
+    "mmlu_per_subject": 4,
+    "quality_concurrency": 4,
+    "seed": 20261010,
+    "depth_gen_tokens": 128
+  },
+  "busy_at_start": 0,
+  "quality": {
+    "seed": 20261010,
+    "thinking": false,
+    "sets": {
+      "gsm8k": {
+        "n": 500,
+        "correct": 478,
+        "accuracy": 0.956,
+        "ci95": [
+          0.9343,
+          0.9708
+        ],
+        "errors": 0,
+        "truncated": 0
+      },
+      "mmlu": {
+        "n": 228,
+        "correct": 189,
+        "accuracy": 0.8289,
+        "ci95": [
+          0.7747,
+          0.8723
+        ],
+        "errors": 0,
+        "truncated": 2
+      }
+    },
+    "contended": false
+  },
+  "rejected_request_fields": [],
+  "wall_s": 746.2,
+  "contended": false
+}

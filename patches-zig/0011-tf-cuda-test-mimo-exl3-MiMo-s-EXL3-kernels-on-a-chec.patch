@@ -1,7 +1,7 @@
 From b69f6f074ce2ab4d46b025a30f7ee76ec9ad5111 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 14:21:03 +1100
-Subject: [PATCH 11/55] tf-cuda-test mimo-exl3: MiMo's EXL3 kernels on a
+Subject: [PATCH 11/67] tf-cuda-test mimo-exl3: MiMo's EXL3 kernels on a
  checkpoint tensor against core/exl3_format.zig
 
 ---

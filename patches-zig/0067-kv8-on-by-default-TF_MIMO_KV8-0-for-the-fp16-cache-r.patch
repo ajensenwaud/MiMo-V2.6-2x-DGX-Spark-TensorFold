@@ -1,0 +1,26 @@
+From 97d47ec6b48cbca324f4756252a0cb50be96ce2d Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 13:57:35 +1100
+Subject: [PATCH 67/67] kv8 on by default (TF_MIMO_KV8=0 for the fp16 cache):
+ rows8b, 1,024-key chunks, merge8
+
+---
+ zig/src/families/mimo_v2/forward.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/families/mimo_v2/forward.zig b/zig/src/families/mimo_v2/forward.zig
+index b9a2f235..8be7a32a 100644
+--- a/zig/src/families/mimo_v2/forward.zig
++++ b/zig/src/families/mimo_v2/forward.zig
+@@ -178,7 +178,7 @@ pub const Model = struct {
+         // caches: keys [1, LEN, HK, 192], values [1, LEN, HK, 128], zeroed (forward.Model.__init__)
+         m.kc = try gpa.alloc(u64, cfg.layers);
+         m.vc = try gpa.alloc(u64, cfg.layers);
+-        m.kv8 = if (std.c.getenv("TF_MIMO_KV8")) |v| v[0] == '1' else false;
++        m.kv8 = if (std.c.getenv("TF_MIMO_KV8")) |v| v[0] != '0' else true; // default on (gate 2026-10-12: GSM8K 500 paired p 0.73, MMLU p 0.38, passkey 10/10)
+         m.kv8_mod = null;
+         m.ks = try gpa.alloc(u64, cfg.layers);
+         m.vs = try gpa.alloc(u64, cfg.layers);
+-- 
+2.53.0
+

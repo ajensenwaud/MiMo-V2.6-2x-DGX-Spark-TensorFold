@@ -1,7 +1,7 @@
 From a72d453d3aabe5d811eb578cbb89e31643ef764b Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 15:19:46 +1100
-Subject: [PATCH 15/55] mimo_v2: config (Config.read) and rank cuts
+Subject: [PATCH 15/67] mimo_v2: config (Config.read) and rank cuts
  (weights.load), host tests against the Python family
 
 ---

@@ -1,0 +1,67 @@
+From b8b7f524f0497bfdbf6f7342e12a8ae0f13cf561 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 09:47:54 +1100
+Subject: [PATCH 59/67] Z7 prompt: TF_MIMO_PROMPT_EXPERTS_FROM /
+ TF_MIMO_PROMPT_GWIN (grouped trellis kernel in windows instead of unpacking
+ every expert)
+
+---
+ zig/src/families/mimo_v2/prompt.zig | 22 ++++++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/prompt.zig b/zig/src/families/mimo_v2/prompt.zig
+index 983e44e7..8cb2de36 100644
+--- a/zig/src/families/mimo_v2/prompt.zig
++++ b/zig/src/families/mimo_v2/prompt.zig
+@@ -87,7 +87,8 @@ pub const Prompt = struct {
+     eu: u64,
+     eh: u64,
+     ed: u64,
+-    sc: exl3.Scratch, // the grouped kernel's, for chunks under EXPERTS_MIN rows
++    sc: exl3.Scratch, // the grouped kernel's, for chunks under experts_from rows (in windows of sc.rows)
++    experts_from: usize, // per-expert (unpack + GEMM) from this many rows; TF_MIMO_PROMPT_EXPERTS_FROM (Python: EXPERTS_MIN)
+     taps: u64, // drafter: the chunk's last TOKENS_PER_UPDATE rows' taps
+     h_ids: []i64,
+     h_pos: []i32,
+@@ -175,7 +176,9 @@ pub const Prompt = struct {
+         };
+         pr.had = try ar.upload(std.mem.sliceAsBytes(&hb));
+         // the grouped kernel's scratch for EXPERTS_MIN - 1 rows (moe.WINDOW covers them in one call)
+-        const rows_g = EXPERTS_MIN - 1;
++        pr.experts_from = envRows("TF_MIMO_PROMPT_EXPERTS_FROM", EXPERTS_MIN);
++        // the grouped window: TF_MIMO_PROMPT_GWIN rows (default EXPERTS_MIN - 1, Python's moe.WINDOW cover)
++        const rows_g = @min(@max(envRows("TF_MIMO_PROMPT_GWIN", EXPERTS_MIN - 1), 1), R);
+         const cfg_gu = try exl3.defaultConfig(e0.dims, e0.width, true);
+         const cfg_d = try exl3.defaultConfig(e0.width, e0.dims, false);
+         const sz = exl3.Scratch.bytes(e0, rows_g, K8, cfg_gu, cfg_d);
+@@ -391,10 +394,16 @@ pub const Prompt = struct {
+                 try m.set.run(s, "_topk", .{ u(n), 1, 1 }, &.{
+                     p("L", "*fp32", pr.logits), p("BIAS", "*fp32", L.bias), p("PICK", "*i32", pr.pick), p("WTS", "*fp32", pr.wts), aot.float("SCALE", L.route_scale),
+                 }, &.{ ci("NE", cfg.experts), ci("TOPK", cfg.top_k), ci("BLOCK", pow2(cfg.experts)), ci("KP", pow2(cfg.top_k)) });
+-                if (n >= EXPERTS_MIN) {
++                if (n >= pr.experts_from) {
+                     try pr.experts(s, e, L.route_scale, n);
+                 } else {
+-                    try m.k3.routed(s, pr.x, false, D, pr.pick, pr.wts, e, pr.sc, pr.part, n, std.math.inf(f32), 1, true);
++                    // the grouped kernel reads the 3-bit trellis directly (no fp16 copy of every expert); rows are
++                    // independent, so windows of sc.rows give the same rows as one call
++                    var w0: usize = 0;
++                    while (w0 < n) : (w0 += pr.sc.rows) {
++                        const k = @min(pr.sc.rows, n - w0);
++                        try m.k3.routed(s, pr.x + w0 * D * 2, false, D, pr.pick + w0 * cfg.top_k * 4, pr.wts + w0 * cfg.top_k * 4, e, pr.sc, pr.part + w0 * D * 4, k, std.math.inf(f32), 1, true);
++                    }
+                 }
+             } else {
+                 try pr.gemm(s, L.gate.?, false, pr.x, pr.g, false, n);
+@@ -465,3 +474,8 @@ test "prompt chunk plan" {
+     defer g.free(c);
+     try std.testing.expectEqualSlices(usize, &.{ 4096, 4096, 4096, 4096, 100 }, c);
+ }
++
++fn envRows(name: [:0]const u8, default: usize) usize {
++    const v = std.c.getenv(name) orelse return default;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
++}
+-- 
+2.53.0
+

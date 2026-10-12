@@ -1,7 +1,7 @@
 From 2bd8b425e67e173c243c42b3a45c3d9e209233d9 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 22:58:33 +1100
-Subject: [PATCH 43/55] tf-mimo: announce the stop before closing the TP
+Subject: [PATCH 43/67] tf-mimo: announce the stop before closing the TP
  session (no fail-fast exit 70 when a rank finishes first)
 
 ---

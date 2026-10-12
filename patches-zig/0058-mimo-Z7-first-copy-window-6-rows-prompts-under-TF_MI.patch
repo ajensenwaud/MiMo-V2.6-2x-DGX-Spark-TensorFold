@@ -1,0 +1,37 @@
+From 56ff14ed57cbb7a45389935dce34ef8ea12ead48 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 09:23:34 +1100
+Subject: [PATCH 58/67] mimo Z7: first copy window 6 rows; prompts under
+ TF_MIMO_PROMPT_MIN (256) on decode rows
+
+---
+ zig/src/families/mimo_v2/native.zig | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index 28ea572b..771b5424 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -294,7 +294,7 @@ pub const Lanes = struct {
+             // copy windows (suffix matches of 8+ tokens): TF_MIMO_COPIES=0 off (Python's DFlash decoder never copies),
+             // TF_MIMO_COPY_ROWS the first window's rows (default: the drafter's block)
+             .copies = if (std.c.getenv("TF_MIMO_COPIES")) |v| v[0] != '0' else true,
+-            .first_copy_rows = if (std.c.getenv("TF_MIMO_COPY_ROWS")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0 else 0,
++            .first_copy_rows = if (std.c.getenv("TF_MIMO_COPY_ROWS")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 6 else 6, // 6: fixed texts chat 46.8 -> 48.2, agent 58.2 -> 60.2 (15 before)
+         };
+     }
+ 
+@@ -402,7 +402,9 @@ pub const Lanes = struct {
+         const slot = gop.value_ptr.slot;
+         s.cached = 0;
+         const greedy = s.sampling == null or s.sampling.?.temperature <= 0;
+-        if (e.pr) |pr| {
++        const short = if (std.c.getenv("TF_MIMO_PROMPT_MIN")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 256 else 256;
++        if (e.pr != null and ids.len >= short) {
++            const pr = e.pr.?;
+             // the prompt path: Python's lone-stream chunks, split to this engine's chunk rows (prompt.plan)
+             const cuts = try prompt_mod.plan(l.gpa, 0, ids.len, pr.cap);
+             defer l.gpa.free(cuts);
+-- 
+2.53.0
+

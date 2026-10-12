@@ -1,7 +1,7 @@
 From 77e3d935db25edd38adedde6c6c9e36c61d0241a Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Mon, 12 Oct 2026 06:54:42 +1100
-Subject: [PATCH 49/55] m1_run.sh: ORACLE= prefix, prompt mode
+Subject: [PATCH 49/67] m1_run.sh: ORACLE= prefix, prompt mode
 
 ---
  zig/src/families/mimo_v2/m1_run.sh | 6 +++---

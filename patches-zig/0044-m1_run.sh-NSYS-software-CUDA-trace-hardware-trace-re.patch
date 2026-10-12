@@ -1,7 +1,7 @@
 From aa6b1c71d0dd1fc80202308cd476af6427a22571 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Mon, 12 Oct 2026 05:08:59 +1100
-Subject: [PATCH 44/55] m1_run.sh NSYS: software CUDA trace (hardware trace
+Subject: [PATCH 44/67] m1_run.sh NSYS: software CUDA trace (hardware trace
  records nothing on GB10 here)
 
 ---

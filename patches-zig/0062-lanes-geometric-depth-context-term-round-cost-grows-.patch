@@ -1,0 +1,137 @@
+From b154ad9dce20eae4e95ddd3da38b0874e0e005ab Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 11:13:20 +1100
+Subject: [PATCH 62/67] lanes geometric depth: context term (round cost grows
+ with the stream's cache); mimo: measured 0.0723 + 0.0060/row ms per 1K
+ positions, TF_MIMO_DEPTH_CTX=0 off
+
+---
+ zig/src/core/lanes/config.zig       | 8 ++++++++
+ zig/src/core/lanes/depth.zig        | 9 +++++++--
+ zig/src/core/lanes/engine.zig       | 2 ++
+ zig/src/core/lanes/windows.zig      | 2 +-
+ zig/src/families/mimo_v2/native.zig | 8 ++++++++
+ 5 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index 134c459c..ad67ffa1 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -41,6 +41,10 @@ pub const Model = struct {
+     /// the end extended by its last step (decoder.cost); the draft pass against one row. Empty: the measured costs.
+     geometric_costs: []const f64 = &.{},
+     geometric_draft_cost: f64 = 0,
++    /// geometric_depth: a round's cost grows with the stream's context (full-attention key reads): per 1,000 positions
++    /// past geometric_ctx_base, ctx[0] + ctx[1] * (rows - 1), in the cost table's units. Zero: context-blind (Python).
++    geometric_ctx: [2]f64 = .{ 0, 0 },
++    geometric_ctx_base: f64 = 9000,
+ };
+ 
+ pub const Config = struct {
+@@ -73,6 +77,8 @@ pub const Config = struct {
+     geometric_depth: bool = false,
+     geometric_costs: []const f64 = &.{},
+     geometric_draft_cost: f64 = 0,
++    geometric_ctx: [2]f64 = .{ 0, 0 },
++    geometric_ctx_base: f64 = 9000,
+     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
+     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
+     k: Constants = .{},
+@@ -131,6 +137,8 @@ pub const Config = struct {
+             .geometric_depth = m.geometric_depth,
+             .geometric_costs = m.geometric_costs,
+             .geometric_draft_cost = m.geometric_draft_cost,
++            .geometric_ctx = m.geometric_ctx,
++            .geometric_ctx_base = m.geometric_ctx_base,
+         };
+     }
+ 
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index f34a1010..e939fe3e 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -36,6 +36,7 @@ pub const Who = struct {
+     forced: bool,
+     granted: ?u32 = null,
+     stream: ?*anyopaque = null,
++    position: u64 = 0, // the stream's cache length (geometric depth's context term)
+ };
+ 
+ /// Whether a copied continuation is ahead of a stream (the round loop proposes; Python `_copy_proposal`).
+@@ -69,6 +70,8 @@ pub const Rule = struct {
+     geometric: bool = false, // Config.geometric_depth: a lone stream's depth by its one acceptance (Python joint_widths)
+     geo_costs: []const f64 = &.{}, // Config.geometric_costs
+     geo_draft: f64 = 0,
++    geo_ctx: [2]f64 = .{ 0, 0 }, // Config.geometric_ctx
++    geo_ctx_base: f64 = 9000,
+     sharing: bool = false, // inside budgets(): shared rounds keep the per-depth rule
+     round_ms: Table = .{}, // a round's wall time by drafts, shared by every stream
+     overhead: std.ArrayList(Overhead) = .empty, // a shared round's ms past its forward, by streams (insertion order)
+@@ -199,8 +202,10 @@ pub const Rule = struct {
+         while (d <= most) : (d += 1) {
+             expected += run;
+             run *= alpha;
+-            const cost = (try r.roundCost(d, who)) orelse break;
+-            if (cost <= 0.0) continue;
++            const base = (try r.roundCost(d, who)) orelse break;
++            if (base <= 0.0) continue;
++            const past = @max(0.0, @as(f64, @floatFromInt(who.position)) - r.geo_ctx_base) / 1000.0;
++            const cost = base + past * (r.geo_ctx[0] + r.geo_ctx[1] * @as(f64, @floatFromInt(d)));
+             if (expected / cost > best_rate) {
+                 best = d;
+                 best_rate = expected / cost;
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 4ad4f4c5..4429075e 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -61,6 +61,8 @@ pub const Engine = struct {
+                 .geometric = cfg.geometric_depth,
+                 .geo_costs = cfg.geometric_costs,
+                 .geo_draft = cfg.geometric_draft_cost,
++                .geo_ctx = cfg.geometric_ctx,
++                .geo_ctx_base = cfg.geometric_ctx_base,
+             },
+         };
+     }
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index a76e4ed4..c93067c3 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -152,7 +152,7 @@ pub fn probe(e: *Engine) depth.Probe {
+ }
+ 
+ pub fn who(s: *Stream) depth.Who {
+-    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .stream = s };
++    return .{ .state = &s.depth, .draft_room = s.draftRoom(), .finished = s.finished, .forced = s.force.items.len > 0, .granted = s.granted, .stream = s, .position = s.cache_len };
+ }
+ 
+ /// Trim draft prefixes by landing probability to the shared width with the most expected tokens a ms.
+diff --git a/zig/src/families/mimo_v2/native.zig b/zig/src/families/mimo_v2/native.zig
+index 771b5424..5c04522f 100644
+--- a/zig/src/families/mimo_v2/native.zig
++++ b/zig/src/families/mimo_v2/native.zig
+@@ -291,6 +291,10 @@ pub const Lanes = struct {
+             .geometric_depth = !depthIs("lanes"),
+             .geometric_costs = if (depthIs("geometric")) &.{} else &python_grid1,
+             .geometric_draft_cost = 0.25,
++            // measured (tf-mimo timing, 1 / 4 / 8 rows at 9,000 vs 128,000): 22.7 / 42.6 / 60.8 -> 31.3 / 52.6 / 74.4 ms,
++            // so +0.0723 ms per 1,000 positions a round and +0.0060 a row more; in the table's units (1 row = 22.7 ms)
++            // for python's grid, in ms for geometric's measured costs. TF_MIMO_DEPTH_CTX=0: context-blind, as Python.
++            .geometric_ctx = if (std.c.getenv("TF_MIMO_DEPTH_CTX")) |v| (if (v[0] == '0') .{ 0, 0 } else ctxTerm()) else ctxTerm(),
+             // copy windows (suffix matches of 8+ tokens): TF_MIMO_COPIES=0 off (Python's DFlash decoder never copies),
+             // TF_MIMO_COPY_ROWS the first window's rows (default: the drafter's block)
+             .copies = if (std.c.getenv("TF_MIMO_COPIES")) |v| v[0] != '0' else true,
+@@ -584,6 +588,10 @@ pub fn draw(gpa: std.mem.Allocator, row: []const f32, settings: ?lanes.Sampling,
+ 
+ const Owned = struct { gpa: std.mem.Allocator, e: *Engine, l: Lanes, session: ?*tp.Session };
+ 
++fn ctxTerm() [2]f64 {
++    return if (depthIs("geometric")) .{ 0.0723, 0.0060 } else .{ 0.0723 / 22.7, 0.0060 / 22.7 };
++}
++
+ fn depthIs(v: []const u8) bool {
+     const e = std.c.getenv("TF_MIMO_DEPTH") orelse return false;
+     return std.mem.eql(u8, std.mem.span(e), v);
+-- 
+2.53.0
+

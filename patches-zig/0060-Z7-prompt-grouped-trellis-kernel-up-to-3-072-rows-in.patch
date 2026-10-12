@@ -1,0 +1,32 @@
+From 257c10e23e83d543ea5f2b1563ef110e6a75c8d0 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 10:20:07 +1100
+Subject: [PATCH 60/67] Z7 prompt: grouped trellis kernel up to 3,072 rows in
+ 1,024-row windows (512 rows 2.62 -> 0.74 s)
+
+---
+ zig/src/families/mimo_v2/prompt.zig | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/prompt.zig b/zig/src/families/mimo_v2/prompt.zig
+index 8cb2de36..693978ed 100644
+--- a/zig/src/families/mimo_v2/prompt.zig
++++ b/zig/src/families/mimo_v2/prompt.zig
+@@ -176,9 +176,11 @@ pub const Prompt = struct {
+         };
+         pr.had = try ar.upload(std.mem.sliceAsBytes(&hb));
+         // the grouped kernel's scratch for EXPERTS_MIN - 1 rows (moe.WINDOW covers them in one call)
+-        pr.experts_from = envRows("TF_MIMO_PROMPT_EXPERTS_FROM", EXPERTS_MIN);
+-        // the grouped window: TF_MIMO_PROMPT_GWIN rows (default EXPERTS_MIN - 1, Python's moe.WINDOW cover)
+-        const rows_g = @min(@max(envRows("TF_MIMO_PROMPT_GWIN", EXPERTS_MIN - 1), 1), R);
++        // measured (ptiming, rank 0): unpack + GEMM 2.4 s fixed + 0.57 ms a row; grouped trellis kernel 1.26 ms a row
++        // (512 rows 0.74 s vs 2.62 s; 4,000 rows 5.04 s vs 4.96 s), so the grouped kernel up to 3,072 rows
++        pr.experts_from = envRows("TF_MIMO_PROMPT_EXPERTS_FROM", 3072);
++        // the grouped window: TF_MIMO_PROMPT_GWIN rows (default 1024: 512 rows 736 ms vs 842 at 255)
++        const rows_g = @min(@max(envRows("TF_MIMO_PROMPT_GWIN", 1024), 1), R);
+         const cfg_gu = try exl3.defaultConfig(e0.dims, e0.width, true);
+         const cfg_d = try exl3.defaultConfig(e0.width, e0.dims, false);
+         const sz = exl3.Scratch.bytes(e0, rows_g, K8, cfg_gu, cfg_d);
+-- 
+2.53.0
+

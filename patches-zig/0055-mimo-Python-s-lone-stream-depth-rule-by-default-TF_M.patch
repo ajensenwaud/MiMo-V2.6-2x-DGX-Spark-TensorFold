@@ -1,7 +1,7 @@
 From ba024c09d54fe011f040518e1c622390d93ddc54 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Mon, 12 Oct 2026 08:58:50 +1100
-Subject: [PATCH 55/55] mimo: Python's lone-stream depth rule by default
+Subject: [PATCH 55/67] mimo: Python's lone-stream depth rule by default
  (TF_MIMO_DEPTH=lanes|geometric to change)
 
 ---

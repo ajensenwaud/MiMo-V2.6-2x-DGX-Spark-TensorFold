@@ -379,3 +379,18 @@ path), decode at 128K (-8%), the drafted-rows difference, the 4-5% on multi-row 
   prefill 4K/16K/64K/128K 772 / 1,317 / 1,210 / 1,066; decode at 128K 30.8; GSM8K 96.0%, MMLU 86.0%.
 
 **Next:** fused trellis MMA for big prompt chunks (drop the fp16 unpack); decode at long context (-8%); 1-stream chat.
+
+## Z7, session 12 (long context: depth rule context term, 8-bit key/value cache)
+
+- Step at 128,000 (fp16 cache): 1 / 4 / 8 rows 31.3 / 52.6 / 74.4 ms (9,000: 22.7 / 42.6 / 60.8); attention 1.45 ->
+  9.56 ms a step at 1 row. 9 full layers x 2 key heads x 320 B x 128K = 1.47 GB a step at ~180 GB/s.
+- Geometric depth gains a context term (0.0723 + 0.0060 a row ms per 1K positions): 64K 37.5 -> 39.7, 128K level.
+- kv8 (kv8.cu, ours): full layers' keys / values in e4m3 with an fp32 scale a (token, key head); mimo_qkv8 writes
+  them, mimo_rows8b reads 8-bit tiles (cp.async, two stages, e4m3 pairs converted in the fragments, scales on scores
+  and probabilities; a stream's run of up to 4 rows shares each read), 1,024-key chunks, mimo_merge8 folds the
+  partials (a block a row-head). Prompt chunks dequantise the slot's keys for the existing prompt kernel.
+  kv8check (rank 1, a layer at 128,000): Triton fp16 0.93 / 1.18 / 1.54 ms (1 / 4 / 8 rows) -> 0.54 / 0.56 / 0.60 ms;
+  error against Triton on the same 8-bit values <= 7.7e-6. Step at 128,000: 27.2 / 47.3 / 65.3 ms.
+- Gate: passkey 10/10 (32K, 120K x 5 depths); GSM8K 500 95.2% vs fp16 cache 95.6% (paired p 0.73), MMLU 228 81.6%
+  vs 82.9% (p 0.38). Full bench: decode at 4K / 16K / 64K / 128K 46.3 / 44.0 / 39.1 / 42.5 tok/s (Python 128K 33.4);
+  prefill unchanged. Default on (TF_MIMO_KV8=0: the fp16 cache).

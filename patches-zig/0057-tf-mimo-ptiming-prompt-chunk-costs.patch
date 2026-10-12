@@ -1,0 +1,89 @@
+From c1eb03167fe2e35b090ee75b9e1989da9425543e Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 09:09:51 +1100
+Subject: [PATCH 57/67] tf-mimo ptiming: prompt chunk costs
+
+---
+ zig/src/families/mimo_v2/m1_main.zig | 34 ++++++++++++++++++++++++++--
+ zig/src/families/mimo_v2/m1_run.sh   |  2 +-
+ 2 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index 158028a1..d67bfdd1 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -73,7 +73,8 @@ pub fn main(init: std.process.Init) !u8 {
+     const is_follow = args.len >= 4 and std.mem.eql(u8, args[1], "follow");
+     const is_timing = args.len >= 5 and std.mem.eql(u8, args[1], "timing");
+     const is_prompt = args.len >= 5 and std.mem.eql(u8, args[1], "prompt");
+-    if (!is_m1 and !is_win and !is_dfl and !is_drafted and !is_follow and !is_timing and !is_prompt) {
++    const is_ptiming = args.len >= 5 and std.mem.eql(u8, args[1], "ptiming");
++    if (!is_m1 and !is_win and !is_dfl and !is_drafted and !is_follow and !is_timing and !is_prompt and !is_ptiming) {
+         std.debug.print("usage: tf-mimo m1 MODEL ORACLE(rank<R>.safetensors) AOT_DIR [CONTEXT]\n" ++
+             "       tf-mimo windows MODEL ORACLE AOT_DIR WINDOWS_JSON(windows-r<R>.json)\n" ++
+             "       tf-mimo dflash MODEL ORACLE AOT_DIR DFLASH_JSON(dflash-r<R>.json)\n" ++
+@@ -85,7 +86,7 @@ pub fn main(init: std.process.Init) !u8 {
+     }
+     const gpa = init.gpa;
+     const io = init.io;
+-    const context: usize = if (is_prompt) 32768 else if (is_timing) (if (std.c.getenv("TF_MIMO_TIMING_CONTEXT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 32768) else if (is_m1 and args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096; // timing: graphs-3.0.json's context
++    const context: usize = if (is_prompt) 32768 else if (is_ptiming) 65536 else if (is_timing) (if (std.c.getenv("TF_MIMO_TIMING_CONTEXT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 32768) else if (is_m1 and args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 4096; // timing: graphs-3.0.json's context
+     const rows_max: usize = if (is_m1) 1 else 128;
+     const slots: usize = if (is_m1) 1 else 4;
+     const cfg = try tp.Config.fromEnv();
+@@ -120,6 +121,7 @@ pub fn main(init: std.process.Init) !u8 {
+     defer ora.close(io);
+     if (is_win) return windows(gpa, io, &model, s, &ora, args[5], rank);
+     if (is_prompt) return promptGate(gpa, &model, s, &ora, rank);
++    if (is_ptiming) return promptTiming(gpa, io, &model, s, rank);
+     if (std.mem.eql(u8, args[1], "timing")) {
+         try timing(io, &model, s, rank, "drafter off");
+         const ddir = try std.fmt.allocPrint(gpa, "{s}/dflash", .{args[2]});
+@@ -701,3 +703,31 @@ fn promptGate(gpa: std.mem.Allocator, model: *mimo.forward.Model, s: cuda.Stream
+     std.debug.print("{s} prompt rank {d}: fingerprints {d}/{d} layer captures; last-row logits {d}/{d}; greedy {d}/{d}; serving plan {d}/{d} scenarios{s}{s}\n", .{ if (exact) "PASS" else "FAIL", rank, c.equal, c.checked, logits_ok, logits_n, steps_ok, steps_n, plan_ok, plan_n, if (c.first_fail != null) "; first difference " else "", c.first_fail orelse "" });
+     return if (exact) 0 else 1;
+ }
++
++
++/// Prompt chunk costs (no capture): one slot, chunks of 512 / 4000 / 16000 rows from position 0, warm then timed;
++/// TF_MIMO_PTIMING_ROWS overrides the chunk rows cap (default 16384).
++fn promptTiming(gpa: std.mem.Allocator, io: std.Io, model: *mimo.forward.Model, s: cuda.Stream, rank: usize) !u8 {
++    const cap: usize = if (std.c.getenv("TF_MIMO_PTIMING_ROWS")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 16384;
++    const pr = try mimo.prompt.Prompt.init(model, gpa, cap, s);
++    defer pr.deinit();
++    const ids = try gpa.alloc(i64, 16000);
++    defer gpa.free(ids);
++    for (ids, 0..) |*t, i| t.* = @intCast(1000 + (i * 7919) % 140000);
++    for ([_]usize{ 512, 4000, 16000 }) |n| {
++        const plan = try mimo.prompt.plan(gpa, 0, n, cap);
++        defer gpa.free(plan);
++        for (0..2) |rep| {
++            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++            var p0: usize = 0;
++            for (plan) |c| {
++                try pr.chunk(s, 0, p0, ids[p0 .. p0 + c], null);
++                p0 += c;
++            }
++            try s.synchronize();
++            const ms = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6;
++            if (rep == 1) std.debug.print("[ptiming] rank {d}: {d} rows in {d} chunks: {d:.1} ms, {d:.0} tok/s\n", .{ rank, n, plan.len, ms, @as(f64, @floatFromInt(n)) / ms * 1000.0 });
++        }
++    }
++    return 0;
++}
+diff --git a/zig/src/families/mimo_v2/m1_run.sh b/zig/src/families/mimo_v2/m1_run.sh
+index bed0aee0..49c863cf 100644
+--- a/zig/src/families/mimo_v2/m1_run.sh
++++ b/zig/src/families/mimo_v2/m1_run.sh
+@@ -11,7 +11,7 @@ args() {   # RANK ORACLE
+        "-e TF_TP_WORLD=2 -e TF_TP_RANK=$1 -e TF_TP_MASTER=10.100.128.1 -e TF_TP_PORT=$PORT -e TF_COMM_BACKEND=${COMM:-nccl} -e TF_TP_ROCE_HCA=rocep1s0f0,roceP2p1s0f0 ${EXTRA_ENV:-}" \
+        "-v $HOME/models/mimo-v2.6/MiMo-V2.6-Flash-RL-exl3-3.0bpw:/model:ro -v $HOME/mimo:/mimo" \
+        "$(if [ -n "${NSYS:-}" ] && [ "$1" = 0 ]; then echo --entrypoint /usr/local/cuda/bin/nsys mimo-tf:latest profile -o /mimo/nsys/$NSYS --trace=cuda-sw,nvtx --force-overwrite true ${BIN:-/mimo/m1}/tf-mimo; else echo --entrypoint ${BIN:-/mimo/m1}/tf-mimo mimo-tf:latest; fi) ${MODE:-m1} /model $2 /mimo/oracle/${AOT:-aot2-sm121}" \
+-       "$(case ${MODE:-m1} in windows|dflash) echo /mimo/oracle/${MODE}-r$1.json;; timing|prompt) echo;; *) echo ${CONTEXT:-4096};; esac)"
++       "$(case ${MODE:-m1} in windows|dflash) echo /mimo/oracle/${MODE}-r$1.json;; timing|prompt|ptiming) echo;; *) echo ${CONTEXT:-4096};; esac)"
+ }
+ ssh -n "$WORKER" "docker rm -f mimo-m1 >/dev/null 2>&1; docker run $(args 1 ${ORACLE:-/mimo/oracle/rank}1.safetensors) > \$HOME/mimo/m1/${MODE:-m1}-r1.log 2>&1" </dev/null &
+ docker rm -f mimo-m1 >/dev/null 2>&1
+-- 
+2.53.0
+

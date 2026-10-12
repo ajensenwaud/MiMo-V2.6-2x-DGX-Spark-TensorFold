@@ -1,7 +1,7 @@
 From 04b88f626b58bce999471ca56cefe05b8192ca76 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 18:34:16 +1100
-Subject: [PATCH 27/55] mimo_v2: device argmax for greedy rows
+Subject: [PATCH 27/67] mimo_v2: device argmax for greedy rows
  (TF_MIMO_HOST_ARGMAX=1: the host path)
 
 ---

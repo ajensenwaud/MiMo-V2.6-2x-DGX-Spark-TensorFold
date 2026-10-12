@@ -1,0 +1,382 @@
+From 6c88d37b944f65bb2f2ca3d88567d52b53bf06c6 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 12:49:38 +1100
+Subject: [PATCH 66/67] kv8: chunks of TF_MIMO_KV8_CK keys (1024) for rows8b,
+ mimo_merge8 (a block a row-head, warps over chunks); kv8check arms
+
+---
+ zig/kernels/cuda/mimo_v2/kv8.cu      |  61 ++++++++-
+ zig/src/families/mimo_v2/forward.zig | 187 ++++++++++++++++-----------
+ 2 files changed, 172 insertions(+), 76 deletions(-)
+
+diff --git a/zig/kernels/cuda/mimo_v2/kv8.cu b/zig/kernels/cuda/mimo_v2/kv8.cu
+index 37af74cb..3bd72569 100644
+--- a/zig/kernels/cuda/mimo_v2/kv8.cu
++++ b/zig/kernels/cuda/mimo_v2/kv8.cu
+@@ -336,7 +336,7 @@ extern "C" __global__ void __launch_bounds__(128) mimo_rows8b(
+     const __half* __restrict__ Q, const uint8_t* __restrict__ KC, const float* __restrict__ KS,
+     const uint8_t* __restrict__ VC, const float* __restrict__ VS, const int32_t* __restrict__ POS,
+     const int32_t* __restrict__ SLOT, float* __restrict__ PO, float* __restrict__ PM, float* __restrict__ PL, int LEN,
+-    int NCH, int H, int HK, float scale) {
++    int NCH, int H, int HK, float scale, int CKK) {
+     __shared__ __align__(16) uint8_t st[2][STAGE];
+     const int r = blockIdx.x, hk = blockIdx.y, c = blockIdx.z, n = gridDim.x;
+     const int slot = SLOT[r];
+@@ -349,14 +349,14 @@ extern "C" __global__ void __launch_bounds__(128) mimo_rows8b(
+     const int pos = POS[row];
+     int maxpos = POS[r];
+     for (int i = 1; i < R; ++i) maxpos = max(maxpos, POS[r + i]);
+-    const int start = c * CK;
++    const int start = c * CKK;
+     const int64_t base = static_cast<int64_t>(slot) * LEN;
+     float o[DV / 8][4];
+ #pragma unroll
+     for (int i = 0; i < DV / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
+     const int head0 = hk * G + g;
+-    const int tiles = start <= maxpos ? min(CK / BN, (maxpos - start) / BN + 1) : 0;
++    const int tiles = start <= maxpos ? min(CKK / BN, (maxpos - start) / BN + 1) : 0;
+     auto stage = [&](int t) {
+         uint8_t* s = st[t & 1];
+         const int key0 = start + t * BN;
+@@ -497,6 +497,61 @@ extern "C" __global__ void __launch_bounds__(128) mimo_rows8b(
+     }
+ }
+ 
++// The chunk partials folded (attention._merge without sinks), a block per (row, head): the chunks' maximum over the
++// block, then eight warps each fold every eighth chunk (a lane four dims), summed over the warps; fp16 out.
++extern "C" __global__ void __launch_bounds__(256) mimo_merge8(const float* __restrict__ PO,
++                                                             const float* __restrict__ PM,
++                                                             const float* __restrict__ PL, __half* __restrict__ OUT,
++                                                             int NCH, int H) {
++    __shared__ float red[8];
++    __shared__ float4 acc_s[8][32];
++    __shared__ float l_s[8];
++    const int64_t r = blockIdx.x;
++    const int h = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
++    float mx = -CUDART_INF_F;
++    for (int c = threadIdx.x; c < NCH; c += blockDim.x) mx = fmaxf(mx, PM[(r * NCH + c) * H + h]);
++    mx = warp_max(mx);
++    if (lane == 0) red[warp] = mx;
++    __syncthreads();
++    mx = red[0];
++#pragma unroll
++    for (int w = 1; w < 8; ++w) mx = fmaxf(mx, red[w]);
++    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
++    float l = 0.0f;
++    for (int c = warp; c < NCH; c += 8) {
++        const int64_t at = (r * NCH + c) * H + h;
++        const float cm = PM[at];
++        if (cm == -CUDART_INF_F) continue;
++        const float f = texp(cm - mx);
++        l += PL[at] * f;
++        const float4 v = reinterpret_cast<const float4*>(PO + at * DV)[lane];
++        acc.x += v.x * f;
++        acc.y += v.y * f;
++        acc.z += v.z * f;
++        acc.w += v.w * f;
++    }
++    acc_s[warp][lane] = acc;
++    if (lane == 0) l_s[warp] = l;
++    __syncthreads();
++    if (warp == 0) {
++        float4 s = acc_s[0][lane];
++        float ls = l_s[0];
++#pragma unroll
++        for (int w = 1; w < 8; ++w) {
++            const float4 v = acc_s[w][lane];
++            s.x += v.x;
++            s.y += v.y;
++            s.z += v.z;
++            s.w += v.w;
++            ls += l_s[w];
++        }
++        const float inv = 1.0f / ls;
++        __half2* out = reinterpret_cast<__half2*>(OUT + (r * H + h) * DV + 4 * lane);
++        out[0] = __floats2half2_rn(s.x * inv, s.y * inv);
++        out[1] = __floats2half2_rn(s.z * inv, s.w * inv);
++    }
++}
++
+ // One stream's keys [0, keys): KC / VC rows at base + key -> KD [keys, HK, 192], VD [keys, HK, 128] fp16.
+ extern "C" __global__ void mimo_kv8_dequant(const uint8_t* __restrict__ KC, const float* __restrict__ KS,
+                                             const uint8_t* __restrict__ VC, const float* __restrict__ VS,
+diff --git a/zig/src/families/mimo_v2/forward.zig b/zig/src/families/mimo_v2/forward.zig
+index e3f36ebf..b9a2f235 100644
+--- a/zig/src/families/mimo_v2/forward.zig
++++ b/zig/src/families/mimo_v2/forward.zig
+@@ -136,6 +136,9 @@ pub const Model = struct {
+     f_qkv8: cuda.Function = undefined,
+     f_rows8: cuda.Function = undefined,
+     f_dq8: cuda.Function = undefined,
++    f_merge8: cuda.Function = undefined,
++    kv8_b: bool = true, // mimo_rows8b (else mimo_rows8, chunks of CK)
++    kv8_ck: usize = 1024, // mimo_rows8b's keys a chunk (TF_MIMO_KV8_CK)
+     cos_full: u64,
+     sin_full: u64,
+     cos_swa: u64,
+@@ -184,7 +187,11 @@ pub const Model = struct {
+             m.f_qkv8 = try m.kv8_mod.?.function("mimo_qkv8");
+             // TF_MIMO_KV8_KERNEL=a: keys dequantised into shared memory; b (default): 8-bit tiles, two stages in flight
+             const kb = if (std.c.getenv("TF_MIMO_KV8_KERNEL")) |v| v[0] != 'a' else true;
++            m.kv8_b = kb;
+             m.f_rows8 = try m.kv8_mod.?.function(if (kb) "mimo_rows8b" else "mimo_rows8");
++            m.f_merge8 = try m.kv8_mod.?.function("mimo_merge8");
++            m.kv8_ck = if (!kb) CK else if (std.c.getenv("TF_MIMO_KV8_CK")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 1024;
++            if (m.kv8_ck % CK != 0 or m.kv8_ck == 0) return error.Kv8Chunk;
+             m.f_dq8 = try m.kv8_mod.?.function("mimo_kv8_dequant");
+         }
+         for (0..cfg.layers) |i| {
+@@ -422,8 +429,10 @@ pub const Model = struct {
+     }
+ 
+     /// kv8: decode attention partials over layer i's 8-bit cache, `nch` chunks (kv8.cu mimo_rows8; _merge folds).
+-    pub fn rows8(m: *Model, s: Stream, i: usize, qo: u64, pos: u64, slot: u64, po: u64, pm: u64, pl: u64, n: usize, nch: usize) !void {
++    /// `chunks` of CK keys become chunks of kv8_ck; returns their count (the merge's NCH).
++    pub fn rows8(m: *Model, s: Stream, i: usize, qo: u64, pos: u64, slot: u64, po: u64, pm: u64, pl: u64, n: usize, chunks: usize) !usize {
+         const cfg = m.w.cfg;
++        const nch = (chunks * CK + m.kv8_ck - 1) / m.kv8_ck;
+         var a: cuda.Args = .{};
+         inline for (.{ qo, m.kc[i], m.ks[i], m.vc[i], m.vs[i], pos, slot, po, pm, pl }) |x| a.add(x);
+         a.add(@as(c_int, @intCast(m.context)));
+@@ -431,7 +440,18 @@ pub const Model = struct {
+         a.add(@as(c_int, @intCast(cfg.heads)));
+         a.add(@as(c_int, @intCast(cfg.kvHeads(i))));
+         a.add(m.scale);
++        if (m.kv8_b) a.add(@as(c_int, @intCast(m.kv8_ck)));
+         try cuda.launch.launch(m.f_rows8, .{ .grid = .{ .x = u(n), .y = u(cfg.kvHeads(i)), .z = u(nch) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &a);
++        return nch;
++    }
++
++    /// kv8: the chunk partials folded into fp16 `out` [n, H, 128] (kv8.cu mimo_merge8; no sinks: full layers).
++    pub fn merge8(m: *Model, s: Stream, po: u64, pm: u64, pl: u64, out: u64, n: usize, nch: usize) !void {
++        var a: cuda.Args = .{};
++        inline for (.{ po, pm, pl, out }) |x| a.add(x);
++        a.add(@as(c_int, @intCast(nch)));
++        a.add(@as(c_int, @intCast(m.w.cfg.heads)));
++        try cuda.launch.launch(m.f_merge8, .{ .grid = .{ .x = u(n), .y = u(m.w.cfg.heads), .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
+     }
+ 
+     /// kv8: one stream's keys [0, keys) of layer i back to fp16 [keys, HK, 192] / [keys, HK, 128] (the prompt kernel).
+@@ -473,11 +493,8 @@ pub const Model = struct {
+             const len = if (full) m.context else m.ring;
+             if (full and m.kv8) {
+                 try m.qkv8(s, i, m.b.q, m.b.k, m.b.v, m.b.pos, m.b.slot, m.b.qo, n);
+-                try m.rows8(s, i, m.b.qo, m.b.pos, m.b.slot, m.b.po, m.b.pm, m.b.pl, n, chunks);
+-                try m.set.run(s, "_merge", .{ u(n), u(H), 1 }, &.{
+-                    p("PO", "*fp32", m.b.po), p("PM", "*fp32", m.b.pm), p("PL", "*fp32", m.b.pl),
+-                    p("SINKS", "*fp32", m.b.pm), p("OUT", "*fp16", m.b.att), ii("NCH", chunks),
+-                }, &.{ ci("H", H), ci("HAS_SINK", 0) });
++                const nch8 = try m.rows8(s, i, m.b.qo, m.b.pos, m.b.slot, m.b.po, m.b.pm, m.b.pl, n, chunks);
++                try m.merge8(s, m.b.po, m.b.pm, m.b.pl, m.b.att, n, nch8);
+             } else try m.set.run(s, "_qkv", .{ u(n), u(H + 2 * hk), 1 }, &.{
+                 p("Q", "*fp16", m.b.q),       p("K", "*fp16", m.b.k),         p("V", "*fp16", m.b.v),
+                 p("COS", "*fp32", if (full) m.cos_full else m.cos_swa), p("SIN", "*fp32", if (full) m.sin_full else m.sin_swa),
+@@ -596,9 +613,8 @@ test "ring size and argmax" {
+ }
+ 
+ /// tf-mimo kv8check: the 8-bit decode attention (kv8.cu) against the Triton kernels on one stream's 131,136-key
+-/// cache of hashed values: rows at 128,000.. (1, 4, 8 rows). Errors against the Triton kernel on the same 8-bit values
+-/// (dequantised to fp16: the kernel's own error) and on the fp16 values (the cache's quantisation error); then the
+-/// time of each (rows + merge, 20 reps).
++/// cache of hashed values, rows at 128,000.. (1, 4, 8 rows): each arm's error against Triton on the same 8-bit values
++/// (dequantised to fp16) and on the fp16 values (the cache's quantisation), and its time (rows + merge, 20 reps).
+ pub fn kv8Check(m: *Model, io: std.Io, s: Stream, rank: usize) !void {
+     const cfg = m.w.cfg;
+     const H = cfg.heads;
+@@ -613,8 +629,9 @@ pub fn kv8Check(m: *Model, io: std.Io, s: Stream, rank: usize) !void {
+     defer mod.unload();
+     const f_fill = try mod.function("mimo_fill_half");
+     const f_quant = try mod.function("mimo_kv8_quant");
+-    const f_rows8 = try mod.function("mimo_rows8");
+-    const f_rows8b = try mod.function("mimo_rows8b");
++    const f_a = try mod.function("mimo_rows8");
++    const f_b = try mod.function("mimo_rows8b");
++    const f_m8 = try mod.function("mimo_merge8");
+     const f_dq = try mod.function("mimo_kv8_dequant");
+     const k16 = try ar.zeros(ent * 192 * 2);
+     const v16 = try ar.zeros(ent * 128 * 2);
+@@ -628,7 +645,10 @@ pub fn kv8Check(m: *Model, io: std.Io, s: Stream, rank: usize) !void {
+     const po = try ar.zeros(8 * NCH * H * 128 * 4);
+     const pm = try ar.zeros(8 * NCH * H * 4);
+     const pl = try ar.zeros(8 * NCH * H * 4);
+-    const outs = [4]u64{ try ar.zeros(8 * H * 128 * 2), try ar.zeros(8 * H * 128 * 2), try ar.zeros(8 * H * 128 * 2), try ar.zeros(8 * H * 128 * 2) };
++    const out_sz = 8 * H * 128 * 2;
++    const ref8 = try ar.zeros(out_sz);
++    const ref16 = try ar.zeros(out_sz);
++    const got = try ar.zeros(out_sz);
+     const grid1k: cuda.launch.Config = .{ .grid = .{ .x = 1024, .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } };
+     inline for (.{ .{ k16, ent * 192, 1, 1.0 }, .{ v16, ent * 128, 2, 1.0 }, .{ q, 8 * H * 192, 3, 3.0 } }) |f| {
+         var a: cuda.Args = .{};
+@@ -651,8 +671,18 @@ pub fn kv8Check(m: *Model, io: std.Io, s: Stream, rank: usize) !void {
+         a.add(@as(c_int, @intCast(HK)));
+         try cuda.launch.launch(f_dq, grid1k, s, &a);
+     }
+-    const host = try m.gpa.alloc(u16, 4 * 8 * H * 128);
++    const host = try m.gpa.alloc(u16, 3 * 8 * H * 128);
+     defer m.gpa.free(host);
++    const Arm = struct { name: []const u8, kernel: u8, ck: usize, merge8: bool };
++    const arms = [_]Arm{
++        .{ .name = "triton fp16", .kernel = 't', .ck = CK, .merge8 = false },
++        .{ .name = "a ck256 tmerge", .kernel = 'a', .ck = CK, .merge8 = false },
++        .{ .name = "b ck256 tmerge", .kernel = 'b', .ck = CK, .merge8 = false },
++        .{ .name = "b ck256 merge8", .kernel = 'b', .ck = CK, .merge8 = true },
++        .{ .name = "b ck512 merge8", .kernel = 'b', .ck = 512, .merge8 = true },
++        .{ .name = "b ck1024 merge8", .kernel = 'b', .ck = 1024, .merge8 = true },
++        .{ .name = "b ck2048 merge8", .kernel = 'b', .ck = 2048, .merge8 = true },
++    };
+     for ([_]usize{ 1, 4, 8 }) |n| {
+         var hp: [8]i32 = undefined;
+         var hs: [8]i32 = undefined;
+@@ -662,77 +692,88 @@ pub fn kv8Check(m: *Model, io: std.Io, s: Stream, rank: usize) !void {
+         }
+         const pos = try ar.upload(std.mem.sliceAsBytes(hp[0..n]));
+         const slot = try ar.upload(std.mem.sliceAsBytes(hs[0..n]));
+-        const Run = struct {
+-            fn triton(mm: *Model, ss: Stream, qq: u64, kk: u64, vv: u64, ps: u64, sl: u64, bufs: [3]u64, out: u64, rows: usize, h: usize, hk: usize, g: usize, len: usize, nch: usize) !void {
+-                try mm.set.run(ss, "_rows", .{ u(rows), u(hk), u(nch) }, &.{
+-                    p("Q", "*fp16", qq),  p("KC", "*fp16", kk),     p("VC", "*fp16", vv),
+-                    p("POS", "*i32", ps), p("SLOT", "*i32", sl),    p("PO", "*fp32", bufs[0]),
+-                    p("PM", "*fp32", bufs[1]), p("PL", "*fp32", bufs[2]), ii("LEN", len),
+-                    ii("NCH", nch),
+-                }, &.{ ci("H", h), ci("HK", hk), ci("G", g), ci("WIN", 0), aot.cf("SCALE", mm.scale), ci("CK", CK), ci("BN", BN), ci("GP", GP) });
+-                try merge(mm, ss, bufs, out, rows, h, nch);
++        const Ctx = struct {
++            m: *Model,
++            s: Stream,
++            n: usize,
++            pos: u64,
++            slot: u64,
++            q: u64,
++            po: u64,
++            pm: u64,
++            pl: u64,
++            fa: cuda.Function,
++            fb: cuda.Function,
++            fm: cuda.Function,
++            c8: [4]u64,
++            H: usize,
++            HK: usize,
++            G: usize,
++            LEN: usize,
++            fn triton(c: @This(), kk: u64, vv: u64, out: u64) !void {
++                try c.m.set.run(c.s, "_rows", .{ u(c.n), u(c.HK), u(NCH) }, &.{
++                    p("Q", "*fp16", c.q),      p("KC", "*fp16", kk),     p("VC", "*fp16", vv),
++                    p("POS", "*i32", c.pos),   p("SLOT", "*i32", c.slot), p("PO", "*fp32", c.po),
++                    p("PM", "*fp32", c.pm),    p("PL", "*fp32", c.pl),   ii("LEN", c.LEN),
++                    ii("NCH", NCH),
++                }, &.{ ci("H", c.H), ci("HK", c.HK), ci("G", c.G), ci("WIN", 0), aot.cf("SCALE", c.m.scale), ci("CK", CK), ci("BN", BN), ci("GP", GP) });
++                try c.tmerge(out, NCH);
+             }
+-            fn merge(mm: *Model, ss: Stream, bufs: [3]u64, out: u64, rows: usize, h: usize, nch: usize) !void {
+-                try mm.set.run(ss, "_merge", .{ u(rows), u(h), 1 }, &.{
+-                    p("PO", "*fp32", bufs[0]), p("PM", "*fp32", bufs[1]), p("PL", "*fp32", bufs[2]),
+-                    p("SINKS", "*fp32", bufs[1]), p("OUT", "*fp16", out), ii("NCH", nch),
+-                }, &.{ ci("H", h), ci("HAS_SINK", 0) });
++            fn tmerge(c: @This(), out: u64, nch: usize) !void {
++                try c.m.set.run(c.s, "_merge", .{ u(c.n), u(c.H), 1 }, &.{
++                    p("PO", "*fp32", c.po), p("PM", "*fp32", c.pm), p("PL", "*fp32", c.pl),
++                    p("SINKS", "*fp32", c.pm), p("OUT", "*fp16", out), ii("NCH", nch),
++                }, &.{ ci("H", c.H), ci("HAS_SINK", 0) });
+             }
+-        };
+-        const bufs = [3]u64{ po, pm, pl };
+-        const rows8 = struct {
+-            fn go(mm: *Model, ss: Stream, f: cuda.Function, qq: u64, c8: [4]u64, ps: u64, sl: u64, b: [3]u64, out: u64, rows: usize, h: usize, hk: usize, len: usize, nch: usize) !void {
++            fn arm(c: @This(), a_: Arm, k16_: u64, v16_: u64, out: u64) !void {
++                if (a_.kernel == 't') return c.triton(k16_, v16_, out);
++                const nch = (NCH * CK + a_.ck - 1) / a_.ck;
+                 var a: cuda.Args = .{};
+-                inline for (.{ qq, c8[0], c8[1], c8[2], c8[3], ps, sl, b[0], b[1], b[2] }) |x| a.add(x);
+-                a.add(@as(c_int, @intCast(len)));
++                inline for (.{ c.q, c.c8[0], c.c8[1], c.c8[2], c.c8[3], c.pos, c.slot, c.po, c.pm, c.pl }) |x| a.add(x);
++                a.add(@as(c_int, @intCast(c.LEN)));
+                 a.add(@as(c_int, @intCast(nch)));
+-                a.add(@as(c_int, @intCast(h)));
+-                a.add(@as(c_int, @intCast(hk)));
+-                a.add(mm.scale);
+-                try cuda.launch.launch(f, .{ .grid = .{ .x = u(rows), .y = u(hk), .z = u(nch) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, ss, &a);
+-                try Run.merge(mm, ss, b, out, rows, h, nch);
++                a.add(@as(c_int, @intCast(c.H)));
++                a.add(@as(c_int, @intCast(c.HK)));
++                a.add(c.m.scale);
++                if (a_.kernel == 'b') a.add(@as(c_int, @intCast(a_.ck)));
++                try cuda.launch.launch(if (a_.kernel == 'a') c.fa else c.fb, .{ .grid = .{ .x = u(c.n), .y = u(c.HK), .z = u(nch) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, c.s, &a);
++                if (!a_.merge8) return c.tmerge(out, nch);
++                var b: cuda.Args = .{};
++                inline for (.{ c.po, c.pm, c.pl, out }) |x| b.add(x);
++                b.add(@as(c_int, @intCast(nch)));
++                b.add(@as(c_int, @intCast(c.H)));
++                try cuda.launch.launch(c.fm, .{ .grid = .{ .x = u(c.n), .y = u(c.H), .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, c.s, &b);
+             }
+         };
+-        const c8 = [4]u64{ kc8, ks, vc8, vs };
+-        try Run.triton(m, s, q, kd, vd, pos, slot, bufs, outs[0], n, H, HK, G, LEN, NCH);
+-        try Run.triton(m, s, q, k16, v16, pos, slot, bufs, outs[1], n, H, HK, G, LEN, NCH);
+-        try rows8.go(m, s, f_rows8, q, c8, pos, slot, bufs, outs[2], n, H, HK, LEN, NCH);
+-        try rows8.go(m, s, f_rows8b, q, c8, pos, slot, bufs, outs[3], n, H, HK, LEN, NCH);
++        const cx: Ctx = .{ .m = m, .s = s, .n = n, .pos = pos, .slot = slot, .q = q, .po = po, .pm = pm, .pl = pl, .fa = f_a, .fb = f_b, .fm = f_m8, .c8 = .{ kc8, ks, vc8, vs }, .H = H, .HK = HK, .G = G, .LEN = LEN };
++        try cx.triton(kd, vd, ref8);
++        try cx.triton(k16, v16, ref16);
+         try s.synchronize();
+         const per = n * H * 128;
+-        for (0..4) |k| try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(host[k * per ..].ptr), outs[k], per * 2), "kv8check download");
+-        var e_k: f64 = 0; // rows8 vs Triton on the same 8-bit values
+-        var e_q: f64 = 0; // rows8 vs Triton on fp16 (quantisation)
+-        var e_qm: f64 = 0;
+-        var amax: f64 = 0;
+-        var bad: usize = 0;
+-        var e_b: f64 = 0; // rows8b vs Triton on the same 8-bit values
+-        for (0..per) |i| {
+-            const gb: f64 = @floatCast(@as(f16, @bitCast(host[3 * per + i])));
+-            if (!std.math.isFinite(gb)) bad += 1;
+-            e_b = @max(e_b, @abs(gb - @as(f64, @floatCast(@as(f16, @bitCast(host[i]))))));
+-            const ref: f64 = @floatCast(@as(f16, @bitCast(host[i])));
+-            const r16: f64 = @floatCast(@as(f16, @bitCast(host[per + i])));
+-            const got: f64 = @floatCast(@as(f16, @bitCast(host[2 * per + i])));
+-            if (!std.math.isFinite(got)) bad += 1;
+-            e_k = @max(e_k, @abs(got - ref));
+-            e_q = @max(e_q, @abs(got - r16));
+-            e_qm += @abs(got - r16);
+-            amax = @max(amax, @abs(r16));
+-        }
+-        // time: 20 reps each
+-        var t_tri: f64 = 0;
+-        var t_8: f64 = 0;
+-        var t_8b: f64 = 0;
+-        for (0..3) |phase| {
+-            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+-            for (0..20) |_| {
+-                if (phase == 0) try Run.triton(m, s, q, k16, v16, pos, slot, bufs, outs[1], n, H, HK, G, LEN, NCH) else try rows8.go(m, s, if (phase == 1) f_rows8 else f_rows8b, q, c8, pos, slot, bufs, outs[2], n, H, HK, LEN, NCH);
++        try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(host[0..].ptr), ref8, per * 2), "kv8check download");
++        try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(host[per..].ptr), ref16, per * 2), "kv8check download");
++        for (arms) |a_| {
++            try cx.arm(a_, k16, v16, got);
++            try s.synchronize();
++            try m.d.check(m.d.api.cuMemcpyDtoH_v2(@ptrCast(host[2 * per ..].ptr), got, per * 2), "kv8check download");
++            var e8: f64 = 0;
++            var e16: f64 = 0;
++            var bad: usize = 0;
++            for (0..per) |i| {
++                const r8: f64 = @floatCast(@as(f16, @bitCast(host[i])));
++                const r16: f64 = @floatCast(@as(f16, @bitCast(host[per + i])));
++                const g: f64 = @floatCast(@as(f16, @bitCast(host[2 * per + i])));
++                if (!std.math.isFinite(g)) bad += 1;
++                e8 = @max(e8, @abs(g - r8));
++                e16 = @max(e16, @abs(g - r16));
+             }
++            for (0..3) |_| try cx.arm(a_, k16, v16, got);
++            try s.synchronize();
++            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++            for (0..20) |_| try cx.arm(a_, k16, v16, got);
+             try s.synchronize();
+             const ms = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e6 / 20.0;
+-            if (phase == 0) t_tri = ms else if (phase == 1) t_8 = ms else t_8b = ms;
++            std.debug.print("[kv8check] rank {d}: {d} rows at {d}, {s}: {d:.3} ms a layer; max err vs triton(same 8-bit) {e:.2}, vs triton(fp16) {e:.2}, non-finite {d}\n", .{ rank, n, P, a_.name, ms, e8, e16, bad });
+         }
+-        std.debug.print("[kv8check] rank {d}: {d} rows at {d}: max |rows8 - triton(same 8-bit)| {e:.3}, max |rows8 - triton(fp16)| {e:.3} (mean {e:.3}, |out| max {d:.3}), non-finite {d}; rows8b vs same 8-bit {e:.3}; a layer's attention triton fp16 {d:.3} ms, rows8 {d:.3} ms, rows8b {d:.3} ms\n", .{ rank, n, P, e_k, e_q, e_qm / @as(f64, @floatFromInt(per)), amax, bad, e_b, t_tri, t_8, t_8b });
+     }
+ }
+-- 
+2.53.0
+

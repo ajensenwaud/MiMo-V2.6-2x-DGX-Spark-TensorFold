@@ -1,7 +1,7 @@
 From 363bbfbe18bda3b58d4ba8b75326f105a349f8a2 Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 21:32:17 +1100
-Subject: [PATCH 36/55] dflash: draft attention a block per (row, KV head),
+Subject: [PATCH 36/67] dflash: draft attention a block per (row, KV head),
  keys and values shared by the group's heads (was re-read per head: 9.8 ms
  draft at position 9,000)
 

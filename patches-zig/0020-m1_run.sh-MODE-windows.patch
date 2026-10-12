@@ -1,7 +1,7 @@
 From 5278f668231a05c737928103f56471ab03fb53de Mon Sep 17 00:00:00 2001
 From: Anders Jensen-Waud <anders@jensenwaud.com>
 Date: Sun, 11 Oct 2026 16:21:13 +1100
-Subject: [PATCH 20/55] m1_run.sh: MODE=windows
+Subject: [PATCH 20/67] m1_run.sh: MODE=windows
 
 ---
  zig/src/families/mimo_v2/m1_run.sh | 9 +++++----

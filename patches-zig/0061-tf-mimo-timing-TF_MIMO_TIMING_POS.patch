@@ -1,0 +1,49 @@
+From debe9b1f88d9ac6c1c15f30cbab366cf4398c5f1 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <anders@jensenwaud.com>
+Date: Mon, 12 Oct 2026 11:00:15 +1100
+Subject: [PATCH 61/67] tf-mimo timing: TF_MIMO_TIMING_POS
+
+---
+ zig/src/families/mimo_v2/m1_main.zig | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/m1_main.zig b/zig/src/families/mimo_v2/m1_main.zig
+index d67bfdd1..87493a30 100644
+--- a/zig/src/families/mimo_v2/m1_main.zig
++++ b/zig/src/families/mimo_v2/m1_main.zig
+@@ -497,11 +497,13 @@ fn follow(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, session: *t
+ /// distinct tokens, after a capture and warm-up.
+ fn timing(io: std.Io, model: *mimo.forward.Model, s: cuda.Stream, rank: usize, label: []const u8) !void {
+     var rng = std.Random.DefaultPrng.init(7);
++    // TF_MIMO_TIMING_POS: the rows' position (default 9,000; the context must exceed it)
++    const at: u32 = if (std.c.getenv("TF_MIMO_TIMING_POS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 9000;
+     var rows: [8]mimo.forward.Row = undefined;
+     var ids: [8]i32 = undefined;
+     const reps = 40;
+     for ([_]usize{ 1, 4, 8 }) |n| {
+-        for (0..n) |j| rows[j] = .{ .slot = 0, .pos = @intCast(9000 + j), .token = 1000 };
++        for (0..n) |j| rows[j] = .{ .slot = 0, .pos = @intCast(at + j), .token = 1000 };
+         try model.graphed(s, rows[0..n], null);
+         try model.graphed(s, rows[0..n], null);
+         var t_step: i96 = 0;
+@@ -521,7 +523,7 @@ fn timing(io: std.Io, model: *mimo.forward.Model, s: cuda.Stream, rank: usize, l
+     // eager breakdown by category (CUDA events between launches; eager, so not the graph's wall time)
+     for ([_]usize{ 1, 8 }) |n| {
+         var prof: mimo.forward.EvProf = .{};
+-        for (0..n) |j| rows[j] = .{ .slot = 0, .pos = @intCast(9000 + j), .token = 1000 };
++        for (0..n) |j| rows[j] = .{ .slot = 0, .pos = @intCast(at + j), .token = 1000 };
+         try model.forward(s, rows[0..n], null, null);
+         model.ev = &prof;
+         for (0..20) |_| {
+@@ -547,7 +549,7 @@ fn timing(io: std.Io, model: *mimo.forward.Model, s: cuda.Stream, rank: usize, l
+         var out: [64]i32 = undefined;
+         for (0..S) |i| {
+             toks[i] = 1000;
+-            p0[i] = 9000;
++            p0[i] = at;
+             sl[i] = @intCast(i);
+         }
+         try dr.draft(s, toks[0..S], p0[0..S], sl[0..S], &out);
+-- 
+2.53.0
+
