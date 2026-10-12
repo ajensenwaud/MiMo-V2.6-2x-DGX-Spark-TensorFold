@@ -1,7 +1,7 @@
 From d54a269aa4e2ee37ff7f4fb0c79fd28b3b2e2f60 Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 22:00:40 +1100
-Subject: [PATCH 37/67] m1_run.sh: NSYS= profiles rank 0
+Subject: [PATCH 37/71] m1_run.sh: NSYS= profiles rank 0
 
 ---
  zig/src/families/mimo_v2/m1_run.sh | 2 +-

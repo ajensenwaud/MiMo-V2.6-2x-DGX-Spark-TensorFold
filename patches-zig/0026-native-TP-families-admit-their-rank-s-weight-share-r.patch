@@ -1,7 +1,7 @@
 From 4b92c2e4d66f8a7dcc134a5454a471eda3623731 Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 17:20:46 +1100
-Subject: [PATCH 26/67] native: TP families admit their rank's weight share
+Subject: [PATCH 26/71] native: TP families admit their rank's weight share
  (rankWeights)
 
 ---

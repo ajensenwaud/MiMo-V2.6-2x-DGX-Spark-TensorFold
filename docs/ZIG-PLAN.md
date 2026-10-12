@@ -18,7 +18,7 @@ Confirmed by Anders on 2026-10-11 ("go"): D1 as below; D2-D7 as recommended.
 | D3 | GPU windows | **Anders (2026-10-11): take the GPUs down any time the serve is not in critical use** (check `/health` requests_running == 0 and no established :8891 connections first; restart with `~/mimo/recipe/start.sh` on gx10 after). |
 | D4 | Where it lives | Same repo, `zig/` (family source, kernels, launcher) + `patches-zig/` (TensorFold commits as `git format-patch`), README section added at release. Published only on an explicit yes. |
 | D5 | Toolchain | Zig 0.17.0 inside a build image layered on the existing base image (nvcc 13.3.73, Triton 3.7.1 already there). No host installs. |
-| D6 | Upstream contact | No contact with Jay (Anders, 2026-10-12); credit him in every artefact. Contributing the family upstream needs lint cleanup and is out of scope until Z8. |
+| D6 | Credit | Credit Jay Leaton in every artefact (patch headers, README, CREDITS). Contributing the family upstream needs lint cleanup and is out of scope until Z8. |
 | D7 | Pack | The shipped 3.0 bpw pack (`f2d8d100101b`). No requantising during the port. |
 
 ## Standing rules (verbatim for the executor)
@@ -65,7 +65,7 @@ Port by concern, one commit each, Jay credited in every commit message and file 
 - Z0B.2 CUDA tensor parallelism: rebase #636 (`stack/03-tp-fabric`, +6,004, 38 files) onto 1.0.5's existing `zig/src/fabric` (verbs, mailbox, collectives already upstream). Pass: its host tests; then a two-node GPU check: `fabric_sendrecv` / `linktest` between gx10 and gx11 over the CX7 link, and the RoCE one-shot all-gather matching NCCL bit for bit at decode and prompt sizes.
 - Z0B.3 EXL3 on CUDA: port the mul1 kernels from Jay's export (`exl3_experts.cu`, `x3ld.cu`, `x3pf`/`x3gm`, `linear.cu`, `lin2.cu`) as an EXL3 weight view in `cuda/qlinear.zig` and an EXL3 path in `cuda/grouped.zig`, following 1.0.5's "one home per format" rule. Pass: every kernel's output equals `core/exl3_format.zig`'s reference decode on rectangular and expert tensors from our pack, and equals the Python engine's EXL3 ops on Z1's fixtures.
 - Z0B.4 Sessions (#637) are deferred to Z5.2; grammar (#638, 53K lines with vendored xgrammar) is out of scope.
-- No upstream contact (D6, Anders 2026-10-12).
+- Credit as D6.
 - Order: Z1 (oracle capture on the Python serve) runs alongside Z0B; Z0B.3's last check needs Z1.2's fixtures.
 
 ### Z1. Oracles from the Python engine (1-2 sessions, short GPU windows)
@@ -290,7 +290,7 @@ parallelises: code-only work (Z5 server glue, Z6 kernels) proceeds while GPU win
   drafter's head gather, ~2 MB) look slower on the mailbox path; try TF_TP_MAILBOX_MAX_KB (Python: 512) and graphing
   the draft pass (Python: 7.0 -> 6.05 ms). Then the per-row gap to Python (22.4 vs 21.6 ms) and Z6.
 
-### Z7, session 9: the single-stream gap (Anders: "why slower on one stream, code and chat?")
+### Z7, session 9: the single-stream gap (why slower on one stream, code and chat?)
 - Same-night A/B, 3 runs a cell (median tok/s, 1 stream): Python chat 49.4 / code 78.7 / agent 58.9 / report 51.0;
   Zig lanes rule 46.6 / 66.6 / 55.4 / 47.7; Zig geometric rule 45.4 / 70.7 / 51.4 / 48.4. 4 streams aggregate: Python
   81.8 / 85.7 / 80.1 / 85.1; Zig lanes 72.2 / 110.2 / 83.4 / 78.3; geometric 80.3 / 106.5 / 89.5 / 83.5.

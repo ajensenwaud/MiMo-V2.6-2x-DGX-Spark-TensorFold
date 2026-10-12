@@ -1,7 +1,7 @@
 From e6aa5eaef12be644c37d0ce1a65d5d519f40bfce Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 12:07:42 +1100
-Subject: [PATCH 65/67] kv8: mimo_rows8b (8-bit tiles in shared memory,
+Subject: [PATCH 65/71] kv8: mimo_rows8b (8-bit tiles in shared memory,
  cp.async two stages, scales on scores / probabilities); kv8check times both
 
 ---

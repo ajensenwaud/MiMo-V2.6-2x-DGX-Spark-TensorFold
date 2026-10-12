@@ -1,0 +1,36 @@
+From 5075284c3ba53070b31ed2a76d59c172dc1e3087 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 14:54:16 +1100
+Subject: [PATCH 71/71] pgemm off by default: slower than unpack + _gemm
+ (512/4K/16K rows 722/5531/13522 vs 734/4993/11923 ms) and short/mixed prompts
+ diverge (greedy 101/160)
+
+---
+ zig/src/families/mimo_v2/prompt.zig | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/prompt.zig b/zig/src/families/mimo_v2/prompt.zig
+index 0c548b96..9d4bddaa 100644
+--- a/zig/src/families/mimo_v2/prompt.zig
++++ b/zig/src/families/mimo_v2/prompt.zig
+@@ -87,7 +87,7 @@ pub const Prompt = struct {
+     eu: u64,
+     eh: u64,
+     ed: u64,
+-    /// TF_MIMO_PGEMM (default on; 0 off): prompt GEMMs on pgemm.cu (trellis decoded in the GEMM), not unpack + _gemm
++    /// TF_MIMO_PGEMM=1 (experimental, default off): prompt GEMMs on pgemm.cu (trellis decoded in the GEMM), not unpack + _gemm
+     pg_mod: ?cuda.Module = null,
+     pg: [6]?cuda.Function = .{ null, null, null, null, null, null }, // K2 4, 6, 8, 10, 12, 16
+     kd: u64 = 0, // kv8: a full layer's fp16 keys [context, HK, 192] / values for the prompt kernel
+@@ -193,7 +193,7 @@ pub const Prompt = struct {
+         try m.d.check(m.d.api.cuMemsetD32_v2(pr.sc.members, 0xFFFF_FFFF, sz.members / 4), "members -1");
+         pr.pg_mod = null;
+         pr.pg = .{ null, null, null, null, null, null };
+-        if (if (std.c.getenv("TF_MIMO_PGEMM")) |v| v[0] != '0' else true) {
++        if (if (std.c.getenv("TF_MIMO_PGEMM")) |v| v[0] == '1' else false) { // off: slower (4K 5.53 vs 4.99 s) and greedy 101/160 on the prompt key
+             pr.pg_mod = try cuda.Module.load(m.d, cuda.kernels.mimo_pgemm);
+             inline for (.{ "4", "6", "8", "10", "12", "16" }, 0..) |k2, i| pr.pg[i] = try pr.pg_mod.?.function("mimo_pgemm_k" ++ k2);
+         }
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From 4338fd1677bff115e3d30d361b1adb84bbd2b1fa Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 06:52:23 +1100
-Subject: [PATCH 47/67] Z6: prompt path (prompt GEMM, full-attention prompt
+Subject: [PATCH 47/71] Z6: prompt path (prompt GEMM, full-attention prompt
  kernel, per-expert prompt MoE with torch's glue), chunk plan, tf-mimo prompt
  gate
 

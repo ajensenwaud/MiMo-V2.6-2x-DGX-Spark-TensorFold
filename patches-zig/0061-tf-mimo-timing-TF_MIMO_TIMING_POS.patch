@@ -1,7 +1,7 @@
 From debe9b1f88d9ac6c1c15f30cbab366cf4398c5f1 Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 11:00:15 +1100
-Subject: [PATCH 61/67] tf-mimo timing: TF_MIMO_TIMING_POS
+Subject: [PATCH 61/71] tf-mimo timing: TF_MIMO_TIMING_POS
 
 ---
  zig/src/families/mimo_v2/m1_main.zig | 8 +++++---

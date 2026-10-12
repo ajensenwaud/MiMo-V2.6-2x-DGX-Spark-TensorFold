@@ -1,0 +1,299 @@
+From b260c3c8f6e793ca440e09ef9914db48d1f4d42b Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 14:32:17 +1100
+Subject: [PATCH 70/71] Z7 pgemm.cu: EXL3 prompt GEMM with the trellis decoded
+ in-kernel (256-row blocks, shared fragments, double-buffered stages); prompt
+ path uses it (TF_MIMO_PGEMM=0: unpack + _gemm)
+
+---
+ zig/build/cuda.zig                  |   1 +
+ zig/kernels/cuda/mimo_v2/pgemm.cu   | 175 ++++++++++++++++++++++++++++
+ zig/src/cuda/kernels.zig            |   1 +
+ zig/src/families/mimo_v2/prompt.zig |  40 ++++++-
+ 4 files changed, 216 insertions(+), 1 deletion(-)
+ create mode 100644 zig/kernels/cuda/mimo_v2/pgemm.cu
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 18fee214..c96f5d40 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -44,6 +44,7 @@ const kernels = [_]Kernel{
+     .{ .name = "mimo_dflash", .src = "mimo_v2/dflash", .flags = glue }, // ours: the DFlash drafter's torch glue
+     .{ .name = "mimo_kv8", .src = "mimo_v2/kv8", .flags = &.{"-O3"} }, // ours (Z7): full attention on an 8-bit cache
+     .{ .name = "mimo_fast", .src = "mimo_v2/fast", .flags = &.{"-O3"} }, // ours (Z7): router GEMV, add + RMS norm
++    .{ .name = "mimo_pgemm", .src = "mimo_v2/pgemm", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // ours (Z7): EXL3 prompt GEMM, trellis decoded in-kernel
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+diff --git a/zig/kernels/cuda/mimo_v2/pgemm.cu b/zig/kernels/cuda/mimo_v2/pgemm.cu
+new file mode 100644
+index 00000000..9cbeba94
+--- /dev/null
++++ b/zig/kernels/cuda/mimo_v2/pgemm.cu
+@@ -0,0 +1,175 @@
++// EXL3 prompt GEMM (ours, Z7; not bit-equal to the Python engine): Y = had(X_h @ W) for many rows, the trellis
++// decoded inside the GEMM. The Python prompt path unpacks every weight to fp16 in memory and runs a GEMM on the copy
++// (MiMo's experts: ~280 GB written and read again a chunk); here each 16x16 tile is decoded once per block of 256
++// rows into shared memory as mma B fragments and multiplied straight away.
++//
++// Block (128 columns, 256 rows), 8 warps: per stage of 4 k-tiles (64 of K) the warps decode the stage's 32 tiles
++// (4 each) into fragments in shared memory (double-buffered: the next stage decodes while this one multiplies);
++// warp w multiplies rows [32w, 32w + 32) of the block (two m16 tiles) against all 8 column tiles. Epilogue as
++// linear.cu's finish: a row's 128 sums through the Hadamard butterfly, x 1/sqrt(128), x svh, + bias.
++// Tiles and fragments: decode.cuh (after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp), mul1 codebook.
++
++#include <cstdint>
++#include <cuda_fp16.h>
++
++#include "decode.cuh"
++
++using namespace tf_exl3;
++
++namespace mimo_pgemm {
++
++constexpr int WARPS = 8, MT = 2, KS = 4, BM = WARPS * MT * 16;
++constexpr int STAGE_WORDS = KS * 8 * 4 * 32; // k-tiles x column tiles x fragment words x lanes
++
++enum DType : int { F16 = 0, BF16 = 1, F32 = 2 };
++
++__device__ __forceinline__ void store4(void* p, int dtype, size_t i, const float (&v)[4]) {
++    if (dtype == F32) {
++        *reinterpret_cast<float4*>(static_cast<float*>(p) + i) = make_float4(v[0], v[1], v[2], v[3]);
++    } else {
++        half2 a = __floats2half2_rn(v[0], v[1]), b = __floats2half2_rn(v[2], v[3]);
++        uint2 u;
++        u.x = *reinterpret_cast<uint32_t*>(&a);
++        u.y = *reinterpret_cast<uint32_t*>(&b);
++        *reinterpret_cast<uint2*>(static_cast<half*>(p) + i) = u;
++    }
++}
++
++__device__ __forceinline__ void finish(float (&v)[4], int lane, const half* svh, const half* bias, int col) {
++    fwht128(v, lane);
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        v[j] = v[j] * HAD_SCALE * __half2float(__ldg(svh + col + j));
++        if (bias) v[j] += __half2float(__ldg(bias + col + j));
++    }
++}
++
++template <int K2>
++__device__ __forceinline__ void pgemm(const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k,
++                                      long long stride_nb, const half* __restrict__ svh,
++                                      const half* __restrict__ bias, void* __restrict__ y, int y_dtype, int M, int K,
++                                      int N) {
++    constexpr int TW = tile_words<K2>();
++    __shared__ __align__(16) uint32_t frag[2][STAGE_WORDS];
++    const int nb = blockIdx.x, row_base = blockIdx.y * BM;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    const int col0 = nb * 128;
++    const int wrow = row_base + warp * MT * 16;
++    const bool busy = wrow < M;
++    const uint32_t* tiles = T + nb * stride_nb;
++    const int stages = (K >> 4) / KS;
++
++    auto decode = [&](int s, uint32_t* f) {
++#pragma unroll
++        for (int q = 0; q < KS * 8 / WARPS; ++q) {
++            const int idx = warp * (KS * 8 / WARPS) + q, kk = idx >> 3, j = idx & 7;
++            const int kt = s * KS + kk;
++            uint32_t w[lane_words<K2>()];
++            ldg_lane_words<K2>(tiles + (size_t)kt * stride_k + j * TW, lane, w);
++            uint32_t b0[2], b1[2];
++            decode_lane<K2, CB_MUL1>(w, lane, b0, b1);
++            uint32_t* d = f + ((kk * 8 + j) * 4) * 32 + lane;
++            d[0] = b0[0];
++            d[32] = b0[1];
++            d[64] = b1[0];
++            d[96] = b1[1];
++        }
++    };
++
++    float acc[MT][8][2][4];
++#pragma unroll
++    for (int m = 0; m < MT; ++m)
++#pragma unroll
++        for (int i = 0; i < 8; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
++
++    const half* xr[MT][2];
++#pragma unroll
++    for (int m = 0; m < MT; ++m) {
++        const int r0 = min(wrow + m * 16 + g, M - 1), r1 = min(wrow + m * 16 + g + 8, M - 1);
++        xr[m][0] = xh + (size_t)r0 * K;
++        xr[m][1] = xh + (size_t)r1 * K;
++    }
++
++    decode(0, frag[0]);
++    __syncthreads();
++#pragma unroll 1
++    for (int s = 0; s < stages; ++s) {
++        if (s + 1 < stages) decode(s + 1, frag[(s + 1) & 1]);
++        if (busy) {
++            const uint32_t* f = frag[s & 1];
++#pragma unroll
++            for (int kk = 0; kk < KS; ++kk) {
++                const int k0 = (s * KS + kk) * 16 + 2 * t;
++                uint32_t a[MT][4];
++#pragma unroll
++                for (int m = 0; m < MT; ++m) {
++                    a[m][0] = __ldg(reinterpret_cast<const uint32_t*>(xr[m][0] + k0));
++                    a[m][1] = __ldg(reinterpret_cast<const uint32_t*>(xr[m][1] + k0));
++                    a[m][2] = __ldg(reinterpret_cast<const uint32_t*>(xr[m][0] + k0 + 8));
++                    a[m][3] = __ldg(reinterpret_cast<const uint32_t*>(xr[m][1] + k0 + 8));
++                }
++#pragma unroll
++                for (int j = 0; j < 8; ++j) {
++                    const uint32_t* d = f + ((kk * 8 + j) * 4) * 32 + lane;
++                    const uint32_t b0[2] = {d[0], d[32]}, b1[2] = {d[64], d[96]};
++#pragma unroll
++                    for (int m = 0; m < MT; ++m) {
++                        mma16816(acc[m][j][0], a[m], b0);
++                        mma16816(acc[m][j][1], a[m], b1);
++                    }
++                }
++            }
++        }
++        __syncthreads();
++    }
++
++    // epilogue: 8 rows at a time through this warp's 4 KB of the (now free) fragment buffers
++    if (!busy) return;
++    float* red = reinterpret_cast<float*>(&frag[0][0]) + warp * 8 * 128;
++#pragma unroll
++    for (int m = 0; m < MT; ++m)
++#pragma unroll
++        for (int half_ = 0; half_ < 2; ++half_) {
++#pragma unroll
++            for (int j = 0; j < 8; ++j)
++#pragma unroll
++                for (int h = 0; h < 2; ++h) {
++                    const int col = j * 16 + h * 8 + 2 * t;
++                    *reinterpret_cast<float2*>(red + g * 128 + col) =
++                        half_ ? make_float2(acc[m][j][h][2], acc[m][j][h][3])
++                              : make_float2(acc[m][j][h][0], acc[m][j][h][1]);
++                }
++            __syncwarp();
++            const int base = wrow + m * 16 + half_ * 8;
++            for (int r = 0; r < 8; ++r) {
++                const int row = base + r;
++                if (row >= M) break;
++                const float4 u = *reinterpret_cast<const float4*>(red + r * 128 + 4 * lane);
++                float v[4] = {u.x, u.y, u.z, u.w};
++                finish(v, lane, svh, bias, col0 + 4 * lane);
++                store4(y, y_dtype, (size_t)row * N + col0 + 4 * lane, v);
++            }
++            __syncwarp();
++        }
++}
++
++} // namespace mimo_pgemm
++
++#define MIMO_PGEMM(K2_)                                                                                              \
++    extern "C" __global__ void __launch_bounds__(256) mimo_pgemm_k##K2_(                                             \
++        const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,         \
++        const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype, int M, int K, \
++        int N) {                                                                                                     \
++        mimo_pgemm::pgemm<K2_>(xh, T, stride_k, stride_nb, svh, bias, y, y_dtype, M, K, N);                          \
++    }
++
++MIMO_PGEMM(4)
++MIMO_PGEMM(6)
++MIMO_PGEMM(8)
++MIMO_PGEMM(10)
++MIMO_PGEMM(12)
++MIMO_PGEMM(16)
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 45db23bf..01c5f2f5 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -38,6 +38,7 @@ pub const mimo_glue: []const u8 = if (available) &Blob("fatbin_mimo_glue").bytes
+ pub const mimo_dflash: []const u8 = if (available) &Blob("fatbin_mimo_dflash").bytes else &.{};
+ pub const mimo_kv8: []const u8 = if (available) &Blob("fatbin_mimo_kv8").bytes else &.{};
+ pub const mimo_fast: []const u8 = if (available) &Blob("fatbin_mimo_fast").bytes else &.{};
++pub const mimo_pgemm: []const u8 = if (available) &Blob("fatbin_mimo_pgemm").bytes else &.{};
+ pub const nemotron_norms: []const u8 = if (available) &Blob("fatbin_nemotron_norms").bytes else &.{};
+ pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_route").bytes else &.{};
+ pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};
+diff --git a/zig/src/families/mimo_v2/prompt.zig b/zig/src/families/mimo_v2/prompt.zig
+index cbde907d..0c548b96 100644
+--- a/zig/src/families/mimo_v2/prompt.zig
++++ b/zig/src/families/mimo_v2/prompt.zig
+@@ -87,6 +87,9 @@ pub const Prompt = struct {
+     eu: u64,
+     eh: u64,
+     ed: u64,
++    /// TF_MIMO_PGEMM (default on; 0 off): prompt GEMMs on pgemm.cu (trellis decoded in the GEMM), not unpack + _gemm
++    pg_mod: ?cuda.Module = null,
++    pg: [6]?cuda.Function = .{ null, null, null, null, null, null }, // K2 4, 6, 8, 10, 12, 16
+     kd: u64 = 0, // kv8: a full layer's fp16 keys [context, HK, 192] / values for the prompt kernel
+     vd: u64 = 0,
+     sc: exl3.Scratch, // the grouped kernel's, for chunks under experts_from rows (in windows of sc.rows)
+@@ -188,6 +191,12 @@ pub const Prompt = struct {
+         const sz = exl3.Scratch.bytes(e0, rows_g, K8, cfg_gu, cfg_d);
+         pr.sc = .{ .xg = try ar.zeros(sz.xg), .xu = try ar.zeros(sz.xg), .xd = try ar.zeros(sz.xd), .z = try ar.zeros(sz.z), .y = try ar.zeros(sz.y), .ids = try ar.zeros(sz.ids), .count = try ar.zeros(4), .members = try ar.alloc(sz.members), .rows = rows_g, .slots = K8, .cfg_gu = cfg_gu, .cfg_d = cfg_d };
+         try m.d.check(m.d.api.cuMemsetD32_v2(pr.sc.members, 0xFFFF_FFFF, sz.members / 4), "members -1");
++        pr.pg_mod = null;
++        pr.pg = .{ null, null, null, null, null, null };
++        if (if (std.c.getenv("TF_MIMO_PGEMM")) |v| v[0] != '0' else true) {
++            pr.pg_mod = try cuda.Module.load(m.d, cuda.kernels.mimo_pgemm);
++            inline for (.{ "4", "6", "8", "10", "12", "16" }, 0..) |k2, i| pr.pg[i] = try pr.pg_mod.?.function("mimo_pgemm_k" ++ k2);
++        }
+         if (m.kv8) {
+             pr.kd = try ar.zeros(m.context * cfg.kv_full * 192 * 2);
+             pr.vd = try ar.zeros(m.context * cfg.kv_full * 128 * 2);
+@@ -203,6 +212,7 @@ pub const Prompt = struct {
+     }
+ 
+     pub fn deinit(pr: *Prompt) void {
++        if (pr.pg_mod) |*k| k.unload();
+         pr.gpa.free(pr.h_ids);
+         pr.gpa.free(pr.h_pos);
+         pr.gpa.free(pr.h_slot);
+@@ -220,7 +230,23 @@ pub const Prompt = struct {
+     fn gemm(pr: *Prompt, s: Stream, l: exl3.Linear, stored: bool, x: u64, out: u64, out_f32: bool, n: usize) !void {
+         const m = pr.m;
+         try m.k3.linearRotIn(s, x, .f16, l.suh, pr.xh, n, l.k);
+-        try m.k3.unpackStrided(s, l, pr.wq, if (stored) exl3.Kernels.storedStrides(l) else l.strides());
++        const st = if (stored) exl3.Kernels.storedStrides(l) else l.strides();
++        if (pgIndex(l.k2)) |ki| if (pr.pg[ki]) |f| if (l.k % 64 == 0 and l.n % 128 == 0) {
++            var a: cuda.Args = .{};
++            inline for (.{ pr.xh, l.words }) |v| a.add(v);
++            a.add(st[0]);
++            a.add(st[1]);
++            a.add(l.svh);
++            a.add(l.bias);
++            a.add(out);
++            a.add(@as(c_int, if (out_f32) 2 else 0));
++            a.add(@as(c_int, @intCast(n)));
++            a.add(@as(c_int, @intCast(l.k)));
++            a.add(@as(c_int, @intCast(l.n)));
++            try cuda.launch.launch(f, .{ .grid = .{ .x = u(l.n / 128), .y = u((n + 255) / 256), .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
++            return;
++        };
++        try m.k3.unpackStrided(s, l, pr.wq, st);
+         try m.set.run(s, "_gemm", .{ u(((n + BM_GEMM - 1) / BM_GEMM) * (l.n / 128)), 1, 1 }, &.{
+             p("X", "*fp16", pr.xh),                                  p("W", "*fp16", pr.wq),    p("H", "*bf16", pr.had),
+             p("SVH", "*fp16", l.svh),                                p("BIAS", "*fp16", if (l.bias != 0) l.bias else l.svh),
+@@ -489,3 +515,15 @@ fn envRows(name: [:0]const u8, default: usize) usize {
+     const v = std.c.getenv(name) orelse return default;
+     return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
+ }
++
++fn pgIndex(k2: u32) ?usize {
++    return switch (k2) {
++        4 => 0,
++        6 => 1,
++        8 => 2,
++        10 => 3,
++        12 => 4,
++        16 => 5,
++        else => null,
++    };
++}
+-- 
+2.53.0
+

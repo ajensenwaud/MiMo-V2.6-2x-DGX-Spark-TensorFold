@@ -1,7 +1,7 @@
 From 257c10e23e83d543ea5f2b1563ef110e6a75c8d0 Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 10:20:07 +1100
-Subject: [PATCH 60/67] Z7 prompt: grouped trellis kernel up to 3,072 rows in
+Subject: [PATCH 60/71] Z7 prompt: grouped trellis kernel up to 3,072 rows in
  1,024-row windows (512 rows 2.62 -> 0.74 s)
 
 ---

@@ -1,7 +1,7 @@
 From d7639cc5f0beeedb9ac169b12e3f9fb0141addf4 Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 07:24:22 +1100
-Subject: [PATCH 52/67] lanes geometric_depth: the family's own cost table
+Subject: [PATCH 52/71] lanes geometric_depth: the family's own cost table
  (TF_MIMO_DEPTH=python: decoder.GRID[1], DRAFT_COST 0.25)
 
 ---

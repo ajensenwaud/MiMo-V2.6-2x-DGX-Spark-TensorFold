@@ -1,7 +1,7 @@
 From 6049b1a9e8fe676e3aea51c3748c4a7cd3b77955 Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 14:31:15 +1100
-Subject: [PATCH 13/67] oracle/mimo_exl3_fixtures.py: the Python engine's EXL3
+Subject: [PATCH 13/71] oracle/mimo_exl3_fixtures.py: the Python engine's EXL3
  outputs on MiMo's rank-0 cuts
 
 ---

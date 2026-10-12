@@ -1,7 +1,7 @@
 From 0be9a783339659fbded7682b98910e7f5ec8c2da Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 07:01:07 +1100
-Subject: [PATCH 50/67] Z6: serve prompts on the prompt path (Op.prompt on the
+Subject: [PATCH 50/71] Z6: serve prompts on the prompt path (Op.prompt on the
  plan link; TF_MIMO_PROMPT_ROWS, default 16384; 0 = decode rows)
 
 ---

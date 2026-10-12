@@ -1,7 +1,7 @@
 From f2f1d7910fec90f1c2e6d404b613ece087574acc Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 06:16:22 +1100
-Subject: [PATCH 46/67] mimo costs: median of 16 (8 shared) after warm replays;
+Subject: [PATCH 46/71] mimo costs: median of 16 (8 shared) after warm replays;
  draft median of 16 (a mean of 6 swung 24.6-27.7 ms a row between starts)
 
 ---

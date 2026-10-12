@@ -1,0 +1,249 @@
+From 5a55c40f74f464358e8ddba5650959cdad8ceed5 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 14:03:19 +1100
+Subject: [PATCH 68/71] Z7 fast.cu: router GEMV (a warp an expert, W in
+ registers), fused rank sum + residual add + RMS norm; TF_MIMO_FUSE (default
+ on)
+
+---
+ zig/build/cuda.zig                   |   1 +
+ zig/kernels/cuda/mimo_v2/fast.cu     | 104 +++++++++++++++++++++++++++
+ zig/src/cuda/kernels.zig             |   1 +
+ zig/src/families/mimo_v2/forward.zig |  45 ++++++++++--
+ 4 files changed, 146 insertions(+), 5 deletions(-)
+ create mode 100644 zig/kernels/cuda/mimo_v2/fast.cu
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index bf1fa674..18fee214 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -43,6 +43,7 @@ const kernels = [_]Kernel{
+     .{ .name = "mimo_glue", .src = "mimo_v2/glue", .flags = glue }, // ours: torch's embed / add / rope_tables, bit for bit
+     .{ .name = "mimo_dflash", .src = "mimo_v2/dflash", .flags = glue }, // ours: the DFlash drafter's torch glue
+     .{ .name = "mimo_kv8", .src = "mimo_v2/kv8", .flags = &.{"-O3"} }, // ours (Z7): full attention on an 8-bit cache
++    .{ .name = "mimo_fast", .src = "mimo_v2/fast", .flags = &.{"-O3"} }, // ours (Z7): router GEMV, add + RMS norm
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+diff --git a/zig/kernels/cuda/mimo_v2/fast.cu b/zig/kernels/cuda/mimo_v2/fast.cu
+new file mode 100644
+index 00000000..95ca7b09
+--- /dev/null
++++ b/zig/kernels/cuda/mimo_v2/fast.cu
+@@ -0,0 +1,104 @@
++// MiMo-V2 decode-path fusions (ours, Z7; not bit-equal to the Python engine).
++//
++//   mimo_router     router logits OUT [n, NE] fp32 = x [n, D] fp16 . W [NE, D] fp16: a warp an expert, its row of W
++//                   held in registers across the window's rows (Triton _router ran 8 programs for one row: ~95 GB/s)
++//   mimo_add3_rms   the two ranks' fp32 partials summed into the residual (in place), then RMS-normed into fp16:
++//                   forward._sum's add + ops._add_rms in one pass (one launch, one read of each operand)
++
++#include <cstdint>
++#include <cuda_fp16.h>
++
++namespace mimo_fast {
++
++__device__ __forceinline__ float warp_sum(float v) {
++#pragma unroll
++    for (int x = 16; x >= 1; x /= 2) v += __shfl_xor_sync(0xffffffffu, v, x);
++    return v;
++}
++
++__device__ __forceinline__ float dot8(uint4 a, uint4 b) {
++    const __half2* x = reinterpret_cast<const __half2*>(&a);
++    const __half2* y = reinterpret_cast<const __half2*>(&b);
++    float s = 0.0f;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const float2 fx = __half22float2(x[i]), fy = __half22float2(y[i]);
++        s = fmaf(fx.x, fy.x, s);
++        s = fmaf(fx.y, fy.y, s);
++    }
++    return s;
++}
++
++} // namespace mimo_fast
++
++using namespace mimo_fast;
++
++// Grid (ceil(NE / 4)), 128 threads; D = 32 * 8 * PER (PER 16: D 4096).
++template <int PER>
++__device__ __forceinline__ void router_body(const __half* __restrict__ X, const __half* __restrict__ W,
++                                            float* __restrict__ OUT, int n, int x_stride, int NE) {
++    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
++    const int e = blockIdx.x * 4 + warp;
++    if (e >= NE) return;
++    constexpr int D = 32 * 8 * PER;
++    uint4 w[PER];
++    const uint4* wr = reinterpret_cast<const uint4*>(W + static_cast<int64_t>(e) * D);
++#pragma unroll
++    for (int i = 0; i < PER; ++i) w[i] = wr[lane + 32 * i];
++    for (int r = 0; r < n; ++r) {
++        const uint4* xr = reinterpret_cast<const uint4*>(X + static_cast<int64_t>(r) * x_stride);
++        float s = 0.0f;
++#pragma unroll
++        for (int i = 0; i < PER; ++i) s += dot8(xr[lane + 32 * i], w[i]);
++        s = warp_sum(s);
++        if (lane == 0) OUT[static_cast<int64_t>(r) * NE + e] = s;
++    }
++}
++
++extern "C" __global__ void __launch_bounds__(128) mimo_router(const __half* __restrict__ X,
++                                                             const __half* __restrict__ W, float* __restrict__ OUT,
++                                                             int n, int x_stride, int NE) {
++    router_body<16>(X, W, OUT, n, x_stride, NE);
++}
++
++// Grid (n), 256 threads; D a multiple of 1024 (4096: four float4 a thread).
++extern "C" __global__ void __launch_bounds__(256) mimo_add3_rms(const float* __restrict__ A,
++                                                               const float* __restrict__ B, float* __restrict__ RES,
++                                                               const float* __restrict__ W, __half* __restrict__ OUT,
++                                                               int D, float eps) {
++    __shared__ float red[8];
++    const int64_t r = blockIdx.x;
++    const int t = threadIdx.x, per = D / 1024;
++    const float4* a = reinterpret_cast<const float4*>(A + r * D);
++    const float4* b = reinterpret_cast<const float4*>(B + r * D);
++    float4* res = reinterpret_cast<float4*>(RES + r * D);
++    float4 v[4];
++    float ss = 0.0f;
++    for (int i = 0; i < per; ++i) {
++        const int j = t + 256 * i;
++        const float4 x = a[j], y = b[j], z = res[j];
++        float4 o;
++        o.x = z.x + (x.x + y.x);
++        o.y = z.y + (x.y + y.y);
++        o.z = z.z + (x.z + y.z);
++        o.w = z.w + (x.w + y.w);
++        res[j] = o;
++        v[i] = o;
++        ss += o.x * o.x + o.y * o.y + o.z * o.z + o.w * o.w;
++    }
++    ss = warp_sum(ss);
++    if (t % 32 == 0) red[t / 32] = ss;
++    __syncthreads();
++    float tot = 0.0f;
++#pragma unroll
++    for (int w = 0; w < 8; ++w) tot += red[w];
++    const float rs = rsqrtf(tot / static_cast<float>(D) + eps);
++    const float4* wv = reinterpret_cast<const float4*>(W);
++    __half2* out = reinterpret_cast<__half2*>(OUT + r * D);
++    for (int i = 0; i < per; ++i) {
++        const int j = t + 256 * i;
++        const float4 g = wv[j];
++        out[2 * j] = __floats2half2_rn(v[i].x * rs * g.x, v[i].y * rs * g.y);
++        out[2 * j + 1] = __floats2half2_rn(v[i].z * rs * g.z, v[i].w * rs * g.w);
++    }
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 23acf742..45db23bf 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -37,6 +37,7 @@ pub const mimo_exl3_experts_cb2: []const u8 = if (available) &Blob("fatbin_mimo_
+ pub const mimo_glue: []const u8 = if (available) &Blob("fatbin_mimo_glue").bytes else &.{};
+ pub const mimo_dflash: []const u8 = if (available) &Blob("fatbin_mimo_dflash").bytes else &.{};
+ pub const mimo_kv8: []const u8 = if (available) &Blob("fatbin_mimo_kv8").bytes else &.{};
++pub const mimo_fast: []const u8 = if (available) &Blob("fatbin_mimo_fast").bytes else &.{};
+ pub const nemotron_norms: []const u8 = if (available) &Blob("fatbin_nemotron_norms").bytes else &.{};
+ pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_route").bytes else &.{};
+ pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};
+diff --git a/zig/src/families/mimo_v2/forward.zig b/zig/src/families/mimo_v2/forward.zig
+index 8be7a32a..fa9aae68 100644
+--- a/zig/src/families/mimo_v2/forward.zig
++++ b/zig/src/families/mimo_v2/forward.zig
+@@ -137,6 +137,11 @@ pub const Model = struct {
+     f_rows8: cuda.Function = undefined,
+     f_dq8: cuda.Function = undefined,
+     f_merge8: cuda.Function = undefined,
++    /// TF_MIMO_FUSE (default on; 0 off): the decode path's router GEMV and add + RMS norm (fast.cu)
++    fuse: bool = false,
++    fast_mod: ?cuda.Module = null,
++    f_router: cuda.Function = undefined,
++    f_add3: cuda.Function = undefined,
+     kv8_b: bool = true, // mimo_rows8b (else mimo_rows8, chunks of CK)
+     kv8_ck: usize = 1024, // mimo_rows8b's keys a chunk (TF_MIMO_KV8_CK)
+     cos_full: u64,
+@@ -180,6 +185,13 @@ pub const Model = struct {
+         m.vc = try gpa.alloc(u64, cfg.layers);
+         m.kv8 = if (std.c.getenv("TF_MIMO_KV8")) |v| v[0] != '0' else true; // default on (gate 2026-10-12: GSM8K 500 paired p 0.73, MMLU p 0.38, passkey 10/10)
+         m.kv8_mod = null;
++        m.fast_mod = null;
++        m.fuse = (if (std.c.getenv("TF_MIMO_FUSE")) |v| v[0] != '0' else true) and cfg.hidden == 4096;
++        if (m.fuse) {
++            m.fast_mod = try cuda.Module.load(d, cuda.kernels.mimo_fast);
++            m.f_router = try m.fast_mod.?.function("mimo_router");
++            m.f_add3 = try m.fast_mod.?.function("mimo_add3_rms");
++        }
+         m.ks = try gpa.alloc(u64, cfg.layers);
+         m.vs = try gpa.alloc(u64, cfg.layers);
+         if (m.kv8) {
+@@ -296,6 +308,7 @@ pub const Model = struct {
+         m.gpa.free(m.ks);
+         m.gpa.free(m.vs);
+         if (m.kv8_mod) |*k| k.unload();
++        if (m.fast_mod) |*k| k.unload();
+         m.glue.unload();
+         m.arena.deinit();
+     }
+@@ -329,6 +342,23 @@ pub const Model = struct {
+         try m.set.run(s, "_rms", .{ u(n), 1, 1 }, &.{ p("X", "*fp32", x), p("W", "*fp32", w), p("OUT", "*fp16", out) }, &.{ ci("N", D), aot.cf("EPS", @floatCast(m.w.cfg.eps)), ci("BLOCK", pow2(D)) });
+     }
+ 
++    /// The ranks' partials summed into the residual and RMS-normed into `out`: one fused kernel (fast.cu) when
++    /// m.fuse and TP, else forward._sum then ops._add_rms.
++    fn sumNorm(m: *Model, s: Stream, part: u64, w: u64, out: u64, n: usize) !void {
++        const D = m.w.cfg.hidden;
++        if (m.fuse) if (m.comm) |c| {
++            try c.allGather(part, m.b.recv, n * D, .f32, s.handle);
++            try m.mark(s, .comm);
++            var a: cuda.Args = .{};
++            inline for (.{ m.b.recv, m.b.recv + n * D * 4, m.b.res, w, out }) |x| a.add(x);
++            a.add(@as(c_int, @intCast(D)));
++            a.add(@as(f32, @floatCast(m.w.cfg.eps)));
++            try cuda.launch.launch(m.f_add3, .{ .grid = .{ .x = u(n), .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, s, &a);
++            return;
++        };
++        try m.addRms(s, try m.sum(s, part, n), w, out, n);
++    }
++
+     fn addRms(m: *Model, s: Stream, x: u64, w: u64, out: u64, n: usize) !void {
+         const D = m.w.cfg.hidden;
+         try m.set.run(s, "_add_rms", .{ u(n), 1, 1 }, &.{ p("X", "*fp32", x), p("RES", "*fp32", m.b.res), p("W", "*fp32", w), p("OUT", "*fp16", out) }, &.{ ci("N", D), aot.cf("EPS", @floatCast(m.w.cfg.eps)), ci("BLOCK", pow2(D)) });
+@@ -522,15 +552,21 @@ pub const Model = struct {
+             if (cap) |c| if (c.hook) |h| try h(c.ctx, .att, i, m.b.att, n * H * 128 * 2);
+             try m.proj(s, L.o, m.b.att, m.b.part, true, n);
+             try m.mark(s, .dense);
+-            const so = try m.sum(s, m.b.part, n);
+-            try m.addRms(s, so, L.post_norm, m.b.x, n);
++            try m.sumNorm(s, m.b.part, L.post_norm, m.b.x, n);
+             try m.mark(s, .norm);
+             if (cap) |c| if (c.hook) |h| try h(c.ctx, .attn, i, m.b.res, n * D * 4);
+             if (L.experts) |e| {
+                 // moe.MoE: router logits (shared.router's tile by row count), top 8 (sigmoid + bias), routed experts
+                 const bm = routerTile(n);
+                 const be: usize, const bk: usize = if (bm == 16) .{ 32, 256 } else .{ 64, 64 };
+-                try m.set.run(s, "_router", .{ u((n + bm - 1) / bm), u((cfg.experts + be - 1) / be), 1 }, &.{
++                if (m.fuse) {
++                    var a: cuda.Args = .{};
++                    inline for (.{ m.b.x, L.router, m.b.logits }) |x| a.add(x);
++                    a.add(@as(c_int, @intCast(n)));
++                    a.add(@as(c_int, @intCast(D)));
++                    a.add(@as(c_int, @intCast(cfg.experts)));
++                    try cuda.launch.launch(m.f_router, .{ .grid = .{ .x = u((cfg.experts + 3) / 4), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &a);
++                } else try m.set.run(s, "_router", .{ u((n + bm - 1) / bm), u((cfg.experts + be - 1) / be), 1 }, &.{
+                     p("X", "*fp16", m.b.x), p("W", "*fp16", L.router), p("OUT", "*fp32", m.b.logits), ii("M", n), ii("x_stride", D),
+                 }, &.{ ci("D", D), ci("NE", cfg.experts), ci("BM", bm), ci("BLOCK_E", be), ci("BK", bk) });
+                 try m.set.run(s, "_topk", .{ u(n), 1, 1 }, &.{
+@@ -547,8 +583,7 @@ pub const Model = struct {
+             }
+             try m.mark(s, if (L.experts != null) .experts else .dense);
+             const after = if (i + 1 < m.w.layers.len) m.w.layers[i + 1].input_norm else m.w.norm;
+-            const sm = try m.sum(s, m.b.part, n);
+-            try m.addRms(s, sm, after, m.b.x, n);
++            try m.sumNorm(s, m.b.part, after, m.b.x, n);
+             try m.mark(s, .norm);
+             if (cap) |c| if (c.hook) |h| try h(c.ctx, .mlp, i, m.b.res, n * D * 4);
+             if (m.dr) |dr| if (cap == null) try dr.tap(s, i, m.b.res, n);
+-- 
+2.53.0
+

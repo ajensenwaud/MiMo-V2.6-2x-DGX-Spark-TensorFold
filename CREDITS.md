@@ -6,7 +6,12 @@ This recipe stands on other people's work. Thank you to:
   this recipe serves, and for its DFlash speculative-decoding drafter.
 - **TensorFold** ([ashhart/TensorFold](https://github.com/ashhart/TensorFold), Apache-2.0) by Ash Hart
   ([@ashxhart](https://x.com/ashxhart)). The engine, its two-rank serving, kernels and tooling are TensorFold's; this
-  recipe is a set of patches on top of it (`patches/`).
+  recipe is a set of patches on top of it (`patches/` for the Python engine 0.6, `patches-zig/` for the Zig engine
+  1.0.5). The Zig engine's precompiled kernel pack in `zig/aot/` is TensorFold's Triton kernels, compiled for GB10.
+- **Jay Leaton** ([@jayleaton](https://github.com/jayleaton)). The Zig engine port follows the method of his
+  DeepSeek-V4.1 port to TensorFold's Zig engine: launch for launch against the Python engine, checked bit for bit.
+  Patches 0001-0005 in `patches-zig/` are his commits (cherry-picked with `-x`), including tensor parallelism across
+  CUDA processes and the one-shot RoCE exchange.
 - **Jürgen Schmied** ([@jschmied](https://github.com/jschmied)), author of patches 0001-0006 (from TensorFold pull
   request [#328](https://github.com/ashhart/TensorFold/pull/328)), including the server fix in 0001 that this recipe
   relies on.

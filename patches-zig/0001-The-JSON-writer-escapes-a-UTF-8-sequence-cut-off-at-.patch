@@ -1,7 +1,7 @@
 From b1f5b6485fdf3a8eef1f9ea09ac81a5d7c08ed8c Mon Sep 17 00:00:00 2001
 From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
 Date: Sat, 10 Oct 2026 10:24:31 +0700
-Subject: [PATCH 01/67] The JSON writer escapes a UTF-8 sequence cut off at a
+Subject: [PATCH 01/71] The JSON writer escapes a UTF-8 sequence cut off at a
  string's end as U+FFFD instead of slicing past it.
 
 (cherry picked from commit 4284048d1aca2799e543a7400b3f07519befb515)

@@ -1,7 +1,7 @@
 From b8b7f524f0497bfdbf6f7342e12a8ae0f13cf561 Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 09:47:54 +1100
-Subject: [PATCH 59/67] Z7 prompt: TF_MIMO_PROMPT_EXPERTS_FROM /
+Subject: [PATCH 59/71] Z7 prompt: TF_MIMO_PROMPT_EXPERTS_FROM /
  TF_MIMO_PROMPT_GWIN (grouped trellis kernel in windows instead of unpacking
  every expert)
 

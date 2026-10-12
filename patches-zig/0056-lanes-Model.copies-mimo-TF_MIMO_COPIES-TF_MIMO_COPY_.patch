@@ -1,7 +1,7 @@
 From b549845e24c7c36bcd01b5af862b1c0d6c2ef7b8 Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 09:07:55 +1100
-Subject: [PATCH 56/67] lanes: Model.copies; mimo: TF_MIMO_COPIES,
+Subject: [PATCH 56/71] lanes: Model.copies; mimo: TF_MIMO_COPIES,
  TF_MIMO_COPY_ROWS
 
 ---

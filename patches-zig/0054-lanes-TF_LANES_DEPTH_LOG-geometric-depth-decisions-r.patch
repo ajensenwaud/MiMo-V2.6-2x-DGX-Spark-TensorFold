@@ -1,7 +1,7 @@
 From 4616cf6fdb3797169103e4df5bebaf369e95558c Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 08:20:44 +1100
-Subject: [PATCH 54/67] lanes: TF_LANES_DEPTH_LOG (geometric depth decisions,
+Subject: [PATCH 54/71] lanes: TF_LANES_DEPTH_LOG (geometric depth decisions,
  round by round)
 
 ---

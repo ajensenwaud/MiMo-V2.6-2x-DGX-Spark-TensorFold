@@ -1,0 +1,3035 @@
+{
+ "generator": "zig/tests/cuda/nemotron/aot_pack.py",
+ "kernels": [
+  {
+   "fn": "_add_rms",
+   "hash": "ca9c7d527cd87ad7727501e1774a38a25b9f55446b79fece6b57679be29edc6f",
+   "name": "_add_rms",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 4096,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "RES",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "N": {
+     "int": 4096
+    },
+    "EPS": {
+     "f32": 897988541
+    },
+    "BLOCK": {
+     "int": 4096
+    }
+   }
+  },
+  {
+   "fn": "_gemm",
+   "hash": "280fd81f1a00f0b9013b000769692b7c298390b0b3938168153d234996a10dfe",
+   "name": "_gemm",
+   "num_warps": 8,
+   "num_ctas": 1,
+   "shared": 98304,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "H",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SVH",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "BIAS",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": true
+    },
+    {
+     "name": "o_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "K": {
+     "int": 1024
+    },
+    "N": {
+     "int": 4096
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 32
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1035273459
+    }
+   }
+  },
+  {
+   "fn": "_gemm",
+   "hash": "3a4b525e9d0652aab23f5a4bd88fab9b4b19780ff257a30cc6514ad946f9fe26",
+   "name": "_gemm",
+   "num_warps": 8,
+   "num_ctas": 1,
+   "shared": 98304,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "H",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SVH",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "BIAS",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": true
+    },
+    {
+     "name": "o_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "K": {
+     "int": 4096
+    },
+    "N": {
+     "int": 768
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 32
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1035273459
+    }
+   }
+  },
+  {
+   "fn": "_gemm",
+   "hash": "540bb7906f49a18a7b1f803a27e1fcf1d1480015aad6776b841d26c6779bd8dc",
+   "name": "_gemm",
+   "num_warps": 8,
+   "num_ctas": 1,
+   "shared": 98304,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "H",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SVH",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "BIAS",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": true
+    },
+    {
+     "name": "o_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "K": {
+     "int": 4096
+    },
+    "N": {
+     "int": 8192
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 32
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1035273459
+    }
+   }
+  },
+  {
+   "fn": "_gemm",
+   "hash": "8a34fee921749769cdca80ee487e35c77e7b045d476c4b2b2a3e0b55e4e32f8b",
+   "name": "_gemm",
+   "num_warps": 8,
+   "num_ctas": 1,
+   "shared": 98304,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "H",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SVH",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "BIAS",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": true
+    },
+    {
+     "name": "o_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "K": {
+     "int": 4096
+    },
+    "N": {
+     "int": 384
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 32
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1035273459
+    }
+   }
+  },
+  {
+   "fn": "_gemm",
+   "hash": "91a14dd097b7b709c3df7e59a1fb39700d03e288fd74c29a8b0577da2897d23d",
+   "name": "_gemm",
+   "num_warps": 8,
+   "num_ctas": 1,
+   "shared": 98304,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "H",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SVH",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "BIAS",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": true
+    },
+    {
+     "name": "o_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "K": {
+     "int": 8192
+    },
+    "N": {
+     "int": 4096
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 32
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1035273459
+    }
+   }
+  },
+  {
+   "fn": "_gemm",
+   "hash": "a86d3dfb00113fcae4934f62ab4b768933a35bc7bf282ea593caf5948cd21e3a",
+   "name": "_gemm",
+   "num_warps": 8,
+   "num_ctas": 1,
+   "shared": 98304,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "H",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SVH",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "BIAS",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": true
+    },
+    {
+     "name": "o_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "K": {
+     "int": 4096
+    },
+    "N": {
+     "int": 4096
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 32
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1035273459
+    }
+   }
+  },
+  {
+   "fn": "_gemm",
+   "hash": "c38db5ccb270a165b365bf57dc10dd9c994681117abaf621d981805d7e37c40a",
+   "name": "_gemm",
+   "num_warps": 8,
+   "num_ctas": 1,
+   "shared": 98304,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "H",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SVH",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "BIAS",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": true
+    },
+    {
+     "name": "o_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "K": {
+     "int": 4096
+    },
+    "N": {
+     "int": 1024
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 32
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1035273459
+    }
+   }
+  },
+  {
+   "fn": "_gemm",
+   "hash": "dee20510108fc6ff743404e7670fb99aa6278c4528b5d996790dac90c31e623d",
+   "name": "_gemm",
+   "num_warps": 8,
+   "num_ctas": 1,
+   "shared": 98304,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "H",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SVH",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "BIAS",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": true
+    },
+    {
+     "name": "o_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "K": {
+     "int": 4096
+    },
+    "N": {
+     "int": 6144
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 32
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1035273459
+    }
+   }
+  },
+  {
+   "fn": "_gemm",
+   "hash": "ebde1e80fd6973956b71d45300801f14c454f56c59686a1b22770826c90a6e03",
+   "name": "_gemm",
+   "num_warps": 8,
+   "num_ctas": 1,
+   "shared": 98304,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "H",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SVH",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "BIAS",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": true
+    },
+    {
+     "name": "o_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "K": {
+     "int": 20480
+    },
+    "N": {
+     "int": 4096
+    },
+    "BM": {
+     "int": 128
+    },
+    "BK": {
+     "int": 32
+    },
+    "GROUP": {
+     "int": 8
+    },
+    "HAS_BIAS": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1035273459
+    }
+   }
+  },
+  {
+   "fn": "_merge",
+   "hash": "58ab9ef6438833e44f017d0b21a9dc5344e43b000f6e3cd7129d5248465d7367",
+   "name": "_merge",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SINKS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HAS_SINK": {
+     "int": 0
+    }
+   }
+  },
+  {
+   "fn": "_merge",
+   "hash": "66453a40186787f9ee6d92cd9ffc98a204796cdfe43489da47118b23f88cfe1b",
+   "name": "_merge",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SINKS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "NCH": {
+     "int": 1
+    },
+    "H": {
+     "int": 32
+    },
+    "HAS_SINK": {
+     "int": 0
+    }
+   }
+  },
+  {
+   "fn": "_merge",
+   "hash": "76406ca0dd84a349547f257a290d00539d080637ccb604f18bcc1a214f745b84",
+   "name": "_merge",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SINKS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HAS_SINK": {
+     "int": 1
+    }
+   }
+  },
+  {
+   "fn": "_merge",
+   "hash": "9396d5dca0f17808f50de9deeb42dfe861a4b1d054d5b57318d7a0baacac8e8e",
+   "name": "_merge",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SINKS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HAS_SINK": {
+     "int": 0
+    }
+   }
+  },
+  {
+   "fn": "_prompt",
+   "hash": "630c1ba66c66f6b5d935be9b060aa911ca0ce1461c16106be83adcf19ff535bc",
+   "name": "_prompt",
+   "num_warps": 8,
+   "num_ctas": 1,
+   "shared": 90112,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "P0",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 2
+    },
+    "G": {
+     "int": 16
+    },
+    "SCALE": {
+     "f32": 1033096506
+    },
+    "BM": {
+     "int": 8
+    },
+    "BN": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_prompt",
+   "hash": "872d955d47e44ea0de09bb7875d8f95bf2889c8b50b14c20c470d56681784078",
+   "name": "_prompt",
+   "num_warps": 8,
+   "num_ctas": 1,
+   "shared": 90112,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "P0",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 2
+    },
+    "G": {
+     "int": 16
+    },
+    "SCALE": {
+     "f32": 1033096506
+    },
+    "BM": {
+     "int": 8
+    },
+    "BN": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_prompt",
+   "hash": "9f21bd962810f517225290bd56c47a1e1b7cdfa2ceb924dd010dade21a96d290",
+   "name": "_prompt",
+   "num_warps": 8,
+   "num_ctas": 1,
+   "shared": 90112,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "P0",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "W": {
+     "int": 1
+    },
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 2
+    },
+    "G": {
+     "int": 16
+    },
+    "SCALE": {
+     "f32": 1033096506
+    },
+    "BM": {
+     "int": 8
+    },
+    "BN": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_qkv",
+   "hash": "189c2eee17a70344bb16987787db7373d412033f559ec34cb0791034fd924a52",
+   "name": "_qkv",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "K",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "V",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "COS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SIN",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": false,
+     "nospec": false
+    },
+    {
+     "name": "QO",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 2
+    },
+    "RD": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_qkv",
+   "hash": "598165deb6a126c96088c8bd0896177c59dc74e5b7cfd42f1165e951f15f7e17",
+   "name": "_qkv",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "K",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "V",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "COS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SIN",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": false,
+     "nospec": false
+    },
+    {
+     "name": "QO",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 4
+    },
+    "RD": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_qkv",
+   "hash": "70ffe144325b71820cadf61dda4976c67963fefb0d77c5fa361e2d94c062f007",
+   "name": "_qkv",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "K",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "V",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "COS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SIN",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "QO",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 4
+    },
+    "RD": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_qkv",
+   "hash": "96413823b8c19d8e9e91d286cefaba82ae508c4711f7a2174bf3eccf860bef8e",
+   "name": "_qkv",
+   "num_warps": 1,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "K",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "V",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "COS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SIN",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "QO",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 2
+    },
+    "RD": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_rms",
+   "hash": "ade50c4ee981f69c618b652d40985fabac06e296065d1ce6303c5b85cf1c32dd",
+   "name": "_rms",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 16,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "N": {
+     "int": 4096
+    },
+    "EPS": {
+     "f32": 897988541
+    },
+    "BLOCK": {
+     "int": 4096
+    }
+   }
+  },
+  {
+   "fn": "_router",
+   "hash": "008accffe1b90e05d4b4f9a2021c55377bd80736070d7cdd1e6ba266afc71a29",
+   "name": "_router",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 73728,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    },
+    {
+     "name": "x_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "D": {
+     "int": 4096
+    },
+    "NE": {
+     "int": 256
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_E": {
+     "int": 32
+    },
+    "BK": {
+     "int": 256
+    }
+   }
+  },
+  {
+   "fn": "_router",
+   "hash": "0bf65e314f7267b95a6308046e689bf06e851c0b10c07742ecd0c2196a5e98fe",
+   "name": "_router",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 24576,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "x_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "D": {
+     "int": 4096
+    },
+    "NE": {
+     "int": 256
+    },
+    "BM": {
+     "int": 32
+    },
+    "BLOCK_E": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_router",
+   "hash": "312f0d53abbafaa24345a7906828bccef50a98f9a87a054b01191c548728899a",
+   "name": "_router",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 32768,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    },
+    {
+     "name": "x_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "D": {
+     "int": 4096
+    },
+    "NE": {
+     "int": 256
+    },
+    "BM": {
+     "int": 64
+    },
+    "BLOCK_E": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_router",
+   "hash": "43a04c31b8dc8b4cb3ce87542297b91dc1db2a539a09dc94cf6ab9b6cb125b72",
+   "name": "_router",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 49152,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "x_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "D": {
+     "int": 4096
+    },
+    "NE": {
+     "int": 256
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_E": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_router",
+   "hash": "5f1835d4bb86c77c41fcaa00be0894ff56049476de9efad75302d53305c032aa",
+   "name": "_router",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 49152,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    },
+    {
+     "name": "x_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "D": {
+     "int": 4096
+    },
+    "NE": {
+     "int": 256
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_E": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_router",
+   "hash": "83bc28b3fdd98a9025c9d577df0532a686f3dc07e4c56d0fa8426c0119a1436c",
+   "name": "_router",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 73728,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "x_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "M": {
+     "int": 1
+    },
+    "D": {
+     "int": 4096
+    },
+    "NE": {
+     "int": 256
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_E": {
+     "int": 32
+    },
+    "BK": {
+     "int": 256
+    }
+   }
+  },
+  {
+   "fn": "_router",
+   "hash": "85f652d4b7f2f3c355166e7abe15f20edbf18736d6aacace0112eaf2d8b64b70",
+   "name": "_router",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 73728,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "x_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "D": {
+     "int": 4096
+    },
+    "NE": {
+     "int": 256
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_E": {
+     "int": 32
+    },
+    "BK": {
+     "int": 256
+    }
+   }
+  },
+  {
+   "fn": "_router",
+   "hash": "90bce635e34e43f0a8263a6b37474d6b9653805602f5b85d05fc8e4a9dc0edc6",
+   "name": "_router",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 24576,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    },
+    {
+     "name": "x_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "D": {
+     "int": 4096
+    },
+    "NE": {
+     "int": 256
+    },
+    "BM": {
+     "int": 32
+    },
+    "BLOCK_E": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_router",
+   "hash": "dfec5b210a678b56fc7a7507d57fab736dfc8f67059cfa3ea1d29874de14af7e",
+   "name": "_router",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 32768,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "X",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "M",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "x_stride",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "D": {
+     "int": 4096
+    },
+    "NE": {
+     "int": 256
+    },
+    "BM": {
+     "int": 64
+    },
+    "BLOCK_E": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    }
+   }
+  },
+  {
+   "fn": "_rows",
+   "hash": "0155938e149eeae5c398fcd406c0380701be32b0f482c59c3bd354b7d09c0689",
+   "name": "_rows",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 49152,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 2
+    },
+    "G": {
+     "int": 16
+    },
+    "WIN": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1033096506
+    },
+    "CK": {
+     "int": 256
+    },
+    "BN": {
+     "int": 64
+    },
+    "GP": {
+     "int": 16
+    }
+   }
+  },
+  {
+   "fn": "_rows",
+   "hash": "2cf316b12517ab6c7fbc2f96ec2571a1c05bee712b2b331f8fc932285c1ae47c",
+   "name": "_rows",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 49152,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": false,
+     "nospec": false
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 2
+    },
+    "G": {
+     "int": 16
+    },
+    "WIN": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1033096506
+    },
+    "CK": {
+     "int": 256
+    },
+    "BN": {
+     "int": 64
+    },
+    "GP": {
+     "int": 16
+    }
+   }
+  },
+  {
+   "fn": "_rows",
+   "hash": "34d02875eb4735d7e3b5bfbf16142378740614854f7512464db291e9b68915c5",
+   "name": "_rows",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 49152,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 2
+    },
+    "G": {
+     "int": 16
+    },
+    "WIN": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1033096506
+    },
+    "CK": {
+     "int": 256
+    },
+    "BN": {
+     "int": 64
+    },
+    "GP": {
+     "int": 16
+    }
+   }
+  },
+  {
+   "fn": "_rows",
+   "hash": "8caec40a55d22936f31afab6d48e6024a78ba2f75e870fd5dc066cd842646d2e",
+   "name": "_rows",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 49152,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 4
+    },
+    "G": {
+     "int": 8
+    },
+    "WIN": {
+     "int": 128
+    },
+    "SCALE": {
+     "f32": 1033096506
+    },
+    "CK": {
+     "int": 256
+    },
+    "BN": {
+     "int": 64
+    },
+    "GP": {
+     "int": 16
+    }
+   }
+  },
+  {
+   "fn": "_rows",
+   "hash": "9ed388f50fa0be82f193ef24c8c5a05ba39f7df4a29b68e0f40928982cf16779",
+   "name": "_rows",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 49152,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": false,
+     "nospec": false
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "NCH",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 4
+    },
+    "G": {
+     "int": 8
+    },
+    "WIN": {
+     "int": 128
+    },
+    "SCALE": {
+     "f32": 1033096506
+    },
+    "CK": {
+     "int": 256
+    },
+    "BN": {
+     "int": 64
+    },
+    "GP": {
+     "int": 16
+    }
+   }
+  },
+  {
+   "fn": "_rows",
+   "hash": "a18c8a706d4b6db2661838b2b9ab7293528b838e01d25c9e7c20bcb38302a935",
+   "name": "_rows",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 49152,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VC",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "POS",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SLOT",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PO",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PM",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PL",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "LEN",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "NCH": {
+     "int": 1
+    },
+    "H": {
+     "int": 32
+    },
+    "HK": {
+     "int": 2
+    },
+    "G": {
+     "int": 16
+    },
+    "WIN": {
+     "int": 0
+    },
+    "SCALE": {
+     "f32": 1033096506
+    },
+    "CK": {
+     "int": 256
+    },
+    "BN": {
+     "int": 64
+    },
+    "GP": {
+     "int": 16
+    }
+   }
+  },
+  {
+   "fn": "_silu_mul",
+   "hash": "2c665389cce132b0ccf9798e8d908feca0ddc2388c6a1dcbde0809b092dd297b",
+   "name": "_silu_mul",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "G",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "U",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "N": {
+     "int": 8192
+    },
+    "BLOCK": {
+     "int": 1024
+    }
+   }
+  },
+  {
+   "fn": "_silu_mul",
+   "hash": "a7ea0eee7da50716b86ab604a85c8bae79252388086a0dfc4d52cf110bea77e6",
+   "name": "_silu_mul",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "G",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "U",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "N": {
+     "int": 16384
+    },
+    "BLOCK": {
+     "int": 1024
+    }
+   }
+  },
+  {
+   "fn": "_silu_mul_scale",
+   "hash": "2f43cdd7919c00d15daa16296a4cac279145760ce3e29a98f6b48e9060730f89",
+   "name": "_silu_mul_scale",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "G",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "U",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "N": {
+     "int": 1024
+    },
+    "BLOCK": {
+     "int": 1024
+    }
+   }
+  },
+  {
+   "fn": "_silu_mul_scale",
+   "hash": "376bda492768d716f26e70d777d6ae789edf14eac5a2247b8a36ff6f683c9d3b",
+   "name": "_silu_mul_scale",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 0,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "G",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "U",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "W",
+     "type": "*fp32",
+     "div16": false,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp16",
+     "div16": true,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "N": {
+     "int": 1024
+    },
+    "BLOCK": {
+     "int": 1024
+    }
+   }
+  },
+  {
+   "fn": "_topk",
+   "hash": "26166538040e2c24c9fdd2ca23d100ad3c8fb455d174a9e61772f584fdb11aad",
+   "name": "_topk",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 16,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": false,
+   "params": [
+    {
+     "name": "L",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "BIAS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "PICK",
+     "type": "*i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "WTS",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "SCALE",
+     "type": "fp32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "NE": {
+     "int": 256
+    },
+    "TOPK": {
+     "int": 8
+    },
+    "BLOCK": {
+     "int": 256
+    },
+    "KP": {
+     "int": 8
+    }
+   }
+  }
+ ]
+}

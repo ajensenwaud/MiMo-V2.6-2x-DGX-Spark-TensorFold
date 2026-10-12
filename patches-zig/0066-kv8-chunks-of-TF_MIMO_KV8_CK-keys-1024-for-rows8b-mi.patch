@@ -1,7 +1,7 @@
 From 6c88d37b944f65bb2f2ca3d88567d52b53bf06c6 Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 12:49:38 +1100
-Subject: [PATCH 66/67] kv8: chunks of TF_MIMO_KV8_CK keys (1024) for rows8b,
+Subject: [PATCH 66/71] kv8: chunks of TF_MIMO_KV8_CK keys (1024) for rows8b,
  mimo_merge8 (a block a row-head, warps over chunks); kv8check arms
 
 ---

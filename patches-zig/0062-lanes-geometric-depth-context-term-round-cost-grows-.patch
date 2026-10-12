@@ -1,7 +1,7 @@
 From b154ad9dce20eae4e95ddd3da38b0874e0e005ab Mon Sep 17 00:00:00 2001
-From: Anders Jensen-Waud <anders@jensenwaud.com>
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 11:13:20 +1100
-Subject: [PATCH 62/67] lanes geometric depth: context term (round cost grows
+Subject: [PATCH 62/71] lanes geometric depth: context term (round cost grows
  with the stream's cache); mimo: measured 0.0723 + 0.0060/row ms per 1K
  positions, TF_MIMO_DEPTH_CTX=0 off
 

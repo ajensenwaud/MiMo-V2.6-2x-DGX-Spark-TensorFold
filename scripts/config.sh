@@ -33,6 +33,15 @@ BASE_IMAGE="${BASE_IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-ten
 IMAGE="${IMAGE:-mimo-tf}"                    # tagged with the patched TensorFold tree hash by prepare.sh
 CONTAINER="${CONTAINER:-mimo-tf}"
 
+# --- Zig engine (optional; scripts/zig_prepare.sh, ./zig_start.sh) -------------------------------------------------
+ZIG_TF_TAG="v1.0.5"                          # TensorFold's Zig engine release the patches in patches-zig/ apply to
+ZIG_TF_COMMIT="bec00ae6961a43a9ab73c4fa9338c167b3f82851"
+ZIG_DIR="${ZIG_DIR:-$HOME/mimo/tensorfold-zig}"   # the patched tree and its build (zig-out/), the same path on both nodes
+ZIG_BUILD_IMAGE="${ZIG_BUILD_IMAGE:-mimo-zig-build:0.17.0}"
+ZIG_CONTEXT="${ZIG_CONTEXT:-608256}"         # tokens of context shared by the streams
+ZIG_TP_PORT="${ZIG_TP_PORT:-29661}"
+ZIG_CONTAINER="${ZIG_CONTAINER:-mimo-zig}"
+
 # --- serving -----------------------------------------------------------------------------------------------------
 PORT="${PORT:-8891}"                         # GLM :8888, Kolibri :8890
 HOST="${HOST:-0.0.0.0}"

@@ -1,0 +1,35 @@
+From 7dedb251be3a6b66aa83f07b1c1c759694c102d4 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 14:26:49 +1100
+Subject: [PATCH 69/71] fast.cu fusions off by default: graphed 1/4/8-row steps
+ 22.74/42.83/61.38 fused vs 22.67/42.62/60.99 ms
+
+---
+ zig/src/families/mimo_v2/forward.zig | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/mimo_v2/forward.zig b/zig/src/families/mimo_v2/forward.zig
+index fa9aae68..76856b45 100644
+--- a/zig/src/families/mimo_v2/forward.zig
++++ b/zig/src/families/mimo_v2/forward.zig
+@@ -137,7 +137,7 @@ pub const Model = struct {
+     f_rows8: cuda.Function = undefined,
+     f_dq8: cuda.Function = undefined,
+     f_merge8: cuda.Function = undefined,
+-    /// TF_MIMO_FUSE (default on; 0 off): the decode path's router GEMV and add + RMS norm (fast.cu)
++    /// TF_MIMO_FUSE=1 (default off: graphed steps did not move): the decode path's router GEMV and add + RMS norm (fast.cu)
+     fuse: bool = false,
+     fast_mod: ?cuda.Module = null,
+     f_router: cuda.Function = undefined,
+@@ -186,7 +186,7 @@ pub const Model = struct {
+         m.kv8 = if (std.c.getenv("TF_MIMO_KV8")) |v| v[0] != '0' else true; // default on (gate 2026-10-12: GSM8K 500 paired p 0.73, MMLU p 0.38, passkey 10/10)
+         m.kv8_mod = null;
+         m.fast_mod = null;
+-        m.fuse = (if (std.c.getenv("TF_MIMO_FUSE")) |v| v[0] != '0' else true) and cfg.hidden == 4096;
++        m.fuse = (if (std.c.getenv("TF_MIMO_FUSE")) |v| v[0] == '1' else false) and cfg.hidden == 4096; // off: no measured gain (1-row step 22.74 fused vs 22.67 ms)
+         if (m.fuse) {
+             m.fast_mod = try cuda.Module.load(d, cuda.kernels.mimo_fast);
+             m.f_router = try m.fast_mod.?.function("mimo_router");
+-- 
+2.53.0
+
