@@ -1,0 +1,96 @@
+{
+ "hits": 10,
+ "n": 10,
+ "rows": [
+  {
+   "context": 32000,
+   "depth": 0.1,
+   "key": "63297",
+   "ok": true,
+   "s": 22.3,
+   "prompt_tokens": 27558,
+   "reply": "63297"
+  },
+  {
+   "context": 32000,
+   "depth": 0.3,
+   "key": "11035",
+   "ok": true,
+   "s": 22.2,
+   "prompt_tokens": 27558,
+   "reply": "11035"
+  },
+  {
+   "context": 32000,
+   "depth": 0.5,
+   "key": "16611",
+   "ok": true,
+   "s": 22.1,
+   "prompt_tokens": 27558,
+   "reply": "16611"
+  },
+  {
+   "context": 32000,
+   "depth": 0.7,
+   "key": "10186",
+   "ok": true,
+   "s": 22.1,
+   "prompt_tokens": 27558,
+   "reply": "10186"
+  },
+  {
+   "context": 32000,
+   "depth": 0.9,
+   "key": "15654",
+   "ok": true,
+   "s": 22.1,
+   "prompt_tokens": 27558,
+   "reply": "15654"
+  },
+  {
+   "context": 120000,
+   "depth": 0.1,
+   "key": "83647",
+   "ok": true,
+   "s": 91.0,
+   "prompt_tokens": 103216,
+   "reply": "83647"
+  },
+  {
+   "context": 120000,
+   "depth": 0.3,
+   "key": "79612",
+   "ok": true,
+   "s": 90.7,
+   "prompt_tokens": 103216,
+   "reply": "79612"
+  },
+  {
+   "context": 120000,
+   "depth": 0.5,
+   "key": "97660",
+   "ok": true,
+   "s": 90.9,
+   "prompt_tokens": 103216,
+   "reply": "97660"
+  },
+  {
+   "context": 120000,
+   "depth": 0.7,
+   "key": "18994",
+   "ok": true,
+   "s": 90.6,
+   "prompt_tokens": 103216,
+   "reply": "18994"
+  },
+  {
+   "context": 120000,
+   "depth": 0.9,
+   "key": "39173",
+   "ok": true,
+   "s": 90.5,
+   "prompt_tokens": 103216,
+   "reply": "39173"
+  }
+ ]
+}

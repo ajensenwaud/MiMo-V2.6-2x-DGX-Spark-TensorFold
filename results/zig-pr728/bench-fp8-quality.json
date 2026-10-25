@@ -1,0 +1,81 @@
+{
+  "tool": "spark-bench/1.0",
+  "started": "2026-10-25T18:17:45",
+  "host": "gx10",
+  "base_url": "http://localhost:8891",
+  "model": "MiMo-V2.6-Flash",
+  "label": "PR 728 rebased, fp8 cache",
+  "preset": "full",
+  "thinking": false,
+  "reasoning_effort": null,
+  "server": {
+    "backend": "cuda",
+    "context_length": null,
+    "streams": null
+  },
+  "config": {
+    "suites": [
+      "quality"
+    ],
+    "concurrency": [
+      1,
+      2,
+      4
+    ],
+    "decode_tokens": 512,
+    "depths": [
+      4096,
+      16384,
+      65536,
+      131072
+    ],
+    "depth_samples": 3,
+    "gsm8k_n": 500,
+    "mmlu_per_subject": 4,
+    "quality_concurrency": 4,
+    "seed": 20261010,
+    "depth_gen_tokens": 128,
+    "quality_max_tokens": 28672
+  },
+  "busy_at_start": 0,
+  "quality": {
+    "seed": 20261010,
+    "thinking": false,
+    "max_tokens": 28672,
+    "sampling": {
+      "temperature": 0,
+      "top_p": 1
+    },
+    "request_seed": 20261010,
+    "sets": {
+      "gsm8k": {
+        "n": 500,
+        "correct": 476,
+        "accuracy": 0.952,
+        "ci95": [
+          0.9296,
+          0.9675
+        ],
+        "errors": 0,
+        "truncated": 0,
+        "valid": true
+      },
+      "mmlu": {
+        "n": 228,
+        "correct": 187,
+        "accuracy": 0.8202,
+        "ci95": [
+          0.7652,
+          0.8646
+        ],
+        "errors": 0,
+        "truncated": 0,
+        "valid": true
+      }
+    },
+    "contended": false
+  },
+  "rejected_request_fields": [],
+  "wall_s": 732.4,
+  "contended": false
+}
