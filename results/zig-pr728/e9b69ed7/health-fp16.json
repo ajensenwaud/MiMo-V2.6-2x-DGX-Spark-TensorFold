@@ -1,0 +1,1 @@
+{"status": "ok", "model": "MiMo-V2.6-Flash", "model_ids": ["MiMo-V2.6-Flash"], "max_batch_size": 4, "warming": false, "memory": {"active": 118013034524, "cache": 0, "peak": 118013034524}, "live": {"connections": 0, "waiting": 0, "decode_tokens_per_second": 0.0, "prefill_tokens_per_second": 0.0}, "version": "1.1.6", "backend": "cuda", "device": "NVIDIA GB10"}
